@@ -247,3 +247,9 @@ tmp_test
 vllm_omni/_version.py
 # output files
 *.wav
+
+# GPT-SoVITS vendored text dictionaries / caches
+vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/text/*.rep
+vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/text/*.pickle
+vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/text/g2pw/*.rep
+vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/text/g2pw/*.pickle
