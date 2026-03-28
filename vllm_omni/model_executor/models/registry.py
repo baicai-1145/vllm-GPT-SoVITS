@@ -140,6 +140,21 @@ _OMNI_MODELS = {
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
     ),
+    "GPTSoVITSGeneration": (
+        "gpt_sovits",
+        "gpt_sovits_generation",
+        "GPTSoVITSGeneration",
+    ),
+    "GPTSoVITSV2T2S": (
+        "gpt_sovits",
+        "gpt_sovits_v2_t2s",
+        "GPTSoVITSV2T2S",
+    ),
+    "GPTSoVITSV2Decode": (
+        "gpt_sovits",
+        "gpt_sovits_v2_decode",
+        "GPTSoVITSV2Decode",
+    ),
     ## Voxtral TTS
     "VoxtralTTSForConditionalGeneration": (
         "voxtral_tts",

@@ -1,0 +1,36 @@
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 4
+    engine_args:
+      model_stage: gpt_sovits_generation
+      model_arch: GPTSoVITSGeneration
+      worker_type: generation
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      distributed_executor_backend: "mp"
+      enforce_eager: true
+      trust_remote_code: false
+      async_scheduling: false
+      enable_prefix_caching: false
+      skip_tokenizer_init: true
+      skip_mm_profiling: true
+      engine_output_type: audio
+      gpu_memory_utilization: 0.85
+      max_num_seqs: 4
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.0

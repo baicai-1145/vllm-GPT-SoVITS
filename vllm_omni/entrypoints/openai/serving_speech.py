@@ -42,7 +42,10 @@ logger = init_logger(__name__)
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
-_TTS_MODEL_STAGES: set[str] = _VOXTRAL_TTS_MODEL_STAGES | _QWEN3_TTS_MODEL_STAGES | _FISH_TTS_MODEL_STAGES
+_GPT_SOVITS_MODEL_STAGES = {"gpt_sovits_generation", "gpt_sovits_v2_t2s"}
+_TTS_MODEL_STAGES: set[str] = (
+    _VOXTRAL_TTS_MODEL_STAGES | _QWEN3_TTS_MODEL_STAGES | _FISH_TTS_MODEL_STAGES | _GPT_SOVITS_MODEL_STAGES
+)
 _TTS_LANGUAGES: set[str] = {
     "Auto",
     "Chinese",
@@ -61,6 +64,14 @@ _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
+_GPT_SOVITS_LANGUAGE_MAP = {
+    "auto": "auto",
+    "chinese": "zh",
+    "english": "en",
+    "japanese": "ja",
+    "korean": "ko",
+    "cantonese": "yue",
+}
 
 
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -235,6 +246,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "voxtral_tts"
         if model_stage in _FISH_TTS_MODEL_STAGES:
             return "fish_tts"
+        if model_stage in _GPT_SOVITS_MODEL_STAGES:
+            return "gpt_sovits"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -725,9 +738,43 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
+        if self._tts_model_type == "gpt_sovits":
+            return self._validate_gpt_sovits_request(request)
         if self._tts_model_type == "voxtral_tts":
             return self._validate_voxtral_tts_request(request)
         return self._validate_qwen_tts_request(request)
+
+    @staticmethod
+    def _normalize_gpt_sovits_language(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        return _GPT_SOVITS_LANGUAGE_MAP.get(normalized, normalized)
+
+    def _validate_gpt_sovits_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        if request.ref_audio is None:
+            return "GPT-SoVITS requires 'ref_audio'"
+        fmt_err = self._validate_ref_audio_format(request.ref_audio)
+        if fmt_err:
+            return fmt_err
+        if not request.ref_text or not request.ref_text.strip():
+            return "GPT-SoVITS requires non-empty 'ref_text'"
+
+        text_lang = self._normalize_gpt_sovits_language(request.text_lang or request.language)
+        prompt_lang = self._normalize_gpt_sovits_language(request.prompt_lang or text_lang)
+        request.text_lang = text_lang or "auto"
+        request.prompt_lang = prompt_lang or request.text_lang
+        if request.text_split_method is None:
+            request.text_split_method = "cut4" if request.text_lang == "en" else "cut5"
+        if request.parallel_infer is None:
+            request.parallel_infer = True
+        if request.batch_size is None:
+            request.batch_size = 4
+        return None
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
         """Validate ref_audio is a supported URI format. Returns error or None."""
@@ -907,6 +954,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
             )
         return wav_np.tolist(), sr
+
+    async def _resolve_gpt_sovits_ref_audio_path(self, ref_audio_str: str) -> str:
+        wav_list, sr = await self._resolve_ref_audio(ref_audio_str)
+        wav_np = np.asarray(wav_list, dtype=np.float32)
+        with tempfile.NamedTemporaryFile(prefix="gpt_sovits_ref_", suffix=".wav", delete=False) as f:
+            sf.write(f.name, wav_np, sr)
+            return f.name
 
     async def _generate_audio_chunks(self, generator, request_id: str, response_format: str = "pcm"):
         """Generate audio chunks for streaming response.
@@ -1089,6 +1143,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return params
 
+    async def _build_gpt_sovits_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        ref_audio_path = await self._resolve_gpt_sovits_ref_audio_path(request.ref_audio)
+        additional_information = {
+            "text": request.input,
+            "text_lang": request.text_lang or self._normalize_gpt_sovits_language(request.language) or "auto",
+            "ref_audio_path": ref_audio_path,
+            "prompt_text": request.ref_text,
+            "prompt_lang": request.prompt_lang or request.text_lang or "auto",
+            "text_split_method": request.text_split_method or ("cut4" if request.text_lang == "en" else "cut5"),
+            "batch_size": request.batch_size if request.batch_size is not None else 4,
+            "batch_threshold": request.batch_threshold if request.batch_threshold is not None else 0.75,
+            "split_bucket": True if request.split_bucket is None else request.split_bucket,
+            "speed_factor": request.speed or 1.0,
+            "parallel_infer": True if request.parallel_infer is None else request.parallel_infer,
+            "repetition_penalty": request.repetition_penalty if request.repetition_penalty is not None else 1.35,
+            "sample_steps": request.sample_steps if request.sample_steps is not None else 32,
+            "fragment_interval": request.fragment_interval if request.fragment_interval is not None else 0.3,
+            "seed": request.seed if request.seed is not None else -1,
+        }
+        return {
+            "prompt_token_ids": [1],
+            "additional_information": additional_information,
+        }
+
     # ---- Voxtral TTS helpers ----
 
     async def _build_voxtral_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
@@ -1207,7 +1285,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if validation_error:
                 raise ValueError(validation_error)
 
-            if self._tts_model_type == "voxtral_tts":
+            if self._tts_model_type == "gpt_sovits":
+                prompt = await self._build_gpt_sovits_prompt(request)
+                tts_params = prompt["additional_information"]
+            elif self._tts_model_type == "voxtral_tts":
                 prompt = await self._build_voxtral_prompt(request)
                 tts_params = {}
             else:
@@ -1231,6 +1312,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = f"speech-{random_uuid()}"
         if self._is_fish_speech:
             model_type = "fish_speech"
+        elif self._tts_model_type == "gpt_sovits":
+            model_type = "gpt_sovits"
         elif self._tts_model_type == "voxtral_tts":
             model_type = "voxtral_tts"
         elif self._is_tts:

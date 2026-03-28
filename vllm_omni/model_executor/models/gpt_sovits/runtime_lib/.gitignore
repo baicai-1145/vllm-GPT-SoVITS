@@ -1,0 +1,4 @@
+__pycache__/
+outputs/
+GPT_SoVITS/**/__pycache__/
+tools/**/__pycache__/

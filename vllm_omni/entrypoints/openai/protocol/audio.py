@@ -70,6 +70,17 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+    text_lang: str | None = Field(default=None, description="GPT-SoVITS target text language, e.g. en/zh/ja/auto")
+    prompt_lang: str | None = Field(default=None, description="GPT-SoVITS reference text language")
+    text_split_method: str | None = Field(default=None, description="GPT-SoVITS text split method, e.g. cut4/cut5")
+    batch_size: int | None = Field(default=None, ge=1, description="GPT-SoVITS inference batch size")
+    batch_threshold: float | None = Field(default=None, ge=0.0, description="GPT-SoVITS bucket threshold")
+    split_bucket: bool | None = Field(default=None, description="GPT-SoVITS bucketed batching switch")
+    parallel_infer: bool | None = Field(default=None, description="GPT-SoVITS parallel infer switch")
+    repetition_penalty: float | None = Field(default=None, ge=0.0, description="GPT-SoVITS T2S repetition penalty")
+    sample_steps: int | None = Field(default=None, ge=1, description="GPT-SoVITS vocoder sample steps")
+    fragment_interval: float | None = Field(default=None, ge=0.0, description="GPT-SoVITS fragment interval")
+    seed: int | None = Field(default=None, description="GPT-SoVITS random seed")
 
     @field_validator("stream_format")
     @classmethod
@@ -145,6 +156,17 @@ class SpeechBatchItem(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    text_lang: str | None = None
+    prompt_lang: str | None = None
+    text_split_method: str | None = None
+    batch_size: int | None = Field(default=None, ge=1)
+    batch_threshold: float | None = Field(default=None, ge=0.0)
+    split_bucket: bool | None = None
+    parallel_infer: bool | None = None
+    repetition_penalty: float | None = Field(default=None, ge=0.0)
+    sample_steps: int | None = Field(default=None, ge=1)
+    fragment_interval: float | None = Field(default=None, ge=0.0)
+    seed: int | None = None
 
 
 class BatchSpeechRequest(BaseModel):
@@ -164,6 +186,17 @@ class BatchSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    text_lang: str | None = None
+    prompt_lang: str | None = None
+    text_split_method: str | None = None
+    batch_size: int | None = Field(default=None, ge=1)
+    batch_threshold: float | None = Field(default=None, ge=0.0)
+    split_bucket: bool | None = None
+    parallel_infer: bool | None = None
+    repetition_penalty: float | None = Field(default=None, ge=0.0)
+    sample_steps: int | None = Field(default=None, ge=1)
+    fragment_interval: float | None = Field(default=None, ge=0.0)
+    seed: int | None = None
 
 
 class SpeechBatchItemResult(BaseModel):

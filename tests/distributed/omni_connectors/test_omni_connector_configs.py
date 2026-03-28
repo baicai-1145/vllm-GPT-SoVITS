@@ -6,32 +6,23 @@ from pathlib import Path
 import pytest
 
 # Use the new import path for initialization utilities
-from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    get_connectors_config_for_stage,
+    load_omni_transfer_config,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
+CONFIG_DIR = BASE_DIR / "vllm_omni" / "model_executor" / "stage_configs"
 
 
 def get_config_files():
     """Helper to find config files."""
-    # Go up two levels from 'tests/distributed/omni_connectors' (approx) to 'vllm-omni' root
-    # Adjust based on file location: vllm-omni/tests/distributed/omni_connectors/test_omni_connector_configs.py
-    # This file is 4 levels deep from root if we count from tests?
-    # vllm-omni/tests/distributed/omni_connectors -> parent -> distributed -> parent -> tests -> parent -> vllm-omni
-    # Let's use resolve to be safe.
-
-    # Path(__file__) = .../vllm-omni/tests/distributed/omni_connectors/test_omni_connector_configs.py
-    # .parent = omni_connectors
-    # .parent = distributed
-    # .parent = tests
-    # .parent = vllm-omni
-
-    base_dir = Path(__file__).resolve().parent.parent.parent.parent
-    config_dir = base_dir / "vllm_omni" / "model_executor" / "stage_configs"
-
-    if not config_dir.exists():
+    if not CONFIG_DIR.exists():
         return []
 
-    return list(config_dir.glob("qwen*.yaml"))
+    return list(CONFIG_DIR.glob("qwen*.yaml"))
 
 
 # Collect files at module level for parametrization
@@ -64,3 +55,19 @@ def test_load_qwen_yaml_configs(yaml_file):
 
     except Exception as e:
         pytest.fail(f"Failed to load config {yaml_file.name}: {e}")
+
+
+def test_load_gpt_sovits_v2_yaml_config():
+    """GPT-SoVITS v2 stage config should expose its shared-memory edge via runtime.connectors."""
+    yaml_file = CONFIG_DIR / "gpt_sovits_v2.yaml"
+    assert yaml_file.exists(), f"Config not found: {yaml_file}"
+
+    config = load_omni_transfer_config(yaml_file)
+
+    assert config is not None
+    assert ("0", "1") in config.connectors
+    assert config.connectors[("0", "1")].name == "SharedMemoryConnector"
+
+    stage_1_connectors = get_connectors_config_for_stage(config, stage_id=1)
+    assert "from_stage_0" in stage_1_connectors
+    assert stage_1_connectors["from_stage_0"]["spec"]["name"] == "SharedMemoryConnector"

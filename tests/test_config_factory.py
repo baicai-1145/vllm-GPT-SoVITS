@@ -432,6 +432,43 @@ edges:
         assert pipeline.connectors == {"type": "ray"}
         assert pipeline.edges == [{"from": 0, "to": 1}]
 
+    def test_parse_yaml_with_runtime_nested_connectors_and_edges(self, tmp_path):
+        """Test parsing runtime.connectors/runtime.edges used by stage transfer config."""
+        yaml_content = """\
+model_type: test_model
+
+stages:
+  - stage_id: 0
+    stage_type: llm
+    model_stage: entry
+  - stage_id: 1
+    stage_type: llm
+    model_stage: decode
+    engine_input_source: [0]
+
+runtime:
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
+"""
+        yaml_file = tmp_path / "with_runtime_connectors.yaml"
+        yaml_file.write_text(yaml_content)
+
+        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "test_model")
+        assert pipeline.connectors == {
+            "connector_of_shared_memory": {
+                "name": "SharedMemoryConnector",
+                "extra": {"shm_threshold_bytes": 65536},
+            }
+        }
+        assert pipeline.edges == [{"from": 0, "to": 1, "window_size": -1}]
+
     def test_parsed_pipeline_passes_validation(self, tmp_path):
         """Test that a well-formed YAML produces a valid pipeline."""
         yaml_content = """\
