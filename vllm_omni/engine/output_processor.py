@@ -20,6 +20,18 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+_MM_KEEP_LAST_KEYS_FIELD = "__omni_keep_last_mm_keys__"
+_DEFAULT_KEEP_LAST_MM_KEYS = {
+    "semantic_tokens",
+    "gpt_sovits_phones",
+    "gpt_sovits_prompt_phones",
+    "gpt_sovits_prompt_semantic",
+    "gpt_sovits_refer_audio_spec",
+    "gpt_sovits_refer_audio_16k",
+    "gpt_sovits_raw_audio",
+    "gpt_sovits_raw_sr",
+}
+
 
 class OmniRequestState(RequestState):
     """Request state for omni models, tracking multimodal outputs.
@@ -38,6 +50,20 @@ class OmniRequestState(RequestState):
         # Omni-specific: multimodal output accumulation
         self.mm_type: str | None = None
         self.mm_accumulated: dict[str, Any] | None = None
+        self.mm_keep_last_keys: set[str] = set()
+
+    def _record_keep_last_contract(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        keep_last = payload.get(_MM_KEEP_LAST_KEYS_FIELD)
+        if not isinstance(keep_last, (list, tuple, set)):
+            return
+        for key in keep_last:
+            if key is None:
+                continue
+            key_str = str(key).strip()
+            if key_str:
+                self.mm_keep_last_keys.add(key_str)
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:
@@ -56,10 +82,13 @@ class OmniRequestState(RequestState):
                 return x
 
             if isinstance(payload, dict):
+                self._record_keep_last_contract(payload)
                 incoming: dict[str, Any] = {}
                 target_key = self.mm_type or "hidden"
 
                 for k, v in payload.items():
+                    if k == _MM_KEEP_LAST_KEYS_FIELD:
+                        continue
                     # Normalize producer keys to the modality name.
                     # AR runners produce {"hidden": ...} and generation
                     # runners produce {"model_outputs": ...}; remap both
@@ -114,6 +143,8 @@ class OmniRequestState(RequestState):
         if self.mm_accumulated is None:
             return
         try:
+            keep_last_keys = set(_DEFAULT_KEEP_LAST_MM_KEYS)
+            keep_last_keys.update(self.mm_keep_last_keys)
             for k, v in self.mm_accumulated.items():
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                     try:
@@ -121,6 +152,8 @@ class OmniRequestState(RequestState):
                             # When the audio tensor shape is inconsistent, torch.cat will fail.
                             # We need to use torch.cat in -1 dimension.
                             continue
+                        elif k in keep_last_keys:
+                            self.mm_accumulated[k] = v[-1]
                         elif k == "sr":
                             # Sample rate is a constant scalar, keep last value.
                             self.mm_accumulated[k] = v[-1]
@@ -134,7 +167,10 @@ class OmniRequestState(RequestState):
                     for sk, sv in v.items():
                         if isinstance(sv, list) and sv and isinstance(sv[0], torch.Tensor):
                             try:
-                                v[sk] = torch.cat(sv, dim=0)
+                                if sk in keep_last_keys:
+                                    v[sk] = sv[-1]
+                                else:
+                                    v[sk] = torch.cat(sv, dim=0)
                             except Exception:
                                 v[sk] = sv[-1]
         except Exception:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import threading
@@ -8,10 +9,11 @@ import types
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 try:
     from vllm.logger import init_logger
@@ -32,6 +34,24 @@ _DEFAULT_PROJECT_ROOT = os.path.abspath(
 _DEFAULT_CONFIG_PATH = "GPT_SoVITS/configs/tts_infer.yaml"
 
 
+def _left_pad_hidden(hidden: torch.Tensor, target_len: int) -> torch.Tensor:
+    if hidden.shape[0] >= target_len:
+        return hidden
+    return F.pad(hidden, (0, 0, target_len - hidden.shape[0], 0), value=0)
+
+
+def _make_pad_mask_left(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+    if lengths.ndim != 1:
+        raise ValueError(f"lengths must be 1-D, got ndim={lengths.ndim}")
+    if lengths.numel() == 0:
+        return torch.zeros((0, max_len), dtype=torch.bool, device=lengths.device)
+    max_len = max(int(max_len), int(lengths.max().item()))
+    seq_range = torch.arange(0, max_len, device=lengths.device)
+    expanded_lengths = seq_range.unsqueeze(0).repeat(lengths.size(0), 1)
+    expanded_lengths -= (max_len - lengths).unsqueeze(-1)
+    return expanded_lengths < 0
+
+
 @dataclass(slots=True)
 class GPTSoVITSResult:
     sample_rate: int
@@ -43,6 +63,36 @@ class GPTSoVITSPreparedRequest:
     request_id: str
     state: Any
     transport_info: dict[str, Any]
+
+
+@dataclass(slots=True)
+class GPTSoVITSPreparedCpuStage:
+    request_id: str
+    request: dict[str, Any]
+    spec: Any
+    cpu_stage: Any
+    ref_audio_prepare_future: Any | None = None
+
+
+@dataclass(slots=True)
+class GPTSoVITSPreparedAudioPhase:
+    request_id: str
+    prepared_cpu_stage: GPTSoVITSPreparedCpuStage
+    phase_one: dict[str, Any]
+
+
+@dataclass(slots=True)
+class GPTSoVITSPreparedRefSpecPhase:
+    request_id: str
+    prepared_audio_phase: GPTSoVITSPreparedAudioPhase
+    ref_spec_result: tuple[tuple[Any, Any], dict[str, float]]
+
+
+@dataclass(slots=True)
+class GPTSoVITSPreparedTextPhase:
+    request_id: str
+    prepared_audio_phase: GPTSoVITSPreparedAudioPhase
+    phase_two: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -95,6 +145,8 @@ class GPTSoVITSRuntime:
         self._cwd_lock = threading.RLock()
         self._pipeline: Any | None = None
         self._config: Any | None = None
+        self._prepare_coordinator: Any | None = None
+        self._t2s_active_batch_cls: Any | None = None
         self._native_runtime_ready = False
 
     def _resolve_path(self, maybe_relative_path: str) -> str:
@@ -185,6 +237,316 @@ class GPTSoVITSRuntime:
     def get_semantic_vocab_size(self) -> int:
         model = self.get_t2s_model()
         return int(model.vocab_size)
+
+    def _ensure_prepare_coordinator(self) -> Any:
+        if self._prepare_coordinator is not None:
+            return self._prepare_coordinator
+        with self._init_lock:
+            if self._prepare_coordinator is not None:
+                return self._prepare_coordinator
+            pipeline = self._ensure_pipeline()
+            with self._project_root_cwd():
+                from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import PrepareCoordinator
+
+                self._prepare_coordinator = PrepareCoordinator(pipeline)
+        return self._prepare_coordinator
+
+    def _get_t2s_active_batch_cls(self) -> Any:
+        if self._t2s_active_batch_cls is not None:
+            return self._t2s_active_batch_cls
+        with self._init_lock:
+            if self._t2s_active_batch_cls is not None:
+                return self._t2s_active_batch_cls
+            self._ensure_import_path()
+            self._ensure_native_runtime_deps()
+            with self._project_root_cwd():
+                from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import T2SActiveBatch
+
+            self._t2s_active_batch_cls = T2SActiveBatch
+        return self._t2s_active_batch_cls
+
+    @staticmethod
+    def _ensure_audio_position_encoding(
+        model: Any,
+        max_position: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        required_len = max_position + 1
+        if model.ar_audio_position.pe is not None and model.ar_audio_position.pe.size(1) >= required_len:
+            if model.ar_audio_position.pe.dtype != dtype or model.ar_audio_position.pe.device != device:
+                model.ar_audio_position.pe = model.ar_audio_position.pe.to(dtype=dtype, device=device)
+            return
+        model.ar_audio_position.extend_pe(
+            torch.zeros(1, required_len, model.ar_audio_position.embedding_dim, device=device, dtype=dtype)
+        )
+
+    def _build_prefill_active_batch(
+        self,
+        model: Any,
+        states: Sequence[Any],
+    ) -> Any:
+        if not states:
+            raise ValueError("GPT-SoVITS AR prefill requires at least one state")
+
+        x_items: list[torch.Tensor] = []
+        y_pos_items: list[torch.Tensor] = []
+        x_lens: list[int] = []
+        prefix_lens: list[int] = []
+        y_sequences: list[torch.Tensor] = []
+
+        for state in states:
+            text_emb = model.ar_text_embedding(state.all_phones.unsqueeze(0))
+            bert_proj = model.bert_proj(state.all_bert_features.transpose(0, 1).unsqueeze(0))
+            x_pos = model.ar_text_position(text_emb + bert_proj).squeeze(0)
+            y_emb = model.ar_audio_embedding(state.prompt_semantic.unsqueeze(0))
+            y_pos = model.ar_audio_position(y_emb).squeeze(0)
+            x_items.append(x_pos)
+            y_pos_items.append(y_pos)
+            x_lens.append(int(x_pos.shape[0]))
+            prefix_lens.append(int(y_pos.shape[0]))
+            y_sequences.append(state.prompt_semantic.clone())
+
+        max_x_len = max(x_lens)
+        max_prefix_len = max(prefix_lens)
+        x_batch = torch.stack([_left_pad_hidden(item, max_x_len) for item in x_items], dim=0)
+        y_pos_batch = torch.stack([_left_pad_hidden(item, max_prefix_len) for item in y_pos_items], dim=0)
+        xy_pos = torch.cat([x_batch, y_pos_batch], dim=1)
+
+        device = x_batch.device
+        x_lens_tensor = torch.tensor(x_lens, dtype=torch.long, device=device)
+        prefix_lens_tensor = torch.tensor(prefix_lens, dtype=torch.long, device=device)
+        x_padding_mask = _make_pad_mask_left(x_lens_tensor, max_x_len)
+        y_padding_mask = _make_pad_mask_left(prefix_lens_tensor, max_prefix_len)
+        key_padding_mask = torch.cat([x_padding_mask, y_padding_mask], dim=1).bool()
+        x_mask = F.pad(torch.zeros(max_x_len, max_x_len, dtype=torch.bool, device=device), (0, max_prefix_len), value=True)
+        y_mask = F.pad(
+            torch.triu(torch.ones(max_prefix_len, max_prefix_len, dtype=torch.bool, device=device), diagonal=1),
+            (max_x_len, 0),
+            value=False,
+        )
+        causal_mask = torch.cat([x_mask, y_mask], dim=0).unsqueeze(0)
+        attn_mask = causal_mask.logical_or(key_padding_mask.unsqueeze(1)).unsqueeze(1)
+
+        active_batch_cls = self._get_t2s_active_batch_cls()
+        return active_batch_cls(
+            request_ids=[str(state.request_id) for state in states],
+            states=list(states),
+            x=x_batch,
+            x_lens=x_lens_tensor,
+            y_sequences=y_sequences,
+            prefix_lens=prefix_lens_tensor,
+            xy_pos=xy_pos,
+            key_padding_mask=key_padding_mask,
+            prefill_attn_mask=attn_mask,
+            decode_attn_mask=None,
+            k_cache=None,
+            v_cache=None,
+            kv_lens=None,
+            step_indices=torch.zeros((len(states),), dtype=torch.long, device=device),
+            prefill_done=False,
+            kv_cache_pooled=False,
+            kv_cache_capacity=0,
+            kv_cache_batch_capacity=0,
+        )
+
+    def _build_next_xy_pos(
+        self,
+        model: Any,
+        y_sequences: Sequence[torch.LongTensor],
+    ) -> torch.Tensor:
+        if not y_sequences:
+            raise ValueError("GPT-SoVITS AR decode requires at least one semantic history")
+        last_tokens = torch.stack([seq[-1:] for seq in y_sequences], dim=0)
+        y_emb = model.ar_audio_embedding(last_tokens)
+        position_ids = torch.tensor([int(seq.shape[0] - 1) for seq in y_sequences], dtype=torch.long, device=y_emb.device)
+        self._ensure_audio_position_encoding(model, int(position_ids.max().item()), y_emb.dtype, y_emb.device)
+        pos_emb = model.ar_audio_position.pe[0].index_select(0, position_ids).unsqueeze(1)
+        return y_emb * model.ar_audio_position.x_scale + model.ar_audio_position.alpha * pos_emb.to(
+            dtype=y_emb.dtype,
+            device=y_emb.device,
+        )
+
+    @staticmethod
+    def _get_kv_pool(model: Any) -> Any | None:
+        pool = getattr(model, "kv_cache_pool", None)
+        if pool is None:
+            return None
+        if not getattr(getattr(pool, "state", None), "enabled", False):
+            return None
+        return pool
+
+    def _set_kv_pool_active_rows(self, model: Any, active_rows: int) -> None:
+        pool = self._get_kv_pool(model)
+        if pool is None:
+            return
+        try:
+            pool.set_active_rows(active_rows)
+        except Exception:
+            pass
+
+    def _pack_active_batch_into_pool(self, model: Any, active_batch: Any) -> bool:
+        pool = self._get_kv_pool(model)
+        if (
+            pool is None
+            or active_batch.k_cache is None
+            or active_batch.v_cache is None
+            or active_batch.kv_lens is None
+            or active_batch.kv_lens.numel() <= 0
+        ):
+            return False
+        pooled_views = pool.pack_dynamic_cache_layers(
+            k_layers=active_batch.k_cache,
+            v_layers=active_batch.v_cache,
+            kv_lens=active_batch.kv_lens,
+        )
+        if pooled_views is None:
+            active_batch.kv_cache_pooled = False
+            active_batch.kv_cache_capacity = 0
+            active_batch.kv_cache_batch_capacity = 0
+            self._set_kv_pool_active_rows(model, 0)
+            return False
+        active_batch.k_cache, active_batch.v_cache = pooled_views
+        active_batch.decode_attn_mask = None
+        active_batch.kv_cache_pooled = True
+        active_batch.kv_cache_capacity = int(pool.max_seq_len)
+        active_batch.kv_cache_batch_capacity = int(pool.max_batch_size)
+        self._set_kv_pool_active_rows(model, len(active_batch.request_ids))
+        return True
+
+    @staticmethod
+    def _compact_cache_to_kv_lens(cache: torch.Tensor, kv_lens: torch.LongTensor) -> torch.Tensor:
+        target_len = int(kv_lens.max().item())
+        if cache.shape[1] == target_len and bool(torch.all(kv_lens == target_len).item()):
+            return cache
+        compacted = cache.new_zeros((cache.shape[0], target_len, cache.shape[2]))
+        for batch_index, kv_len in enumerate(kv_lens.tolist()):
+            if kv_len <= 0:
+                continue
+            compacted[batch_index, -kv_len:, :] = cache[batch_index, -kv_len:, :]
+        return compacted
+
+    @staticmethod
+    def _compact_decode_mask_to_kv_lens(
+        decode_attn_mask: torch.Tensor | None,
+        kv_lens: torch.LongTensor,
+    ) -> torch.Tensor | None:
+        target_len = int(kv_lens.max().item()) + 1
+        if decode_attn_mask is None:
+            return None
+        if decode_attn_mask.shape[-1] == target_len and bool(torch.all(kv_lens + 1 == target_len).item()):
+            return decode_attn_mask
+        compacted = torch.ones(
+            (decode_attn_mask.shape[0], 1, 1, target_len),
+            dtype=decode_attn_mask.dtype,
+            device=decode_attn_mask.device,
+        )
+        for batch_index, kv_len in enumerate(kv_lens.tolist()):
+            current_len = kv_len + 1
+            compacted[batch_index, :, :, -current_len:] = decode_attn_mask[batch_index, :, :, -current_len:]
+        if not compacted.any().item():
+            return None
+        return compacted
+
+    @staticmethod
+    def _pad_decode_mask_left(mask: torch.Tensor, target_len: int) -> torch.Tensor:
+        pad_len = target_len - mask.shape[-1]
+        if pad_len <= 0:
+            return mask
+        return F.pad(mask, (pad_len, 0), value=True)
+
+    def _fit_decode_mask_length(self, mask: torch.Tensor, target_len: int) -> torch.Tensor:
+        if mask.shape[-1] > target_len:
+            return mask[:, :, :, -target_len:]
+        if mask.shape[-1] < target_len:
+            return self._pad_decode_mask_left(mask, target_len)
+        return mask
+
+    def _materialize_decode_mask_for_active_batch(
+        self,
+        active_batch: Any,
+        target_mask_len: int | None = None,
+    ) -> torch.Tensor:
+        if active_batch.k_cache is None or active_batch.kv_lens is None:
+            raise ValueError("GPT-SoVITS active batch is missing KV cache or kv_lens")
+        current_mask_len = active_batch.k_cache[0].shape[1] + 1
+        if target_mask_len is None:
+            target_mask_len = current_mask_len
+        if active_batch.decode_attn_mask is None:
+            mask = torch.zeros(
+                (len(active_batch.request_ids), 1, 1, current_mask_len),
+                dtype=torch.bool,
+                device=active_batch.k_cache[0].device,
+            )
+        else:
+            rows: list[torch.Tensor] = []
+            for batch_index, kv_len in enumerate(active_batch.kv_lens.tolist()):
+                row_len = kv_len + 1
+                row_mask = self._fit_decode_mask_length(
+                    active_batch.decode_attn_mask[batch_index : batch_index + 1],
+                    row_len,
+                )
+                rows.append(self._pad_decode_mask_left(row_mask, target_mask_len))
+            mask = torch.cat(rows, dim=0)
+        if target_mask_len != current_mask_len and active_batch.decode_attn_mask is None:
+            mask = self._pad_decode_mask_left(mask, target_mask_len)
+        return mask
+
+    def _advance_decode_mask(
+        self,
+        decode_attn_mask: torch.Tensor | None,
+        kv_lens: torch.LongTensor,
+    ) -> torch.Tensor | None:
+        if decode_attn_mask is None:
+            return None
+        target_len = int(kv_lens.max().item()) + 2
+        advanced = torch.zeros(
+            (decode_attn_mask.shape[0], 1, 1, target_len),
+            dtype=decode_attn_mask.dtype,
+            device=decode_attn_mask.device,
+        )
+        for batch_index, kv_len in enumerate(kv_lens.tolist()):
+            current_len = kv_len + 1
+            next_mask = F.pad(decode_attn_mask[batch_index : batch_index + 1, :, :, -current_len:], (0, 1), value=False)
+            advanced[batch_index : batch_index + 1, :, :, -next_mask.shape[-1] :] = next_mask
+        if not advanced.any().item():
+            return None
+        return advanced
+
+    @staticmethod
+    def _run_awaitable_sync(awaitable: Any) -> Any:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is None or not running_loop.is_running():
+            return asyncio.run(awaitable)
+
+        result_holder: dict[str, Any] = {}
+        error_holder: dict[str, BaseException] = {}
+
+        def _runner() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                result_holder["value"] = loop.run_until_complete(awaitable)
+            except BaseException as exc:  # pragma: no cover - defensive
+                error_holder["error"] = exc
+            finally:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                asyncio.set_event_loop(None)
+                loop.close()
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+        if "error" in error_holder:
+            raise error_holder["error"]
+        return result_holder.get("value")
 
     @staticmethod
     def _load_ref_audio_with_soundfile(ref_audio_path: str) -> tuple[torch.Tensor, int]:
@@ -328,18 +690,123 @@ class GPTSoVITSRuntime:
                 max_steps = max(max_steps, early_stop_num + 1)
         return max_steps
 
-    def prepare_request(self, request: dict[str, Any], *, request_id: str | None = None) -> GPTSoVITSPreparedRequest:
-        pipeline = self._ensure_pipeline()
-        spec = self._build_scheduler_request_spec(request, request_id=request_id)
+    def preload_ref_audio_asset(self, ref_audio_path: str, *, submit_at: float | None = None) -> Any:
+        coordinator = self._ensure_prepare_coordinator()
         with self._project_root_cwd():
-            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import _prepare_request_state_legacy
+            return coordinator.submit_prepare_ref_audio_asset(ref_audio_path, submit_at=submit_at)
 
-            state = _prepare_request_state_legacy(pipeline, spec)
-        return GPTSoVITSPreparedRequest(
-            request_id=str(spec.request_id),
-            state=state,
-            transport_info=self._state_to_transport_info(state, request),
+    def prepare_request_cpu_stage(
+        self,
+        request: dict[str, Any],
+        *,
+        request_id: str | None = None,
+        preload_ref_audio: bool = True,
+    ) -> GPTSoVITSPreparedCpuStage:
+        coordinator = self._ensure_prepare_coordinator()
+        spec = self._build_scheduler_request_spec(request, request_id=request_id)
+        ref_audio_prepare_future = None
+        if preload_ref_audio:
+            ref_audio_prepare_future = self.preload_ref_audio_asset(str(spec.ref_audio_path), submit_at=time.perf_counter())
+        cpu_stage = self._run_awaitable_sync(
+            coordinator.prepare_cpu_stage_profiled_async(spec, time.perf_counter())
         )
+        return GPTSoVITSPreparedCpuStage(
+            request_id=str(spec.request_id),
+            request=dict(request),
+            spec=spec,
+            cpu_stage=cpu_stage,
+            ref_audio_prepare_future=ref_audio_prepare_future,
+        )
+
+    def prepare_request_gpu_audio_phase(
+        self,
+        prepared_cpu_stage: GPTSoVITSPreparedCpuStage,
+    ) -> GPTSoVITSPreparedAudioPhase:
+        coordinator = self._ensure_prepare_coordinator()
+        phase_one_results = self._run_awaitable_sync(
+            coordinator.prepare_gpu_audio_phases_async(
+                [prepared_cpu_stage.cpu_stage],
+                prepared_ref_audio_futures=[prepared_cpu_stage.ref_audio_prepare_future],
+            )
+        )
+        if not phase_one_results:
+            raise ValueError("GPT-SoVITS prepare_gpu_audio_phases_async returned no results")
+        phase_one = phase_one_results[0]
+        if isinstance(phase_one, Exception):
+            raise phase_one
+        return GPTSoVITSPreparedAudioPhase(
+            request_id=prepared_cpu_stage.request_id,
+            prepared_cpu_stage=prepared_cpu_stage,
+            phase_one=phase_one,
+        )
+
+    def prepare_request_gpu_text_phase(
+        self,
+        prepared_audio_phase: GPTSoVITSPreparedAudioPhase,
+    ) -> GPTSoVITSPreparedTextPhase:
+        coordinator = self._ensure_prepare_coordinator()
+        phase_two_results = self._run_awaitable_sync(
+            coordinator.prepare_gpu_text_phases_async(
+                [(prepared_audio_phase.prepared_cpu_stage.cpu_stage, prepared_audio_phase.phase_one)]
+            )
+        )
+        if not phase_two_results:
+            raise ValueError("GPT-SoVITS prepare_gpu_text_phases_async returned no results")
+        phase_two = phase_two_results[0]
+        if isinstance(phase_two, Exception):
+            raise phase_two
+        return GPTSoVITSPreparedTextPhase(
+            request_id=prepared_audio_phase.request_id,
+            prepared_audio_phase=prepared_audio_phase,
+            phase_two=phase_two,
+        )
+
+    def prepare_request_ref_spec_phase(
+        self,
+        prepared_audio_phase: GPTSoVITSPreparedAudioPhase,
+    ) -> GPTSoVITSPreparedRefSpecPhase:
+        coordinator = self._ensure_prepare_coordinator()
+        ref_spec_results = self._run_awaitable_sync(
+            coordinator.prepare_ref_spec_stages_async([prepared_audio_phase.phase_one])
+        )
+        if not ref_spec_results:
+            raise ValueError("GPT-SoVITS prepare_ref_spec_stages_async returned no results")
+        ref_spec_result = ref_spec_results[0]
+        if isinstance(ref_spec_result, Exception):
+            raise ref_spec_result
+        return GPTSoVITSPreparedRefSpecPhase(
+            request_id=prepared_audio_phase.request_id,
+            prepared_audio_phase=prepared_audio_phase,
+            ref_spec_result=ref_spec_result,
+        )
+
+    def build_prepared_request_from_phases(
+        self,
+        prepared_text_phase: GPTSoVITSPreparedTextPhase,
+        prepared_ref_spec_phase: GPTSoVITSPreparedRefSpecPhase | None = None,
+    ) -> GPTSoVITSPreparedRequest:
+        coordinator = self._ensure_prepare_coordinator()
+        prepared_cpu_stage = prepared_text_phase.prepared_audio_phase.prepared_cpu_stage
+        state, _, _ = coordinator.build_gpu_prepare_result_from_phases(
+            prepared_cpu_stage.cpu_stage,
+            prepared_text_phase.prepared_audio_phase.phase_one,
+            prepared_text_phase.phase_two,
+            extra_profile=None,
+        )
+        if prepared_ref_spec_phase is not None:
+            coordinator.apply_ref_spec_result_to_state(state, prepared_ref_spec_phase.ref_spec_result)
+        return GPTSoVITSPreparedRequest(
+            request_id=prepared_text_phase.request_id,
+            state=state,
+            transport_info=self._state_to_transport_info(state, prepared_cpu_stage.request),
+        )
+
+    def prepare_request(self, request: dict[str, Any], *, request_id: str | None = None) -> GPTSoVITSPreparedRequest:
+        prepared_cpu_stage = self.prepare_request_cpu_stage(request, request_id=request_id)
+        prepared_audio_phase = self.prepare_request_gpu_audio_phase(prepared_cpu_stage)
+        prepared_ref_spec_phase = self.prepare_request_ref_spec_phase(prepared_audio_phase)
+        prepared_text_phase = self.prepare_request_gpu_text_phase(prepared_audio_phase)
+        return self.build_prepared_request_from_phases(prepared_text_phase, prepared_ref_spec_phase=prepared_ref_spec_phase)
 
     def prepare_requests(self, requests: list[dict[str, Any]]) -> list[GPTSoVITSPreparedRequest]:
         prepared: list[GPTSoVITSPreparedRequest] = []
@@ -349,62 +816,53 @@ class GPTSoVITSRuntime:
 
     def _build_ar_session_from_prepared(self, prepared: GPTSoVITSPreparedRequest) -> GPTSoVITSARSession:
         pipeline = self._ensure_pipeline()
-        with self._project_root_cwd():
-            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import (
-                _compact_cache_to_kv_lens,
-                _compact_decode_mask_to_kv_lens,
-                _pack_active_batch_into_pool,
-                build_next_xy_pos,
-                build_prefill_batch,
+        model = pipeline.t2s_model.model
+        active_batch = self._build_prefill_active_batch(model, [prepared.state])
+        if active_batch.prefill_attn_mask is None or active_batch.key_padding_mask is None:
+            raise ValueError("GPT-SoVITS AR prefill batch is missing attention masks")
+        enable_pooled_kv = str(os.environ.get("GPT_SOVITS_ENABLE_AR_KV_POOL", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.process_prompt(
+            active_batch.xy_pos,
+            active_batch.prefill_attn_mask,
+            None,
+        )
+        active_batch.kv_lens = active_batch.x_lens + active_batch.prefix_lens
+        if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
+            raise ValueError("GPT-SoVITS AR prefill did not produce KV cache")
+
+        packed_into_pool = False
+        if enable_pooled_kv:
+            packed_into_pool = bool(self._pack_active_batch_into_pool(model, active_batch))
+        if not packed_into_pool:
+            active_batch.decode_attn_mask = F.pad(
+                active_batch.key_padding_mask.unsqueeze(1).unsqueeze(1),
+                (0, 1),
+                value=False,
+            )
+            active_batch.k_cache = [
+                self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
+            ]
+            active_batch.v_cache = [
+                self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
+            ]
+            active_batch.decode_attn_mask = self._compact_decode_mask_to_kv_lens(
+                active_batch.decode_attn_mask,
+                active_batch.kv_lens,
             )
 
-            model = pipeline.t2s_model.model
-            active_batch = build_prefill_batch(model, [prepared.state])
-            if active_batch.prefill_attn_mask is None or active_batch.key_padding_mask is None:
-                raise ValueError("GPT-SoVITS AR prefill batch is missing attention masks")
-            enable_pooled_kv = str(os.environ.get("GPT_SOVITS_ENABLE_AR_KV_POOL", "")).strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-
-            xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.process_prompt(
-                active_batch.xy_pos,
-                active_batch.prefill_attn_mask,
-                None,
-            )
-            active_batch.kv_lens = active_batch.x_lens + active_batch.prefix_lens
-            if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
-                raise ValueError("GPT-SoVITS AR prefill did not produce KV cache")
-
-            packed_into_pool = False
-            if enable_pooled_kv:
-                packed_into_pool = bool(_pack_active_batch_into_pool(model, active_batch))
-            if not packed_into_pool:
-                active_batch.decode_attn_mask = torch.nn.functional.pad(
-                    active_batch.key_padding_mask.unsqueeze(1).unsqueeze(1),
-                    (0, 1),
-                    value=False,
-                )
-                active_batch.k_cache = [
-                    _compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
-                ]
-                active_batch.v_cache = [
-                    _compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
-                ]
-                active_batch.decode_attn_mask = _compact_decode_mask_to_kv_lens(
-                    active_batch.decode_attn_mask,
-                    active_batch.kv_lens,
-                )
-
-            active_batch.x = None
-            active_batch.x_lens = None
-            active_batch.key_padding_mask = None
-            active_batch.prefill_attn_mask = None
-            active_batch.prefill_done = True
-            active_batch.xy_pos = build_next_xy_pos(model, active_batch.y_sequences)
-            current_logits = model.ar_predict_layer(xy_dec[:, -1]).detach()
+        active_batch.x = None
+        active_batch.x_lens = None
+        active_batch.key_padding_mask = None
+        active_batch.prefill_attn_mask = None
+        active_batch.prefill_done = True
+        active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+        current_logits = model.ar_predict_layer(xy_dec[:, -1]).detach()
 
         return GPTSoVITSARSession(
             request_id=prepared.request_id,
@@ -425,55 +883,47 @@ class GPTSoVITSRuntime:
         token_value = int(sampled_token_id)
         with self._run_lock:
             with torch.inference_mode(False), torch.no_grad():
-                with self._project_root_cwd():
-                    from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import (
-                        _advance_decode_mask,
-                        _get_kv_pool,
-                        _materialize_decode_mask_for_active_batch,
-                        build_next_xy_pos,
+                model = pipeline.t2s_model.model
+                active_batch = session.active_batch
+                device = active_batch.y_sequences[0].device
+                token_tensor = torch.tensor([token_value], device=device, dtype=torch.long)
+                active_batch.y_sequences[0] = torch.cat([active_batch.y_sequences[0], token_tensor], dim=0)
+                active_batch.step_indices = active_batch.step_indices + 1
+                active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+
+                if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
+                    raise ValueError("GPT-SoVITS AR decode session is missing KV cache")
+
+                if active_batch.kv_cache_pooled:
+                    pool = self._get_kv_pool(model)
+                    if pool is None:
+                        raise ValueError("GPT-SoVITS AR pooled KV cache is unavailable")
+                    batched_decode_attn_mask = pool.build_decode_mask(active_batch.kv_lens + 1)
+                    xy_dec, active_batch.k_cache, active_batch.v_cache = model.decode_next_token_prealloc_runtime(
+                        active_batch.xy_pos,
+                        active_batch.k_cache,
+                        active_batch.v_cache,
+                        active_batch.kv_lens,
+                        batched_decode_attn_mask,
+                    )
+                else:
+                    batched_decode_attn_mask = None
+                    if active_batch.decode_attn_mask is not None:
+                        batched_decode_attn_mask = self._materialize_decode_mask_for_active_batch(active_batch)
+                        if not batched_decode_attn_mask.any().item():
+                            batched_decode_attn_mask = None
+                    xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.decode_next_token(
+                        active_batch.xy_pos,
+                        active_batch.k_cache,
+                        active_batch.v_cache,
+                        batched_decode_attn_mask,
+                    )
+                    active_batch.decode_attn_mask = self._advance_decode_mask(
+                        active_batch.decode_attn_mask, active_batch.kv_lens
                     )
 
-                    model = pipeline.t2s_model.model
-                    active_batch = session.active_batch
-                    device = active_batch.y_sequences[0].device
-                    token_tensor = torch.tensor([token_value], device=device, dtype=torch.long)
-                    active_batch.y_sequences[0] = torch.cat([active_batch.y_sequences[0], token_tensor], dim=0)
-                    active_batch.step_indices = active_batch.step_indices + 1
-                    active_batch.xy_pos = build_next_xy_pos(model, active_batch.y_sequences)
-
-                    if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
-                        raise ValueError("GPT-SoVITS AR decode session is missing KV cache")
-
-                    if active_batch.kv_cache_pooled:
-                        pool = _get_kv_pool(model)
-                        if pool is None:
-                            raise ValueError("GPT-SoVITS AR pooled KV cache is unavailable")
-                        batched_decode_attn_mask = pool.build_decode_mask(active_batch.kv_lens + 1)
-                        xy_dec, active_batch.k_cache, active_batch.v_cache = model.decode_next_token_prealloc_runtime(
-                            active_batch.xy_pos,
-                            active_batch.k_cache,
-                            active_batch.v_cache,
-                            active_batch.kv_lens,
-                            batched_decode_attn_mask,
-                        )
-                    else:
-                        batched_decode_attn_mask = None
-                        if active_batch.decode_attn_mask is not None:
-                            batched_decode_attn_mask = _materialize_decode_mask_for_active_batch(active_batch)
-                            if not batched_decode_attn_mask.any().item():
-                                batched_decode_attn_mask = None
-                        xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.decode_next_token(
-                            active_batch.xy_pos,
-                            active_batch.k_cache,
-                            active_batch.v_cache,
-                            batched_decode_attn_mask,
-                        )
-                        active_batch.decode_attn_mask = _advance_decode_mask(
-                            active_batch.decode_attn_mask, active_batch.kv_lens
-                        )
-
-                    active_batch.kv_lens = active_batch.kv_lens + 1
-                    session.current_logits = model.ar_predict_layer(xy_dec[:, -1]).detach()
+                active_batch.kv_lens = active_batch.kv_lens + 1
+                session.current_logits = model.ar_predict_layer(xy_dec[:, -1]).detach()
         return session.current_logits
 
     def get_ar_session_logits(self, session: GPTSoVITSARSession, *, suppress_eos_until_step: int = 11) -> torch.Tensor:
