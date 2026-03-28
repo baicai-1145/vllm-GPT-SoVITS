@@ -5,6 +5,7 @@ import sys
 import threading
 import ctypes
 import types
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -42,6 +43,39 @@ class GPTSoVITSPreparedRequest:
     request_id: str
     state: Any
     transport_info: dict[str, Any]
+
+
+@dataclass(slots=True)
+class GPTSoVITSDecodePreparedRequest:
+    request_id: str
+    semantic_tokens: torch.Tensor
+    phones: torch.Tensor
+    prompt_phones: torch.Tensor
+    prompt_semantic: torch.Tensor
+    refer_audio_spec: torch.Tensor
+    refer_audio_16k: torch.Tensor
+    raw_audio: torch.Tensor
+    raw_sr: int
+    speed_factor: float
+    sample_steps: int
+    super_sampling: bool
+
+
+@dataclass(slots=True)
+class GPTSoVITSDecodedAudio:
+    request_id: str
+    audio_fragment: Any
+    output_sr: int
+    speed_factor: float
+    super_sampling: bool
+
+
+@dataclass
+class GPTSoVITSARSession:
+    request_id: str
+    active_batch: Any
+    transport_info: dict[str, Any]
+    current_logits: torch.Tensor
 
 
 class GPTSoVITSRuntime:
@@ -139,6 +173,18 @@ class GPTSoVITSRuntime:
                 self.config_path,
             )
         return self._pipeline
+
+    def get_t2s_model(self) -> Any:
+        pipeline = self._ensure_pipeline()
+        return pipeline.t2s_model.model
+
+    def get_semantic_eos_id(self) -> int:
+        model = self.get_t2s_model()
+        return int(model.EOS)
+
+    def get_semantic_vocab_size(self) -> int:
+        model = self.get_t2s_model()
+        return int(model.vocab_size)
 
     @staticmethod
     def _load_ref_audio_with_soundfile(ref_audio_path: str) -> tuple[torch.Tensor, int]:
@@ -301,6 +347,162 @@ class GPTSoVITSRuntime:
             prepared.append(self.prepare_request(request, request_id=str(request.get("engine_request_id") or f"gpt_sovits_{index}")))
         return prepared
 
+    def _build_ar_session_from_prepared(self, prepared: GPTSoVITSPreparedRequest) -> GPTSoVITSARSession:
+        pipeline = self._ensure_pipeline()
+        with self._project_root_cwd():
+            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import (
+                _compact_cache_to_kv_lens,
+                _compact_decode_mask_to_kv_lens,
+                _pack_active_batch_into_pool,
+                build_next_xy_pos,
+                build_prefill_batch,
+            )
+
+            model = pipeline.t2s_model.model
+            active_batch = build_prefill_batch(model, [prepared.state])
+            if active_batch.prefill_attn_mask is None or active_batch.key_padding_mask is None:
+                raise ValueError("GPT-SoVITS AR prefill batch is missing attention masks")
+            enable_pooled_kv = str(os.environ.get("GPT_SOVITS_ENABLE_AR_KV_POOL", "")).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+            xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.process_prompt(
+                active_batch.xy_pos,
+                active_batch.prefill_attn_mask,
+                None,
+            )
+            active_batch.kv_lens = active_batch.x_lens + active_batch.prefix_lens
+            if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
+                raise ValueError("GPT-SoVITS AR prefill did not produce KV cache")
+
+            packed_into_pool = False
+            if enable_pooled_kv:
+                packed_into_pool = bool(_pack_active_batch_into_pool(model, active_batch))
+            if not packed_into_pool:
+                active_batch.decode_attn_mask = torch.nn.functional.pad(
+                    active_batch.key_padding_mask.unsqueeze(1).unsqueeze(1),
+                    (0, 1),
+                    value=False,
+                )
+                active_batch.k_cache = [
+                    _compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
+                ]
+                active_batch.v_cache = [
+                    _compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
+                ]
+                active_batch.decode_attn_mask = _compact_decode_mask_to_kv_lens(
+                    active_batch.decode_attn_mask,
+                    active_batch.kv_lens,
+                )
+
+            active_batch.x = None
+            active_batch.x_lens = None
+            active_batch.key_padding_mask = None
+            active_batch.prefill_attn_mask = None
+            active_batch.prefill_done = True
+            active_batch.xy_pos = build_next_xy_pos(model, active_batch.y_sequences)
+            current_logits = model.ar_predict_layer(xy_dec[:, -1]).detach()
+
+        return GPTSoVITSARSession(
+            request_id=prepared.request_id,
+            active_batch=active_batch,
+            transport_info=prepared.transport_info,
+            current_logits=current_logits,
+        )
+
+    def start_ar_session(self, request: dict[str, Any], *, request_id: str | None = None) -> GPTSoVITSARSession:
+        resolved_request_id = request_id or request.get("engine_request_id") or f"gpt_sovits_ar_{time.time_ns()}"
+        with self._run_lock:
+            with torch.inference_mode(False), torch.no_grad():
+                prepared = self.prepare_request(request, request_id=str(resolved_request_id))
+                return self._build_ar_session_from_prepared(prepared)
+
+    def advance_ar_session(self, session: GPTSoVITSARSession, sampled_token_id: int) -> torch.Tensor:
+        pipeline = self._ensure_pipeline()
+        token_value = int(sampled_token_id)
+        with self._run_lock:
+            with torch.inference_mode(False), torch.no_grad():
+                with self._project_root_cwd():
+                    from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import (
+                        _advance_decode_mask,
+                        _get_kv_pool,
+                        _materialize_decode_mask_for_active_batch,
+                        build_next_xy_pos,
+                    )
+
+                    model = pipeline.t2s_model.model
+                    active_batch = session.active_batch
+                    device = active_batch.y_sequences[0].device
+                    token_tensor = torch.tensor([token_value], device=device, dtype=torch.long)
+                    active_batch.y_sequences[0] = torch.cat([active_batch.y_sequences[0], token_tensor], dim=0)
+                    active_batch.step_indices = active_batch.step_indices + 1
+                    active_batch.xy_pos = build_next_xy_pos(model, active_batch.y_sequences)
+
+                    if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
+                        raise ValueError("GPT-SoVITS AR decode session is missing KV cache")
+
+                    if active_batch.kv_cache_pooled:
+                        pool = _get_kv_pool(model)
+                        if pool is None:
+                            raise ValueError("GPT-SoVITS AR pooled KV cache is unavailable")
+                        batched_decode_attn_mask = pool.build_decode_mask(active_batch.kv_lens + 1)
+                        xy_dec, active_batch.k_cache, active_batch.v_cache = model.decode_next_token_prealloc_runtime(
+                            active_batch.xy_pos,
+                            active_batch.k_cache,
+                            active_batch.v_cache,
+                            active_batch.kv_lens,
+                            batched_decode_attn_mask,
+                        )
+                    else:
+                        batched_decode_attn_mask = None
+                        if active_batch.decode_attn_mask is not None:
+                            batched_decode_attn_mask = _materialize_decode_mask_for_active_batch(active_batch)
+                            if not batched_decode_attn_mask.any().item():
+                                batched_decode_attn_mask = None
+                        xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.decode_next_token(
+                            active_batch.xy_pos,
+                            active_batch.k_cache,
+                            active_batch.v_cache,
+                            batched_decode_attn_mask,
+                        )
+                        active_batch.decode_attn_mask = _advance_decode_mask(
+                            active_batch.decode_attn_mask, active_batch.kv_lens
+                        )
+
+                    active_batch.kv_lens = active_batch.kv_lens + 1
+                    session.current_logits = model.ar_predict_layer(xy_dec[:, -1]).detach()
+        return session.current_logits
+
+    def get_ar_session_logits(self, session: GPTSoVITSARSession, *, suppress_eos_until_step: int = 11) -> torch.Tensor:
+        logits = session.current_logits.detach().clone()
+        active_batch = session.active_batch
+        if logits.ndim == 2 and logits.shape[-1] > self.get_semantic_eos_id():
+            step_idx = int(active_batch.step_indices[0].item()) if active_batch.step_indices.numel() > 0 else 0
+            if step_idx < suppress_eos_until_step:
+                logits[..., self.get_semantic_eos_id()] = float("-inf")
+        return logits
+
+    @staticmethod
+    def _active_batch_semantic_tokens(active_batch: Any) -> torch.Tensor:
+        if active_batch is None or not getattr(active_batch, "y_sequences", None):
+            return torch.zeros((0,), dtype=torch.long)
+        if getattr(active_batch, "prefix_lens", None) is None:
+            return torch.zeros((0,), dtype=torch.long)
+        prefix_len = int(active_batch.prefix_lens[0].item()) if active_batch.prefix_lens.numel() > 0 else 0
+        current = active_batch.y_sequences[0]
+        if not isinstance(current, torch.Tensor) or current.numel() <= prefix_len:
+            return torch.zeros((0,), dtype=torch.long, device=current.device if isinstance(current, torch.Tensor) else None)
+        return current[prefix_len:].detach().to(dtype=torch.long).contiguous()
+
+    def get_ar_session_semantic_tokens(self, session: GPTSoVITSARSession) -> torch.Tensor:
+        tokens = self._active_batch_semantic_tokens(session.active_batch)
+        if tokens.numel() > 0 and int(tokens[-1].item()) == self.get_semantic_eos_id():
+            tokens = tokens[:-1]
+        return tokens.to("cpu").contiguous()
+
     def generate_semantic_tokens(
         self,
         prepared_requests: list[GPTSoVITSPreparedRequest],
@@ -336,62 +538,126 @@ class GPTSoVITSRuntime:
             return torch.empty((0,), dtype=dtype)
         return torch.as_tensor(value, dtype=dtype)
 
-    def decode_semantic_tokens_from_transport(
+    def prepare_decode_request(
         self,
         semantic_tokens: torch.Tensor,
         transport_info: dict[str, Any],
-    ) -> GPTSoVITSResult:
+    ) -> GPTSoVITSDecodePreparedRequest:
         pipeline = self._ensure_pipeline()
         device = torch.device(getattr(pipeline.configs, "device", "cpu"))
-        semantic_tokens = semantic_tokens.detach().reshape(-1).to(device=device, dtype=torch.long)
-        if semantic_tokens.numel() == 0:
-            return GPTSoVITSResult(
-                sample_rate=int(getattr(pipeline.configs, "sampling_rate", 32000)),
-                audio=np.zeros((0,), dtype=np.float32),
+        request_id = str(
+            transport_info.get("gpt_sovits_request_id")
+            or transport_info.get("engine_request_id")
+            or transport_info.get("request_id")
+            or f"gpt_sovits_decode_{time.time_ns()}"
+        )
+        return GPTSoVITSDecodePreparedRequest(
+            request_id=request_id,
+            semantic_tokens=semantic_tokens.detach().reshape(-1).to(device=device, dtype=torch.long),
+            phones=self._tensor_from_transport(transport_info, "gpt_sovits_phones", dtype=torch.long).to(device=device),
+            prompt_phones=self._tensor_from_transport(
+                transport_info,
+                "gpt_sovits_prompt_phones",
+                dtype=torch.long,
+            ).to(device=device),
+            prompt_semantic=self._tensor_from_transport(
+                transport_info,
+                "gpt_sovits_prompt_semantic",
+                dtype=torch.long,
+            ).to(device=device),
+            refer_audio_spec=self._tensor_from_transport(
+                transport_info,
+                "gpt_sovits_refer_audio_spec",
+                dtype=torch.float32,
+            ),
+            refer_audio_16k=self._tensor_from_transport(
+                transport_info,
+                "gpt_sovits_refer_audio_16k",
+                dtype=torch.float32,
+            ),
+            raw_audio=self._tensor_from_transport(transport_info, "gpt_sovits_raw_audio", dtype=torch.float32),
+            raw_sr=int(transport_info.get("gpt_sovits_raw_sr", 0)),
+            speed_factor=float(transport_info.get("gpt_sovits_speed_factor", 1.0)),
+            sample_steps=int(transport_info.get("gpt_sovits_sample_steps", 32)),
+            super_sampling=bool(transport_info.get("gpt_sovits_super_sampling", False)),
+        )
+
+    def decode_prepared_request(
+        self,
+        prepared: GPTSoVITSDecodePreparedRequest,
+    ) -> GPTSoVITSDecodedAudio:
+        pipeline = self._ensure_pipeline()
+        if prepared.semantic_tokens.numel() == 0:
+            return GPTSoVITSDecodedAudio(
+                request_id=prepared.request_id,
+                audio_fragment=np.zeros((0,), dtype=np.float32),
+                output_sr=int(getattr(pipeline.configs, "sampling_rate", 32000)),
+                speed_factor=float(prepared.speed_factor),
+                super_sampling=bool(prepared.super_sampling),
             )
 
-        phones = self._tensor_from_transport(transport_info, "gpt_sovits_phones", dtype=torch.long).to(device=device)
-        prompt_phones = self._tensor_from_transport(transport_info, "gpt_sovits_prompt_phones", dtype=torch.long).to(device=device)
-        prompt_semantic = self._tensor_from_transport(transport_info, "gpt_sovits_prompt_semantic", dtype=torch.long).to(
-            device=device
+        refer_spec = (
+            prepared.refer_audio_spec,
+            None if prepared.refer_audio_16k.numel() == 0 else prepared.refer_audio_16k,
         )
-        refer_audio_spec = self._tensor_from_transport(transport_info, "gpt_sovits_refer_audio_spec", dtype=torch.float32)
-        refer_audio_16k = self._tensor_from_transport(transport_info, "gpt_sovits_refer_audio_16k", dtype=torch.float32)
-        raw_audio = self._tensor_from_transport(transport_info, "gpt_sovits_raw_audio", dtype=torch.float32)
-        raw_sr = int(transport_info.get("gpt_sovits_raw_sr", 0))
-        speed_factor = float(transport_info.get("gpt_sovits_speed_factor", 1.0))
-        sample_steps = int(transport_info.get("gpt_sovits_sample_steps", 32))
-        super_sampling = bool(transport_info.get("gpt_sovits_super_sampling", False))
-
-        refer_spec = (refer_audio_spec, None if refer_audio_16k.numel() == 0 else refer_audio_16k)
         with self._run_lock:
             with self._project_root_cwd():
                 audio_fragment = pipeline.synthesize_audio_request_local(
-                    semantic_tokens=semantic_tokens.unsqueeze(0).unsqueeze(0),
-                    phones=phones.unsqueeze(0),
-                    prompt_semantic=prompt_semantic,
-                    prompt_phones=prompt_phones,
+                    semantic_tokens=prepared.semantic_tokens.unsqueeze(0).unsqueeze(0),
+                    phones=prepared.phones.unsqueeze(0),
+                    prompt_semantic=prepared.prompt_semantic,
+                    prompt_phones=prepared.prompt_phones,
                     refer_spec=[refer_spec],
-                    raw_audio=raw_audio,
-                    raw_sr=raw_sr,
-                    speed=speed_factor,
-                    sample_steps=sample_steps,
+                    raw_audio=prepared.raw_audio,
+                    raw_sr=int(prepared.raw_sr),
+                    speed=float(prepared.speed_factor),
+                    sample_steps=int(prepared.sample_steps),
                 )
                 output_sr = (
                     int(pipeline.configs.sampling_rate)
                     if not pipeline.configs.use_vocoder
                     else int(pipeline.vocoder_configs["sr"])
                 )
+        return GPTSoVITSDecodedAudio(
+            request_id=prepared.request_id,
+            audio_fragment=audio_fragment,
+            output_sr=int(output_sr),
+            speed_factor=float(prepared.speed_factor),
+            super_sampling=bool(prepared.super_sampling),
+        )
+
+    def finalize_decoded_audio(
+        self,
+        decoded: GPTSoVITSDecodedAudio,
+    ) -> GPTSoVITSResult:
+        pipeline = self._ensure_pipeline()
+        with self._run_lock:
+            with self._project_root_cwd():
                 sample_rate, audio = pipeline.audio_postprocess(
-                    audio=[[audio_fragment]],
-                    sr=output_sr,
+                    audio=[[decoded.audio_fragment]],
+                    sr=int(decoded.output_sr),
                     batch_index_list=None,
-                    speed_factor=speed_factor,
+                    speed_factor=float(decoded.speed_factor),
                     split_bucket=False,
                     fragment_interval=0.0,
-                    super_sampling=super_sampling,
+                    super_sampling=bool(decoded.super_sampling),
                 )
         return GPTSoVITSResult(sample_rate=int(sample_rate), audio=self._normalize_audio(np.asarray(audio)))
+
+    def decode_semantic_tokens_from_transport(
+        self,
+        semantic_tokens: torch.Tensor,
+        transport_info: dict[str, Any],
+    ) -> GPTSoVITSResult:
+        prepared = self.prepare_decode_request(semantic_tokens, transport_info)
+        if prepared.semantic_tokens.numel() == 0:
+            pipeline = self._ensure_pipeline()
+            return GPTSoVITSResult(
+                sample_rate=int(getattr(pipeline.configs, "sampling_rate", 32000)),
+                audio=np.zeros((0,), dtype=np.float32),
+            )
+        decoded = self.decode_prepared_request(prepared)
+        return self.finalize_decoded_audio(decoded)
 
     @staticmethod
     def _normalize_audio(audio: np.ndarray) -> np.ndarray:

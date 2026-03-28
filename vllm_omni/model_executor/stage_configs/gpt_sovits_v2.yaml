@@ -9,9 +9,9 @@ stage_args:
     engine_args:
       model_stage: gpt_sovits_v2_t2s
       model_arch: GPTSoVITSV2T2S
-      worker_type: generation
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
-      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      worker_type: ar
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       distributed_executor_backend: "mp"
       enforce_eager: true
       trust_remote_code: false
@@ -20,7 +20,7 @@ stage_args:
       skip_tokenizer_init: true
       skip_mm_profiling: true
       engine_output_type: latent
-      gpu_memory_utilization: 0.45
+      gpu_memory_utilization: 0.35
       max_num_seqs: 4
       max_num_batched_tokens: 4096
       max_model_len: 4096
@@ -30,13 +30,14 @@ stage_args:
     final_output: false
     final_output_type: text
     default_sampling_params:
-      temperature: 0.0
+      temperature: 1.0
       top_p: 1.0
-      top_k: -1
-      max_tokens: 1
+      top_k: 15
+      max_tokens: 1500
       seed: 42
       detokenize: false
-      repetition_penalty: 1.0
+      repetition_penalty: 1.35
+      stop_token_ids: [1024]
   - stage_id: 1
     stage_type: llm
     engine_input_source: [0]
@@ -59,7 +60,7 @@ stage_args:
       skip_tokenizer_init: true
       skip_mm_profiling: true
       engine_output_type: audio
-      gpu_memory_utilization: 0.45
+      gpu_memory_utilization: 0.35
       max_num_seqs: 4
       max_num_batched_tokens: 4096
       max_model_len: 4096

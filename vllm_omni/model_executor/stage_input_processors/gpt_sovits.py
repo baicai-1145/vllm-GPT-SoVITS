@@ -44,10 +44,13 @@ def t2s2decode(
         if semantic_tokens.numel() == 0:
             continue
         prompt_info = _prompt_additional_info(prompt, index)
+        request_id = str(getattr(t2s_output, "request_id", getattr(output, "request_id", "")) or "")
         raw_sr = output.multimodal_output["gpt_sovits_raw_sr"]
         if isinstance(raw_sr, torch.Tensor):
             raw_sr = int(raw_sr.reshape(-1)[0].item()) if raw_sr.numel() > 0 else 0
         additional_information = {
+            "gpt_sovits_request_id": request_id,
+            "gpt_sovits_semantic_tokens": semantic_tokens,
             "gpt_sovits_phones": output.multimodal_output["gpt_sovits_phones"].to(torch.long).cpu().contiguous(),
             "gpt_sovits_prompt_phones": output.multimodal_output["gpt_sovits_prompt_phones"].to(torch.long).cpu().contiguous(),
             "gpt_sovits_prompt_semantic": output.multimodal_output["gpt_sovits_prompt_semantic"]
@@ -71,7 +74,7 @@ def t2s2decode(
         }
         decode_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=semantic_tokens.tolist(),
+                prompt_token_ids=[0],
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
                 additional_information=additional_information,

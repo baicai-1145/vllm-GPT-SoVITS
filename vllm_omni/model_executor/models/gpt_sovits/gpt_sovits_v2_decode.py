@@ -16,13 +16,14 @@ class GPTSoVITSV2Decode(nn.Module):
     """Stage-1 GPT-SoVITS v2 semantic-to-waveform decoder."""
 
     input_modalities = "audio"
+    _PREPARED_KEY = "gpt_sovits_decode_prepared"
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         del prefix
         self.vllm_config = vllm_config
         self.have_multimodal_outputs = True
-        self.has_preprocess = False
+        self.has_preprocess = True
         self.has_postprocess = False
         self.enable_update_additional_information = True
         self.requires_raw_input_tokens = True
@@ -42,11 +43,31 @@ class GPTSoVITSV2Decode(nn.Module):
         del hidden_states, sampling_metadata
         return None
 
+    def _merge_request_info(self, info_dict: dict[str, Any]) -> dict[str, Any]:
+        additional_information = info_dict.get("additional_information")
+        if not isinstance(additional_information, dict):
+            return dict(info_dict)
+        merged: dict[str, Any] = {k: v for k, v in info_dict.items() if k != "additional_information"}
+        for key, value in additional_information.items():
+            merged.setdefault(key, value)
+        return merged
+
+    @staticmethod
+    def _semantic_tokens_from_info(info: dict[str, Any]) -> torch.Tensor:
+        value = info.get("gpt_sovits_semantic_tokens")
+        if isinstance(value, torch.Tensor):
+            return value.detach().reshape(-1).to(dtype=torch.long).cpu().contiguous()
+        if value in (None, [], ()):
+            return torch.zeros((0,), dtype=torch.long)
+        return torch.as_tensor(value, dtype=torch.long).reshape(-1).cpu().contiguous()
+
     def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, Any]]:
         empty_long = torch.zeros((0,), dtype=torch.long)
         empty_float = torch.zeros((0,), dtype=torch.float32)
         return [
             {
+                "gpt_sovits_request_id": "",
+                "gpt_sovits_semantic_tokens": empty_long,
                 "gpt_sovits_phones": empty_long,
                 "gpt_sovits_prompt_phones": empty_long,
                 "gpt_sovits_prompt_semantic": empty_long,
@@ -61,7 +82,10 @@ class GPTSoVITSV2Decode(nn.Module):
 
     @staticmethod
     def _has_decode_conditioning(info: dict[str, Any]) -> bool:
+        if info.get(GPTSoVITSV2Decode._PREPARED_KEY) is not None:
+            return True
         required_keys = (
+            "gpt_sovits_semantic_tokens",
             "gpt_sovits_phones",
             "gpt_sovits_prompt_phones",
             "gpt_sovits_prompt_semantic",
@@ -78,6 +102,23 @@ class GPTSoVITSV2Decode(nn.Module):
             if value in (None, [], ()):
                 return False
         return True
+
+    def preprocess(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None,
+        **info_dict: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        merged_info = self._merge_request_info(info_dict)
+        embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+        if not self._has_decode_conditioning(merged_info):
+            return input_ids, embeds, {}
+
+        prepared = merged_info.get(self._PREPARED_KEY)
+        if prepared is None:
+            semantic_tokens = self._semantic_tokens_from_info(merged_info)
+            prepared = self.runtime.prepare_decode_request(semantic_tokens, merged_info)
+        return input_ids, embeds, {self._PREPARED_KEY: prepared}
 
     def _split_request_ids(
         self,
@@ -121,6 +162,7 @@ class GPTSoVITSV2Decode(nn.Module):
         positions: torch.Tensor | None = None,
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
+        model_intermediate_buffer: list[dict[str, Any]] | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
@@ -128,29 +170,36 @@ class GPTSoVITSV2Decode(nn.Module):
         empty = torch.zeros((0,), dtype=torch.float32)
         default_sr = torch.tensor(32000, dtype=torch.int32)
 
-        if input_ids is None or input_ids.numel() == 0:
+        request_infos = model_intermediate_buffer or runtime_additional_information or []
+        if not request_infos and (input_ids is None or input_ids.numel() == 0):
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"audio": [empty], "sr": [default_sr]},
             )
 
-        ids = input_ids.reshape(-1).to(dtype=torch.long)
-        request_infos = runtime_additional_information or []
-        request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"), request_infos)
-        if runtime_additional_information is None:
-            request_infos = [{} for _ in range(len(request_ids_list))]
-        elif len(request_infos) < len(request_ids_list):
-            request_infos = request_infos + ([{}] * (len(request_ids_list) - len(request_infos)))
+        if request_infos:
+            request_infos = [self._merge_request_info(info) for info in request_infos]
 
         audio_outputs: list[torch.Tensor] = []
         sample_rates: list[torch.Tensor] = []
+        if not request_infos:
+            ids = input_ids.reshape(-1).to(dtype=torch.long) if input_ids is not None else torch.zeros((0,), dtype=torch.long)
+            request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"), runtime_additional_information)
+            request_infos = [{} for _ in range(len(request_ids_list))]
+        else:
+            request_ids_list = [self._semantic_tokens_from_info(info) for info in request_infos]
+
         for index, semantic_ids in enumerate(request_ids_list):
             info = request_infos[index] if index < len(request_infos) else {}
             if not self._has_decode_conditioning(info):
                 audio_outputs.append(empty)
                 sample_rates.append(default_sr)
                 continue
-            result = self.runtime.decode_semantic_tokens_from_transport(semantic_ids, info)
+            prepared = info.get(self._PREPARED_KEY)
+            if prepared is None:
+                prepared = self.runtime.prepare_decode_request(semantic_ids, info)
+            decoded = self.runtime.decode_prepared_request(prepared)
+            result = self.runtime.finalize_decoded_audio(decoded)
             audio_outputs.append(torch.from_numpy(result.audio).to(dtype=torch.float32))
             sample_rates.append(torch.tensor(int(result.sample_rate), dtype=torch.int32))
 
