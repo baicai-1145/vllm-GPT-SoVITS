@@ -25,6 +25,7 @@ from vllm_omni.model_executor.models.gpt_sovits.runtime import (
     GPTSoVITSRefAudioBundle,
     GPTSoVITSPrepareRefSpecResult,
     GPTSoVITSPrepareRuntimeCoordinator,
+    GPTSoVITSRequestSpec,
     GPTSoVITSPrepareTextPhaseData,
     GPTSoVITSPreparedRefAudioAsset,
     GPTSoVITSPreparedRefSpecPhase,
@@ -758,6 +759,42 @@ def test_prepare_request_cpu_stage_uses_prepare_coordinator_and_ref_audio_preloa
     assert prepared.current_inflight == 4
     assert prepared.prompt_cpu_profiled is prompt_cpu_profiled
     assert prepared.ref_audio_prepare_future == "future"
+
+
+def test_build_scheduler_request_spec_returns_runtime_native_spec(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._ensure_pipeline = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(configs=SimpleNamespace(hz=50, max_sec=30))
+    )
+    runtime.build_tts_inputs = Mock(  # type: ignore[method-assign]
+        return_value={
+            "ref_audio_path": "/tmp/ref.wav",
+            "prompt_text": "prompt",
+            "prompt_lang": "zh",
+            "text": "text",
+            "text_lang": "zh",
+            "top_k": 5,
+            "top_p": 0.9,
+            "temperature": 1.1,
+            "repetition_penalty": 1.2,
+            "aux_ref_audio_paths": ["/tmp/a.wav", "/tmp/b.wav"],
+        }
+    )
+
+    spec = runtime._build_scheduler_request_spec({"ready_step": 7}, request_id="req-native-spec")
+
+    assert isinstance(spec, GPTSoVITSRequestSpec)
+    assert spec.request_id == "req-native-spec"
+    assert spec.ref_audio_path == "/tmp/ref.wav"
+    assert spec.prompt_text == "prompt"
+    assert spec.text == "text"
+    assert spec.top_k == 5
+    assert spec.top_p == pytest.approx(0.9)
+    assert spec.temperature == pytest.approx(1.1)
+    assert spec.repetition_penalty == pytest.approx(1.2)
+    assert spec.early_stop_num == 1500
+    assert spec.aux_ref_audio_paths == ["/tmp/a.wav", "/tmp/b.wav"]
+    assert spec.ready_step == 7
 
 
 def test_preload_ref_audio_asset_wraps_runtime_future_into_runtime_native_types(tmp_path):

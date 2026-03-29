@@ -94,10 +94,27 @@ class GPTSoVITSPreparedRequest:
 
 
 @dataclass(slots=True)
+class GPTSoVITSRequestSpec:
+    request_id: str
+    ref_audio_path: str
+    prompt_text: str
+    prompt_lang: str
+    text: str
+    text_lang: str
+    top_k: int
+    top_p: float
+    temperature: float
+    repetition_penalty: float
+    early_stop_num: int
+    aux_ref_audio_paths: list[str]
+    ready_step: int = 0
+
+
+@dataclass(slots=True)
 class GPTSoVITSPreparedCpuStage:
     request_id: str
     request: dict[str, Any]
-    spec: Any
+    spec: GPTSoVITSRequestSpec
     prepare_submit_at: float
     prepare_start: float
     prompt_text: str
@@ -116,7 +133,7 @@ class GPTSoVITSPreparedCpuStage:
 
 @dataclass(slots=True)
 class GPTSoVITSNativePreparedCpuStage:
-    spec: Any
+    spec: GPTSoVITSRequestSpec
     prepare_submit_at: float
     prepare_start: float
     prompt_text: str
@@ -1506,29 +1523,28 @@ class GPTSoVITSRuntime:
         sv_model.compute_embedding3 = types.MethodType(_compute_embedding3_float32_fbank, sv_model)
         sv_model._vllm_omni_compute_embedding3_patched = True
 
-    def _build_scheduler_request_spec(self, request: dict[str, Any], request_id: str | None = None) -> Any:
+    def _build_scheduler_request_spec(
+        self,
+        request: dict[str, Any],
+        request_id: str | None = None,
+    ) -> GPTSoVITSRequestSpec:
         pipeline = self._ensure_pipeline()
         inputs = self.build_tts_inputs(request)
-        with self._project_root_cwd():
-            from pathlib import Path
-
-            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import SchedulerRequestSpec
-
-            return SchedulerRequestSpec(
-                request_id=str(request_id or request.get("request_id") or request.get("engine_request_id") or "gpt_sovits"),
-                ref_audio_path=Path(inputs["ref_audio_path"]),
-                prompt_text=inputs["prompt_text"],
-                prompt_lang=inputs["prompt_lang"],
-                text=inputs["text"],
-                text_lang=inputs["text_lang"],
-                top_k=int(inputs["top_k"]),
-                top_p=float(inputs["top_p"]),
-                temperature=float(inputs["temperature"]),
-                repetition_penalty=float(inputs["repetition_penalty"]),
-                early_stop_num=int(getattr(pipeline.configs, "hz", 50) * getattr(pipeline.configs, "max_sec", 30)),
-                aux_ref_audio_paths=[str(item) for item in list(inputs.get("aux_ref_audio_paths") or [])],
-                ready_step=int(request.get("ready_step", 0)),
-            )
+        return GPTSoVITSRequestSpec(
+            request_id=str(request_id or request.get("request_id") or request.get("engine_request_id") or "gpt_sovits"),
+            ref_audio_path=str(inputs["ref_audio_path"]),
+            prompt_text=str(inputs["prompt_text"]),
+            prompt_lang=str(inputs["prompt_lang"]),
+            text=str(inputs["text"]),
+            text_lang=str(inputs["text_lang"]),
+            top_k=int(inputs["top_k"]),
+            top_p=float(inputs["top_p"]),
+            temperature=float(inputs["temperature"]),
+            repetition_penalty=float(inputs["repetition_penalty"]),
+            early_stop_num=int(getattr(pipeline.configs, "hz", 50) * getattr(pipeline.configs, "max_sec", 30)),
+            aux_ref_audio_paths=[str(item) for item in list(inputs.get("aux_ref_audio_paths") or [])],
+            ready_step=int(request.get("ready_step", 0)),
+        )
 
     @staticmethod
     def _clone_tensor_to_cpu(value: torch.Tensor | None, *, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -1932,7 +1948,7 @@ class GPTSoVITSRuntime:
     async def _prepare_cpu_stage_async(
         self,
         coordinator: Any,
-        spec: Any,
+        spec: GPTSoVITSRequestSpec,
         *,
         prepare_submit_at: float,
     ) -> Any:
@@ -3326,7 +3342,7 @@ class GPTSoVITSRuntime:
         self,
         *,
         pipeline: Any,
-        spec: Any,
+        spec: GPTSoVITSRequestSpec,
         prompt_text: str,
         text: str,
         prompt_result: Any,
