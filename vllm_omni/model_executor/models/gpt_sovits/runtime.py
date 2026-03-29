@@ -4771,7 +4771,8 @@ class GPTSoVITSRuntime:
 
     @staticmethod
     def _default_cut_method(text_lang: str) -> str:
-        return "cut4" if text_lang == "en" else "cut5"
+        del text_lang
+        return "cut1"
 
     def build_tts_inputs(self, request: dict[str, Any]) -> dict[str, Any]:
         text = str(request.get("text") or "").strip()

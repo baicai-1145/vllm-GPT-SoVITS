@@ -8,8 +8,6 @@ from pypinyin.core import Pinyin, Style
 from pypinyin.seg.simpleseg import simple_seg
 from pypinyin.converter import UltimateConverter
 from pypinyin.contrib.tone_convert import to_tone
-from .cuda_api import G2PWCudaConverter
-from .onnx_api import G2PWOnnxConverter
 
 current_file_path = os.path.dirname(__file__)
 CACHE_PATH = os.path.join(current_file_path, "polyphonic.pickle")
@@ -33,6 +31,8 @@ class G2PWPinyin(Pinyin):
         self._g2pw = None
         if backend in {"cuda", "auto"}:
             try:
+                from .cuda_api import G2PWCudaConverter
+
                 self._g2pw = G2PWCudaConverter(
                     model_dir=model_dir,
                     style="pinyin",
@@ -50,6 +50,8 @@ class G2PWPinyin(Pinyin):
                 if backend == "cuda" and strict_mode:
                     raise
         if self._g2pw is None:
+            from .onnx_api import G2PWOnnxConverter
+
             self._g2pw = G2PWOnnxConverter(
                 model_dir=model_dir,
                 style="pinyin",

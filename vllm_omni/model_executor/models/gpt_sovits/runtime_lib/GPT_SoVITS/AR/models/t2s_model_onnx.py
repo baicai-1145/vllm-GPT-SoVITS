@@ -3,7 +3,6 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torchmetrics.classification import MulticlassAccuracy
 
 from AR.modules.embedding_onnx import SinePositionalEmbedding, TokenEmbedding
 from AR.modules.transformer_onnx import LayerNorm, TransformerEncoder, TransformerEncoderLayer
@@ -21,6 +20,41 @@ default_config = {
 }
 
 inf_tensor_value = torch.FloatTensor([-float("Inf")]).float()
+
+
+class _MulticlassAccuracy(nn.Module):
+    """Minimal top-k accuracy metric to avoid pulling torchmetrics at import time."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        *,
+        top_k: int = 1,
+        average: str = "micro",
+        multidim_average: str = "global",
+        ignore_index: int | None = None,
+    ) -> None:
+        super().__init__()
+        del num_classes, average, multidim_average
+        self.top_k = max(1, int(top_k))
+        self.ignore_index = ignore_index
+
+    def forward(self, preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if preds.numel() == 0 or target.numel() == 0:
+            return preds.new_tensor(0.0)
+
+        topk = min(self.top_k, int(preds.shape[1]))
+        predicted = torch.topk(preds, k=topk, dim=1).indices
+        correct = (predicted == target.unsqueeze(1)).any(dim=1).reshape(-1)
+        target = target.reshape(-1)
+
+        if self.ignore_index is not None:
+            valid = target != self.ignore_index
+            if not bool(valid.any()):
+                return preds.new_tensor(0.0)
+            correct = correct[valid]
+
+        return correct.float().mean() if correct.numel() > 0 else preds.new_tensor(0.0)
 
 
 def logits_to_probs(
@@ -279,7 +313,7 @@ class Text2SemanticDecoder(nn.Module):
         )
         self.ar_predict_layer = nn.Linear(self.model_dim, self.vocab_size, bias=False)
         self.loss_fct = nn.CrossEntropyLoss(reduction="sum")
-        self.ar_accuracy_metric = MulticlassAccuracy(
+        self.ar_accuracy_metric = _MulticlassAccuracy(
             self.vocab_size,
             top_k=top_k,
             average="micro",

@@ -223,6 +223,23 @@ def test_update_intermediate_buffer_skips_unknown_req_id():
     assert "unknown_req" not in runner.model_intermediate_buffer
 
 
+def test_gather_runtime_additional_information_returns_live_buffer_dict():
+    """New requests should expose the same mutable dict to preprocess and forward."""
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    req_state = runner.requests["r1"]
+    req_state.output_token_ids = [101, 102]
+
+    gathered = OmniGPUModelRunner._gather_runtime_additional_information(runner)
+
+    assert len(gathered) == 1
+    assert "r1" in runner.model_intermediate_buffer
+    assert gathered[0] is runner.model_intermediate_buffer["r1"]
+    assert gathered[0]["generated_len"] == 2
+
+    runner.model_intermediate_buffer["r1"]["gpt_sovits_ar_session"] = "session"
+    assert gathered[0]["gpt_sovits_ar_session"] == "session"
+
+
 def test_maybe_attach_mimo_audio_req_infos_enriches_dict():
     runner = _make_runner_for_mimo()
     req_id = "r_mimo"

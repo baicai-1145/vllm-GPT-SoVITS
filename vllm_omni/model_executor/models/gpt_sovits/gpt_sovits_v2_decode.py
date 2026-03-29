@@ -7,9 +7,12 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.gpt_sovits.runtime import get_gpt_sovits_runtime
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+logger = init_logger(__name__)
 
 
 class GPTSoVITSV2Decode(nn.Module):
@@ -197,6 +200,12 @@ class GPTSoVITSV2Decode(nn.Module):
         for index, semantic_ids in enumerate(request_ids_list):
             info = request_infos[index] if index < len(request_infos) else {}
             if not self._has_decode_conditioning(info):
+                logger.warning(
+                    "GPT-SoVITS decode request %s is missing conditioning; semantic_tokens=%d keys=%s",
+                    str(info.get("gpt_sovits_request_id", index)),
+                    int(semantic_ids.numel()),
+                    sorted(info.keys()),
+                )
                 continue
             prepared = info.get(self._PREPARED_KEY)
             if prepared is not None:
@@ -224,11 +233,14 @@ class GPTSoVITSV2Decode(nn.Module):
             sample_rates.append(default_sr)
 
         if runnable_prepared:
+            logger.info("GPT-SoVITS decode running %d prepared request(s)", len(runnable_prepared))
             decoded_items = self.runtime.decode_prepared_requests(runnable_prepared)
             finalized_items = self.runtime.finalize_decoded_audios(decoded_items)
             for index, result in zip(runnable_indices, finalized_items):
                 audio_outputs[index] = torch.from_numpy(result.audio).to(dtype=torch.float32)
                 sample_rates[index] = torch.tensor(int(result.sample_rate), dtype=torch.int32)
+        else:
+            logger.warning("GPT-SoVITS decode had no runnable prepared requests")
 
         return OmniOutput(
             text_hidden_states=None,

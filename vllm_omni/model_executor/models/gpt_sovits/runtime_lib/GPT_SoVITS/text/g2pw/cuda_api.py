@@ -13,7 +13,7 @@ import numpy as np
 
 from TTS_infer_pack.prepare_gpu_timeline import trace_gpu_batch
 
-from .onnx_api import _G2PWBaseOnnxConverter
+from .backend_common import _G2PWBaseOnnxConverter
 
 
 class G2PWCudaError(RuntimeError):

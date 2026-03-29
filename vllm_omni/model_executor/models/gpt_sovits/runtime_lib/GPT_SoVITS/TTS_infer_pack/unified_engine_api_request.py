@@ -30,7 +30,7 @@ def check_params(tts: TTS, cut_method_names: Sequence[str], req: dict) -> Option
     ref_audio_path = req.get("ref_audio_path", "")
     media_type = req.get("media_type", "wav")
     prompt_lang = req.get("prompt_lang", "")
-    text_split_method = req.get("text_split_method", "cut5")
+    text_split_method = req.get("text_split_method", "cut1")
 
     if ref_audio_path in [None, ""]:
         return "ref_audio_path is required"

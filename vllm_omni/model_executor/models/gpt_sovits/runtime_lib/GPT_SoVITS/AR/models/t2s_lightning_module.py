@@ -8,14 +8,35 @@ sys.path.append(now_dir)
 from typing import Dict
 
 import torch
-from pytorch_lightning import LightningModule
+from torch import nn
 
 from AR.models.t2s_model import Text2SemanticDecoder
 from AR.modules.lr_schedulers import WarmupCosineLRSchedule
 from AR.modules.optim import ScaledAdam
 
 
-class Text2SemanticLightningModule(LightningModule):
+class _InferenceCompatibleLightningModule(nn.Module):
+    """Inference only shim for the original Lightning base class."""
+
+    def save_hyperparameters(self, *args, **kwargs):
+        del args, kwargs
+        return None
+
+    def log(self, *args, **kwargs):
+        del args, kwargs
+        return None
+
+    def manual_backward(self, loss):
+        loss.backward()
+
+    def optimizers(self):
+        raise RuntimeError("Training helpers are unavailable in the inference runtime")
+
+    def lr_schedulers(self):
+        raise RuntimeError("Training helpers are unavailable in the inference runtime")
+
+
+class Text2SemanticLightningModule(_InferenceCompatibleLightningModule):
     def __init__(self, config, output_dir, is_train=True):
         super().__init__()
         self.config = config

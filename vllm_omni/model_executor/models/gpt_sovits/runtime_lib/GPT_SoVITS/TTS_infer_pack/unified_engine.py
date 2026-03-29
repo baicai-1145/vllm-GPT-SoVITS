@@ -298,7 +298,7 @@ class UnifiedTTSEngine(EnginePublicInterface, EngineCompatInterface, EngineBridg
             if not text_path.exists():
                 continue
             text_lang = fields[1] or "zh"
-            text_split_method = fields[2] or "cut5"
+            text_split_method = fields[2] or "cut1"
             unit_limit = int(fields[3]) if len(fields) >= 4 and fields[3] not in {"", None} else 0
             raw_text = text_path.read_text(encoding="utf-8").strip()
             if not raw_text:

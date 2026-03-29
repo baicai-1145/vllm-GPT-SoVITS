@@ -108,6 +108,25 @@ def test_sv_embedding_patch_keeps_fbank_in_float32(tmp_path):
     assert pipeline.sv_model.embedding_model.last_dtype == torch.float16
 
 
+def test_build_tts_inputs_defaults_to_upstream_cut1(tmp_path):
+    wav_path = tmp_path / "ref.wav"
+    sf.write(wav_path, np.zeros(1600, dtype=np.float32), 16000)
+
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+
+    inputs = runtime.build_tts_inputs(
+        {
+            "text": "今天风很轻，路边的树叶在阳光里慢慢摇晃。",
+            "text_lang": "zh",
+            "ref_audio_path": str(wav_path),
+            "prompt_text": "朝阳下的朝圣者重申着重获新生的愿望。",
+            "prompt_lang": "zh",
+        }
+    )
+
+    assert inputs["text_split_method"] == "cut1"
+
+
 def test_get_ar_session_semantic_tokens_drops_prefix_and_trailing_eos(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     runtime.get_semantic_eos_id = lambda: 1024  # type: ignore[method-assign]
