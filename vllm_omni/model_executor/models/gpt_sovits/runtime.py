@@ -128,6 +128,14 @@ class GPTSoVITSARSession:
     current_logits: torch.Tensor
 
 
+@dataclass(slots=True)
+class GPTSoVITSARFinishedItem:
+    request_id: str
+    semantic_tokens: torch.LongTensor
+    finish_idx: int
+    finish_reason: str
+
+
 class GPTSoVITSRuntime:
     """Thin, process-local wrapper around GPT-SoVITS TTS.run()."""
 
@@ -514,6 +522,447 @@ class GPTSoVITSRuntime:
         return advanced
 
     @staticmethod
+    def _pad_cache_left(cache: torch.Tensor, target_len: int) -> torch.Tensor:
+        pad_len = target_len - cache.shape[1]
+        if pad_len <= 0:
+            return cache
+        return F.pad(cache, (0, 0, pad_len, 0), value=0)
+
+    @staticmethod
+    def _extract_cache_row(
+        cache: torch.Tensor,
+        batch_index: int,
+        kv_len: int,
+        *,
+        pooled: bool,
+    ) -> torch.Tensor:
+        if kv_len <= 0:
+            return cache[batch_index : batch_index + 1, :0, :]
+        if pooled:
+            return cache[batch_index : batch_index + 1, :kv_len, :]
+        return cache[batch_index : batch_index + 1, -kv_len:, :]
+
+    def _compact_pooled_active_batch(
+        self,
+        model: Any,
+        active_batch: Any,
+        keep_indices: Sequence[int],
+    ) -> bool:
+        pool = self._get_kv_pool(model)
+        if pool is None or active_batch.kv_lens is None:
+            return False
+        pooled_views = pool.compact_rows(keep_indices=keep_indices, kv_lens=active_batch.kv_lens)
+        if pooled_views is None:
+            active_batch.kv_cache_pooled = False
+            active_batch.kv_cache_capacity = 0
+            active_batch.kv_cache_batch_capacity = 0
+            self._set_kv_pool_active_rows(model, 0)
+            return False
+        active_batch.k_cache, active_batch.v_cache = pooled_views
+        active_batch.decode_attn_mask = None
+        active_batch.kv_cache_pooled = True
+        active_batch.kv_cache_capacity = int(pool.max_seq_len)
+        active_batch.kv_cache_batch_capacity = int(pool.max_batch_size)
+        self._set_kv_pool_active_rows(model, len(active_batch.request_ids))
+        return True
+
+    def _sample_active_batch_requests(
+        self,
+        model: Any,
+        active_batch: Any,
+        logits: torch.Tensor,
+        *,
+        max_steps: int,
+    ) -> tuple[list[GPTSoVITSARFinishedItem], list[int], list[torch.LongTensor]]:
+        with self._project_root_cwd():
+            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import (
+                _batched_sample_by_group,
+                _batched_sample_uniform,
+                _sampling_group_key,
+                _stack_token_sequences_if_same_length,
+                _uniform_sampling_group_key,
+            )
+
+        finished_items: list[GPTSoVITSARFinishedItem] = []
+        keep_indices: list[int] = []
+        updated_sequences: list[torch.LongTensor] = []
+
+        uniform_sampling_key = _uniform_sampling_group_key(active_batch)
+        sampled_items: list[torch.Tensor]
+        argmax_tokens: list[int]
+        sampled_token_tensor: torch.Tensor | None = None
+        argmax_token_tensor: torch.Tensor | None = None
+        if uniform_sampling_key is not None:
+            sampled_tensor, argmax_tensor = _batched_sample_uniform(
+                logits=logits,
+                histories=active_batch.y_sequences,
+                sampling_key=uniform_sampling_key,
+            )
+            sampled_token_tensor = sampled_tensor.view(-1)
+            argmax_token_tensor = argmax_tensor.view(-1)
+            stacked_histories = _stack_token_sequences_if_same_length(active_batch.y_sequences)
+            if (
+                all(state.early_stop_num == -1 for state in active_batch.states)
+                and int(active_batch.step_indices[0].item()) + 1 < max_steps
+                and not bool(sampled_token_tensor.eq(model.EOS).any().item())
+                and not bool(argmax_token_tensor.eq(model.EOS).any().item())
+            ):
+                return (
+                    [],
+                    list(range(len(active_batch.states))),
+                    list(torch.cat([stacked_histories, sampled_token_tensor.view(-1, 1)], dim=1).unbind(0))
+                    if stacked_histories is not None
+                    else [
+                        torch.cat([history, sampled_token_tensor[index : index + 1]], dim=0)
+                        for index, history in enumerate(active_batch.y_sequences)
+                    ],
+                )
+            sampled_items = [sampled_tensor[index : index + 1] for index in range(sampled_tensor.shape[0])]
+            argmax_tokens = [int(item) for item in argmax_tensor.tolist()]
+        else:
+            sampling_keys = [
+                _sampling_group_key(
+                    top_k=state.top_k,
+                    top_p=state.top_p,
+                    temperature=state.temperature,
+                    repetition_penalty=state.repetition_penalty,
+                    trim_eos=int(active_batch.step_indices[batch_index].item()) < 11,
+                )
+                for batch_index, state in enumerate(active_batch.states)
+            ]
+            sampled_items, argmax_tokens = _batched_sample_by_group(
+                logits=logits,
+                histories=active_batch.y_sequences,
+                sampling_keys=sampling_keys,
+            )
+
+        for batch_index, state in enumerate(active_batch.states):
+            step_index = int(active_batch.step_indices[batch_index].item())
+            current_history = active_batch.y_sequences[batch_index]
+            if sampled_token_tensor is not None and argmax_token_tensor is not None:
+                sampled = sampled_token_tensor[batch_index : batch_index + 1]
+                sampled_token = int(sampled_token_tensor[batch_index].item())
+                argmax_token = int(argmax_token_tensor[batch_index].item())
+            else:
+                sampled = sampled_items[batch_index]
+                sampled_token = int(sampled[0, 0].item())
+                argmax_token = argmax_tokens[batch_index]
+            new_history = torch.cat([current_history, sampled.view(-1)], dim=0)
+
+            finish_reason: str | None = None
+            if state.early_stop_num != -1 and (
+                new_history.shape[0] - int(active_batch.prefix_lens[batch_index].item())
+            ) > state.early_stop_num:
+                finish_reason = "early_stop"
+            elif step_index + 1 >= max_steps:
+                finish_reason = "max_step"
+            elif sampled_token == model.EOS:
+                finish_reason = "eos_sample"
+            elif argmax_token == model.EOS:
+                finish_reason = "eos_argmax"
+
+            if finish_reason is not None:
+                prefix_len = int(active_batch.prefix_lens[batch_index].item())
+                finished_items.append(
+                    GPTSoVITSARFinishedItem(
+                        request_id=str(state.request_id),
+                        semantic_tokens=new_history[prefix_len:-1].clone(),
+                        finish_idx=step_index,
+                        finish_reason=finish_reason,
+                    )
+                )
+            else:
+                keep_indices.append(batch_index)
+                updated_sequences.append(new_history)
+        return finished_items, keep_indices, updated_sequences
+
+    def _decode_active_batch_one_step(
+        self,
+        model: Any,
+        active_batch: Any,
+        *,
+        max_steps: int,
+    ) -> tuple[Any | None, list[GPTSoVITSARFinishedItem]]:
+        was_prefill = not active_batch.prefill_done
+        if was_prefill:
+            if active_batch.prefill_attn_mask is None or active_batch.key_padding_mask is None:
+                raise ValueError("GPT-SoVITS AR prefill stage is missing masks")
+            xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.process_prompt(
+                active_batch.xy_pos,
+                active_batch.prefill_attn_mask,
+                None,
+            )
+            active_batch.kv_lens = active_batch.x_lens + active_batch.prefix_lens
+            if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
+                raise ValueError("GPT-SoVITS AR prefill did not produce complete KV cache")
+            if not self._pack_active_batch_into_pool(model, active_batch):
+                active_batch.decode_attn_mask = F.pad(
+                    active_batch.key_padding_mask.unsqueeze(1).unsqueeze(1),
+                    (0, 1),
+                    value=False,
+                )
+                active_batch.k_cache = [
+                    self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
+                ]
+                active_batch.v_cache = [
+                    self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
+                ]
+                active_batch.decode_attn_mask = self._compact_decode_mask_to_kv_lens(
+                    active_batch.decode_attn_mask,
+                    active_batch.kv_lens,
+                )
+            active_batch.x = None
+            active_batch.x_lens = None
+            active_batch.key_padding_mask = None
+            active_batch.prefill_attn_mask = None
+            active_batch.prefill_done = True
+        else:
+            if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
+                raise ValueError("GPT-SoVITS AR decode stage is missing KV cache")
+            if active_batch.kv_cache_pooled:
+                pool = self._get_kv_pool(model)
+                if pool is None:
+                    raise ValueError("GPT-SoVITS AR pooled KV cache is unavailable")
+                next_kv_lens = active_batch.kv_lens + 1
+                batched_decode_attn_mask = pool.build_decode_mask(next_kv_lens)
+                xy_dec, active_batch.k_cache, active_batch.v_cache = model.decode_next_token_prealloc_runtime(
+                    active_batch.xy_pos,
+                    active_batch.k_cache,
+                    active_batch.v_cache,
+                    active_batch.kv_lens,
+                    batched_decode_attn_mask,
+                )
+            else:
+                batched_decode_attn_mask = None
+                if active_batch.decode_attn_mask is not None:
+                    batched_decode_attn_mask = self._materialize_decode_mask_for_active_batch(active_batch)
+                    if not batched_decode_attn_mask.any().item():
+                        batched_decode_attn_mask = None
+                xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.decode_next_token(
+                    active_batch.xy_pos,
+                    active_batch.k_cache,
+                    active_batch.v_cache,
+                    batched_decode_attn_mask,
+                )
+                active_batch.decode_attn_mask = self._advance_decode_mask(active_batch.decode_attn_mask, active_batch.kv_lens)
+
+        logits = model.ar_predict_layer(xy_dec[:, -1])
+        finished_items, keep_indices, updated_sequences = self._sample_active_batch_requests(
+            model,
+            active_batch,
+            logits,
+            max_steps=max_steps,
+        )
+
+        if len(keep_indices) == 0:
+            if active_batch.kv_cache_pooled:
+                self._set_kv_pool_active_rows(model, 0)
+            return None, finished_items
+
+        if len(keep_indices) == len(active_batch.request_ids):
+            active_batch.y_sequences = updated_sequences
+            active_batch.step_indices = active_batch.step_indices + 1
+            if not was_prefill and active_batch.kv_lens is not None:
+                active_batch.kv_lens = active_batch.kv_lens + 1
+            active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+            return active_batch, finished_items
+
+        device = logits.device
+        keep_tensor = torch.tensor(keep_indices, dtype=torch.long, device=device)
+        active_batch.request_ids = [active_batch.request_ids[i] for i in keep_indices]
+        active_batch.states = [active_batch.states[i] for i in keep_indices]
+        active_batch.y_sequences = updated_sequences
+        active_batch.prefix_lens = torch.index_select(active_batch.prefix_lens, dim=0, index=keep_tensor)
+        next_step_indices = torch.index_select(active_batch.step_indices, dim=0, index=keep_tensor)
+        next_kv_lens = None if active_batch.kv_lens is None else torch.index_select(active_batch.kv_lens, dim=0, index=keep_tensor)
+        active_batch.step_indices = next_step_indices + 1
+        active_batch.kv_lens = next_kv_lens if was_prefill else (None if next_kv_lens is None else next_kv_lens + 1)
+
+        if active_batch.decode_attn_mask is not None:
+            active_batch.decode_attn_mask = torch.index_select(active_batch.decode_attn_mask, dim=0, index=keep_tensor)
+            if not active_batch.decode_attn_mask.any().item():
+                active_batch.decode_attn_mask = None
+        if active_batch.kv_cache_pooled:
+            pooled_compacted = self._compact_pooled_active_batch(model, active_batch, keep_indices)
+            if not pooled_compacted:
+                active_batch.kv_cache_pooled = False
+        if (not active_batch.kv_cache_pooled) and active_batch.k_cache is not None and active_batch.v_cache is not None:
+            for cache_index in range(len(active_batch.k_cache)):
+                active_batch.k_cache[cache_index] = torch.index_select(active_batch.k_cache[cache_index], dim=0, index=keep_tensor)
+                active_batch.v_cache[cache_index] = torch.index_select(active_batch.v_cache[cache_index], dim=0, index=keep_tensor)
+            if active_batch.kv_lens is not None:
+                active_batch.k_cache = [
+                    self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
+                ]
+                active_batch.v_cache = [
+                    self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
+                ]
+                active_batch.decode_attn_mask = self._compact_decode_mask_to_kv_lens(
+                    active_batch.decode_attn_mask,
+                    active_batch.kv_lens,
+                )
+
+        active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+        return active_batch, finished_items
+
+    def _run_prefill_active_batch(
+        self,
+        model: Any,
+        states: Sequence[Any],
+        *,
+        max_steps: int,
+    ) -> tuple[Any | None, list[GPTSoVITSARFinishedItem]]:
+        if not states:
+            return None, []
+        active_batch = self._build_prefill_active_batch(model, states)
+        return self._decode_active_batch_one_step(model, active_batch, max_steps=max_steps)
+
+    def _merge_active_batches(
+        self,
+        model: Any,
+        left_batch: Any | None,
+        right_batch: Any | None,
+    ) -> Any | None:
+        if left_batch is None:
+            return right_batch
+        if right_batch is None:
+            return left_batch
+        if not left_batch.prefill_done or not right_batch.prefill_done:
+            raise ValueError("Only prefill-complete GPT-SoVITS active batches can be merged")
+        if left_batch.k_cache is None or left_batch.v_cache is None or right_batch.k_cache is None or right_batch.v_cache is None:
+            raise ValueError("GPT-SoVITS active batch merge is missing KV cache")
+        if left_batch.kv_lens is None or right_batch.kv_lens is None:
+            raise ValueError("GPT-SoVITS active batch merge is missing kv_lens")
+
+        merged_kv_lens = torch.cat([left_batch.kv_lens, right_batch.kv_lens], dim=0)
+        merged_kv_len = int(merged_kv_lens.max().item())
+        merged_mask_len = merged_kv_len + 1
+        merged_k_cache: list[torch.Tensor] = []
+        merged_v_cache: list[torch.Tensor] = []
+        left_request_count = len(left_batch.request_ids)
+        right_request_count = len(right_batch.request_ids)
+
+        for layer_index in range(len(left_batch.k_cache)):
+            layer_device = left_batch.k_cache[layer_index].device
+            layer_dtype = left_batch.k_cache[layer_index].dtype
+            layer_hidden = int(left_batch.k_cache[layer_index].shape[2])
+            merged_layer_k = torch.zeros(
+                (left_request_count + right_request_count, merged_kv_len, layer_hidden),
+                dtype=layer_dtype,
+                device=layer_device,
+            )
+            merged_layer_v = torch.zeros_like(merged_layer_k)
+            for batch_index, kv_len in enumerate(left_batch.kv_lens.tolist()):
+                if kv_len <= 0:
+                    continue
+                merged_layer_k[batch_index : batch_index + 1, -kv_len:, :] = self._extract_cache_row(
+                    left_batch.k_cache[layer_index],
+                    batch_index,
+                    int(kv_len),
+                    pooled=bool(left_batch.kv_cache_pooled),
+                )
+                merged_layer_v[batch_index : batch_index + 1, -kv_len:, :] = self._extract_cache_row(
+                    left_batch.v_cache[layer_index],
+                    batch_index,
+                    int(kv_len),
+                    pooled=bool(left_batch.kv_cache_pooled),
+                )
+            for batch_index, kv_len in enumerate(right_batch.kv_lens.tolist()):
+                if kv_len <= 0:
+                    continue
+                target_index = left_request_count + batch_index
+                merged_layer_k[target_index : target_index + 1, -kv_len:, :] = self._extract_cache_row(
+                    right_batch.k_cache[layer_index],
+                    batch_index,
+                    int(kv_len),
+                    pooled=bool(right_batch.kv_cache_pooled),
+                )
+                merged_layer_v[target_index : target_index + 1, -kv_len:, :] = self._extract_cache_row(
+                    right_batch.v_cache[layer_index],
+                    batch_index,
+                    int(kv_len),
+                    pooled=bool(right_batch.kv_cache_pooled),
+                )
+            merged_k_cache.append(merged_layer_k)
+            merged_v_cache.append(merged_layer_v)
+
+        merged_decode_attn_mask = torch.ones(
+            (left_request_count + right_request_count, 1, 1, merged_mask_len),
+            dtype=torch.bool,
+            device=merged_k_cache[0].device,
+        )
+        for batch_index, kv_len in enumerate(merged_kv_lens.tolist()):
+            merged_decode_attn_mask[batch_index : batch_index + 1, :, :, -(int(kv_len) + 1) :] = False
+        if not merged_decode_attn_mask.any().item():
+            merged_decode_attn_mask = None
+
+        active_batch_cls = self._get_t2s_active_batch_cls()
+        merged_batch = active_batch_cls(
+            request_ids=list(left_batch.request_ids) + list(right_batch.request_ids),
+            states=list(left_batch.states) + list(right_batch.states),
+            x=None,
+            x_lens=None,
+            y_sequences=list(left_batch.y_sequences) + list(right_batch.y_sequences),
+            prefix_lens=torch.cat([left_batch.prefix_lens, right_batch.prefix_lens], dim=0),
+            xy_pos=self._build_next_xy_pos(model, list(left_batch.y_sequences) + list(right_batch.y_sequences)),
+            key_padding_mask=None,
+            prefill_attn_mask=None,
+            decode_attn_mask=merged_decode_attn_mask,
+            k_cache=merged_k_cache,
+            v_cache=merged_v_cache,
+            kv_lens=merged_kv_lens,
+            step_indices=torch.cat([left_batch.step_indices, right_batch.step_indices], dim=0),
+            prefill_done=True,
+            kv_cache_pooled=False,
+            kv_cache_capacity=0,
+            kv_cache_batch_capacity=0,
+        )
+        self._pack_active_batch_into_pool(model, merged_batch)
+        return merged_batch
+
+    def _run_continuous_batch_scheduler(
+        self,
+        model: Any,
+        states: Sequence[Any],
+        *,
+        max_steps: int,
+    ) -> list[GPTSoVITSARFinishedItem]:
+        pending = sorted(states, key=lambda item: (item.ready_step, item.request_id))
+        active_batch: Any | None = None
+        finished: list[GPTSoVITSARFinishedItem] = []
+        current_tick = 0
+
+        while pending or active_batch is not None:
+            admitted: list[Any] = []
+            while pending and pending[0].ready_step <= current_tick:
+                admitted.append(pending.pop(0))
+
+            admitted_active_batch, admitted_finished = self._run_prefill_active_batch(
+                model,
+                admitted,
+                max_steps=max_steps,
+            )
+            finished.extend(admitted_finished)
+            active_batch = self._merge_active_batches(model, active_batch, admitted_active_batch)
+
+            if active_batch is not None:
+                active_batch, step_finished = self._decode_active_batch_one_step(
+                    model,
+                    active_batch,
+                    max_steps=max_steps,
+                )
+                finished.extend(step_finished)
+
+            if active_batch is None and pending:
+                current_tick = max(current_tick + 1, int(pending[0].ready_step))
+                continue
+
+            current_tick += 1
+
+        finished.sort(key=lambda item: item.request_id)
+        return finished
+
+    @staticmethod
     def _run_awaitable_sync(awaitable: Any) -> Any:
         try:
             running_loop = asyncio.get_running_loop()
@@ -780,6 +1229,180 @@ class GPTSoVITSRuntime:
             ref_spec_result=ref_spec_result,
         )
 
+    @staticmethod
+    def _profile_value(profiled: Any, key: str, default: float = 0.0) -> float:
+        return float((getattr(profiled, "profile", None) or {}).get(key, default))
+
+    def _build_prepare_profile_overrides(
+        self,
+        cpu_stage: Any,
+        phase_one: dict[str, Any],
+        phase_two: dict[str, Any],
+        *,
+        extra_profile: dict[str, float] | None = None,
+    ) -> dict[str, float]:
+        prompt_g2pw_profiled = phase_one["prompt_g2pw_profiled"]
+        target_g2pw_profiled = phase_one["target_g2pw_profiled"]
+        ref_audio_profiled = phase_one["ref_audio_profiled"]
+        prompt_feature_profiled = phase_two["prompt_feature_profiled"]
+        target_feature_profiled = phase_two["target_feature_profiled"]
+        profile_overrides = {
+            "executor_queue_ms": max(0.0, (cpu_stage.prepare_start - cpu_stage.prepare_submit_at) * 1000.0),
+            "prepare_admission_wait_ms": float(cpu_stage.prepare_admission_wait_ms),
+            "prepare_submit_ts": float(cpu_stage.prepare_submit_at),
+            "prepare_cpu_start_ts": float(cpu_stage.prepare_start),
+            "prepare_cpu_done_ts": float(
+                max(cpu_stage.prompt_cpu_profiled.finished_at, cpu_stage.target_cpu_profiled.finished_at)
+            ),
+            "prompt_text_cpu_start_ts": float(cpu_stage.prompt_cpu_profiled.started_at),
+            "prompt_text_cpu_end_ts": float(cpu_stage.prompt_cpu_profiled.finished_at),
+            "text_cpu_start_ts": float(cpu_stage.target_cpu_profiled.started_at),
+            "text_cpu_end_ts": float(cpu_stage.target_cpu_profiled.finished_at),
+            "executor_run_wall_ms": max(0.0, (time.perf_counter() - cpu_stage.prepare_start) * 1000.0),
+            "text_feature_pair_ms": float(phase_two["phase_wall_ms"]),
+            "g2pw_pair_ms": float(phase_one["g2pw_pair_ms"]),
+            "g2pw_pair_gate_wait_ms": self._profile_value(target_g2pw_profiled, "g2pw_pair_gate_wait_ms"),
+            "g2pw_pair_executor_queue_ms": self._profile_value(target_g2pw_profiled, "g2pw_pair_executor_queue_ms"),
+            "g2pw_pair_compute_ms": self._profile_value(target_g2pw_profiled, "g2pw_pair_compute_ms"),
+            "g2pw_pair_stage_overhead_ms": self._profile_value(target_g2pw_profiled, "g2pw_pair_stage_overhead_ms"),
+            "g2pw_pair_audio_batch_merge_size": self._profile_value(target_g2pw_profiled, "g2pw_pair_audio_batch_merge_size"),
+            "prompt_text_g2pw_queue_ms": float(prompt_g2pw_profiled.queue_ms),
+            "prompt_text_g2pw_run_ms": float(prompt_g2pw_profiled.run_ms),
+            "prompt_text_g2pw_prepare_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_prepare_ms"),
+            "prompt_text_g2pw_predict_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_predict_ms"),
+            "prompt_text_g2pw_post_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_post_ms"),
+            "prompt_text_g2pw_wait_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_wait_ms"),
+            "prompt_text_g2pw_admission_wait_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_admission_wait_ms"),
+            "prompt_text_g2pw_worker_queue_wait_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_worker_queue_wait_ms"),
+            "prompt_text_g2pw_batch_collect_wait_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_batch_collect_wait_ms"),
+            "prompt_text_g2pw_batch_dispatch_delay_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_batch_dispatch_delay_ms"),
+            "prompt_text_g2pw_batch_size": self._profile_value(prompt_g2pw_profiled, "g2pw_batch_size"),
+            "prompt_text_g2pw_batch_groups": self._profile_value(prompt_g2pw_profiled, "g2pw_batch_groups"),
+            "prompt_text_g2pw_batch_chars": self._profile_value(prompt_g2pw_profiled, "g2pw_batch_chars"),
+            "text_g2pw_queue_ms": float(target_g2pw_profiled.queue_ms),
+            "text_g2pw_run_ms": float(target_g2pw_profiled.run_ms),
+            "text_g2pw_prepare_ms": self._profile_value(target_g2pw_profiled, "g2pw_prepare_ms"),
+            "text_g2pw_predict_ms": self._profile_value(target_g2pw_profiled, "g2pw_predict_ms"),
+            "text_g2pw_post_ms": self._profile_value(target_g2pw_profiled, "g2pw_post_ms"),
+            "text_g2pw_wait_ms": self._profile_value(target_g2pw_profiled, "g2pw_wait_ms"),
+            "text_g2pw_admission_wait_ms": self._profile_value(target_g2pw_profiled, "g2pw_admission_wait_ms"),
+            "text_g2pw_worker_queue_wait_ms": self._profile_value(target_g2pw_profiled, "g2pw_worker_queue_wait_ms"),
+            "text_g2pw_batch_collect_wait_ms": self._profile_value(target_g2pw_profiled, "g2pw_batch_collect_wait_ms"),
+            "text_g2pw_batch_dispatch_delay_ms": self._profile_value(target_g2pw_profiled, "g2pw_batch_dispatch_delay_ms"),
+            "text_g2pw_batch_size": self._profile_value(target_g2pw_profiled, "g2pw_batch_size"),
+            "text_g2pw_batch_groups": self._profile_value(target_g2pw_profiled, "g2pw_batch_groups"),
+            "text_g2pw_batch_chars": self._profile_value(target_g2pw_profiled, "g2pw_batch_chars"),
+            "prompt_text_parallel_future_wait_ms": 0.0,
+            "prompt_text_parallel_future_executor_queue_ms": 0.0,
+            "prompt_text_parallel_future_run_ms": 0.0,
+            "prompt_text_parallel_future_finish_after_submit_ms": 0.0,
+            "prompt_text_parallel_future_queue_tail_after_target_ms": 0.0,
+            "prompt_text_parallel_future_run_tail_after_target_ms": 0.0,
+            "prompt_text_cpu_queue_ms": float(cpu_stage.prompt_cpu_profiled.queue_ms),
+            "prompt_text_cpu_run_ms": float(cpu_stage.prompt_cpu_profiled.run_ms),
+            "prompt_text_cpu_admission_wait_ms": self._profile_value(cpu_stage.prompt_cpu_profiled, "text_cpu_admission_wait_ms"),
+            "prompt_text_cpu_backpressure_wait_ms": self._profile_value(cpu_stage.prompt_cpu_profiled, "text_cpu_backpressure_wait_ms"),
+            "prompt_text_cpu_capacity_wait_ms": self._profile_value(cpu_stage.prompt_cpu_profiled, "text_cpu_capacity_wait_ms"),
+            "prompt_text_feature_queue_ms": float(prompt_feature_profiled.queue_ms),
+            "prompt_text_feature_run_ms": float(prompt_feature_profiled.run_ms),
+            "text_cpu_queue_ms": float(cpu_stage.target_cpu_profiled.queue_ms),
+            "text_cpu_run_ms": float(cpu_stage.target_cpu_profiled.run_ms),
+            "text_cpu_admission_wait_ms": self._profile_value(cpu_stage.target_cpu_profiled, "text_cpu_admission_wait_ms"),
+            "text_cpu_backpressure_wait_ms": self._profile_value(cpu_stage.target_cpu_profiled, "text_cpu_backpressure_wait_ms"),
+            "text_cpu_capacity_wait_ms": self._profile_value(cpu_stage.target_cpu_profiled, "text_cpu_capacity_wait_ms"),
+            "text_feature_queue_ms": float(target_feature_profiled.queue_ms),
+            "text_feature_run_ms": float(target_feature_profiled.run_ms),
+            "ref_audio_task_queue_ms": float(ref_audio_profiled.queue_ms),
+            "ref_audio_task_run_ms": float(ref_audio_profiled.run_ms),
+            "worker_prepare_inflight_on_enter": float(cpu_stage.current_inflight),
+            "worker_prepare_peak_inflight": float(cpu_stage.peak_inflight),
+        }
+        if extra_profile:
+            profile_overrides.update({key: float(value) for key, value in extra_profile.items()})
+        return profile_overrides
+
+    def _build_ref_audio_bundle_from_phase(
+        self,
+        phase_one: dict[str, Any],
+        *,
+        ref_spec_result: tuple[tuple[Any, Any], dict[str, float]] | None = None,
+    ) -> dict[str, Any]:
+        ref_audio_profiled = phase_one["ref_audio_profiled"]
+        ref_audio_bundle = dict(ref_audio_profiled.result)
+        ref_audio_profile = dict(ref_audio_bundle.get("profile", {}))
+        if ref_spec_result is not None:
+            refer_spec, ref_spec_profile = ref_spec_result
+            ref_audio_bundle["refer_spec"] = refer_spec
+            ref_audio_profile.update(
+                {
+                    "ref_spec_wait_ms": float(ref_spec_profile.get("ref_spec_wait_ms", 0.0)),
+                    "ref_spec_ms": float(ref_spec_profile.get("ref_spec_ms", 0.0)),
+                    "ref_spec_to_device_ms": float(ref_spec_profile.get("ref_spec_to_device_ms", 0.0)),
+                    "ref_spec_main_resample_ms": float(ref_spec_profile.get("ref_spec_main_resample_ms", 0.0)),
+                    "ref_spec_norm_ms": float(ref_spec_profile.get("ref_spec_norm_ms", 0.0)),
+                    "ref_spec_spectrogram_ms": float(ref_spec_profile.get("ref_spec_spectrogram_ms", 0.0)),
+                    "ref_spec_post_resample_ms": float(ref_spec_profile.get("ref_spec_post_resample_ms", 0.0)),
+                }
+            )
+        else:
+            ref_audio_bundle["refer_spec"] = None
+            ref_audio_profile.setdefault("ref_spec_wait_ms", 0.0)
+            ref_audio_profile.setdefault("ref_spec_ms", 0.0)
+            ref_audio_profile.setdefault("ref_spec_to_device_ms", 0.0)
+            ref_audio_profile.setdefault("ref_spec_main_resample_ms", 0.0)
+            ref_audio_profile.setdefault("ref_spec_norm_ms", 0.0)
+            ref_audio_profile.setdefault("ref_spec_spectrogram_ms", 0.0)
+            ref_audio_profile.setdefault("ref_spec_post_resample_ms", 0.0)
+        ref_audio_bundle["profile"] = ref_audio_profile
+        return ref_audio_bundle
+
+    def _build_request_state_from_prepare_phases(
+        self,
+        prepared_cpu_stage: GPTSoVITSPreparedCpuStage,
+        phase_one: dict[str, Any],
+        phase_two: dict[str, Any],
+        *,
+        ref_spec_result: tuple[tuple[Any, Any], dict[str, float]] | None = None,
+        extra_profile: dict[str, float] | None = None,
+    ) -> Any:
+        pipeline = self._ensure_pipeline()
+        profile_overrides = self._build_prepare_profile_overrides(
+            prepared_cpu_stage.cpu_stage,
+            phase_one,
+            phase_two,
+            extra_profile=extra_profile,
+        )
+        ref_audio_bundle = self._build_ref_audio_bundle_from_phase(
+            phase_one,
+            ref_spec_result=ref_spec_result,
+        )
+        with self._project_root_cwd():
+            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import build_request_state_from_parts
+
+            state = build_request_state_from_parts(
+                tts=pipeline,
+                spec=prepared_cpu_stage.cpu_stage.spec,
+                prompt_text=prepared_cpu_stage.cpu_stage.prompt_text,
+                text=prepared_cpu_stage.cpu_stage.text,
+                prompt_result=phase_two["prompt_feature_profiled"].result,
+                target_result=phase_two["target_feature_profiled"].result,
+                ref_audio_bundle=ref_audio_bundle,
+                prepare_start=prepared_cpu_stage.cpu_stage.prepare_start,
+                prepare_sync_start=prepared_cpu_stage.cpu_stage.prepare_start,
+                profile_overrides=profile_overrides,
+            )
+        prepare_exec_finished_at = time.perf_counter()
+        state.prepare_profile["executor_run_wall_ms"] = max(
+            0.0,
+            (prepare_exec_finished_at - prepared_cpu_stage.cpu_stage.prepare_start) * 1000.0,
+        )
+        return state
+
+    def _release_prepare_split_stage_slot(self, coordinator: Any) -> None:
+        release_slot = getattr(coordinator, "_release_split_stage_slot", None)
+        if callable(release_slot):
+            release_slot()
+
     def build_prepared_request_from_phases(
         self,
         prepared_text_phase: GPTSoVITSPreparedTextPhase,
@@ -787,14 +1410,18 @@ class GPTSoVITSRuntime:
     ) -> GPTSoVITSPreparedRequest:
         coordinator = self._ensure_prepare_coordinator()
         prepared_cpu_stage = prepared_text_phase.prepared_audio_phase.prepared_cpu_stage
-        state, _, _ = coordinator.build_gpu_prepare_result_from_phases(
-            prepared_cpu_stage.cpu_stage,
-            prepared_text_phase.prepared_audio_phase.phase_one,
-            prepared_text_phase.phase_two,
-            extra_profile=None,
-        )
-        if prepared_ref_spec_phase is not None:
-            coordinator.apply_ref_spec_result_to_state(state, prepared_ref_spec_phase.ref_spec_result)
+        try:
+            state = self._build_request_state_from_prepare_phases(
+                prepared_cpu_stage,
+                prepared_text_phase.prepared_audio_phase.phase_one,
+                prepared_text_phase.phase_two,
+                ref_spec_result=(
+                    prepared_ref_spec_phase.ref_spec_result if prepared_ref_spec_phase is not None else None
+                ),
+                extra_profile=None,
+            )
+        finally:
+            self._release_prepare_split_stage_slot(coordinator)
         return GPTSoVITSPreparedRequest(
             request_id=prepared_text_phase.request_id,
             state=state,
@@ -965,10 +1592,11 @@ class GPTSoVITSRuntime:
         states = [item.state for item in prepared_requests]
         max_steps = int(max_steps or self._estimate_scheduler_max_steps(states))
         with self._run_lock:
-            with self._project_root_cwd():
-                from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import run_scheduler_continuous
-
-                finished_items = run_scheduler_continuous(pipeline.t2s_model.model, states, max_steps=max_steps)
+            finished_items = self._run_continuous_batch_scheduler(
+                pipeline.t2s_model.model,
+                states,
+                max_steps=max_steps,
+            )
         return {
             str(item.request_id): item.semantic_tokens.detach().to("cpu").contiguous().to(dtype=torch.long)
             for item in finished_items
