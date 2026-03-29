@@ -102,6 +102,20 @@ class GPTSoVITSPreparedCpuStage:
 
 
 @dataclass(slots=True)
+class GPTSoVITSNativePreparedCpuStage:
+    spec: Any
+    prepare_submit_at: float
+    prepare_start: float
+    prompt_text: str
+    text: str
+    prepare_admission_wait_ms: float
+    current_inflight: int
+    peak_inflight: int
+    prompt_cpu_profiled: Any
+    target_cpu_profiled: Any
+
+
+@dataclass(slots=True)
 class GPTSoVITSPreparedAudioPhase:
     request_id: str
     prepared_cpu_stage: GPTSoVITSPreparedCpuStage
@@ -148,6 +162,28 @@ class GPTSoVITST2SRequestState:
     early_stop_num: int
     ready_step: int
     prepare_profile: dict[str, float]
+
+
+@dataclass(slots=True)
+class GPTSoVITSActiveBatch:
+    request_ids: list[str]
+    states: list[Any]
+    x: torch.Tensor | None
+    x_lens: torch.LongTensor | None
+    y_sequences: list[torch.LongTensor]
+    prefix_lens: torch.LongTensor
+    xy_pos: torch.Tensor
+    key_padding_mask: torch.Tensor | None
+    prefill_attn_mask: torch.Tensor | None
+    decode_attn_mask: torch.Tensor | None
+    k_cache: list[torch.Tensor] | None
+    v_cache: list[torch.Tensor] | None
+    kv_lens: torch.LongTensor | None
+    step_indices: torch.LongTensor
+    prefill_done: bool
+    kv_cache_pooled: bool = False
+    kv_cache_capacity: int = 0
+    kv_cache_batch_capacity: int = 0
 
 
 @dataclass(slots=True)
@@ -226,8 +262,6 @@ class GPTSoVITSRuntime:
         self._pipeline: Any | None = None
         self._config: Any | None = None
         self._prepare_coordinator: Any | None = None
-        self._prepared_cpu_stage_cls: Any | None = None
-        self._t2s_active_batch_cls: Any | None = None
         self._native_runtime_ready = False
 
     def _resolve_path(self, maybe_relative_path: str) -> str:
@@ -332,34 +366,6 @@ class GPTSoVITSRuntime:
                 self._prepare_coordinator = PrepareCoordinator(pipeline)
         return self._prepare_coordinator
 
-    def _get_t2s_active_batch_cls(self) -> Any:
-        if self._t2s_active_batch_cls is not None:
-            return self._t2s_active_batch_cls
-        with self._init_lock:
-            if self._t2s_active_batch_cls is not None:
-                return self._t2s_active_batch_cls
-            self._ensure_import_path()
-            self._ensure_native_runtime_deps()
-            with self._project_root_cwd():
-                from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import T2SActiveBatch
-
-            self._t2s_active_batch_cls = T2SActiveBatch
-        return self._t2s_active_batch_cls
-
-    def _get_prepare_cpu_stage_cls(self) -> Any:
-        if self._prepared_cpu_stage_cls is not None:
-            return self._prepared_cpu_stage_cls
-        with self._init_lock:
-            if self._prepared_cpu_stage_cls is not None:
-                return self._prepared_cpu_stage_cls
-            self._ensure_import_path()
-            self._ensure_native_runtime_deps()
-            with self._project_root_cwd():
-                from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import PreparedCpuStage
-
-            self._prepared_cpu_stage_cls = PreparedCpuStage
-        return self._prepared_cpu_stage_cls
-
     @staticmethod
     def _ensure_audio_position_encoding(
         model: Any,
@@ -423,8 +429,7 @@ class GPTSoVITSRuntime:
         causal_mask = torch.cat([x_mask, y_mask], dim=0).unsqueeze(0)
         attn_mask = causal_mask.logical_or(key_padding_mask.unsqueeze(1)).unsqueeze(1)
 
-        active_batch_cls = self._get_t2s_active_batch_cls()
-        return active_batch_cls(
+        return GPTSoVITSActiveBatch(
             request_ids=[str(state.request_id) for state in states],
             states=list(states),
             x=x_batch,
@@ -1118,8 +1123,7 @@ class GPTSoVITSRuntime:
         if not merged_decode_attn_mask.any().item():
             merged_decode_attn_mask = None
 
-        active_batch_cls = self._get_t2s_active_batch_cls()
-        merged_batch = active_batch_cls(
+        merged_batch = GPTSoVITSActiveBatch(
             request_ids=list(left_batch.request_ids) + list(right_batch.request_ids),
             states=list(left_batch.states) + list(right_batch.states),
             x=None,
@@ -1711,8 +1715,7 @@ class GPTSoVITSRuntime:
                 text,
                 spec.text_lang,
             )
-            prepared_cpu_stage_cls = self._get_prepare_cpu_stage_cls()
-            return prepared_cpu_stage_cls(
+            return GPTSoVITSNativePreparedCpuStage(
                 spec=spec,
                 prepare_submit_at=float(prepare_submit_at),
                 prepare_start=float(prepare_start),
@@ -3577,11 +3580,12 @@ class GPTSoVITSRuntime:
         states = [item.state for item in prepared_requests]
         max_steps = int(max_steps or self._estimate_scheduler_max_steps(states))
         with self._run_lock:
-            finished_items = self._run_continuous_batch_scheduler(
-                pipeline.t2s_model.model,
-                states,
-                max_steps=max_steps,
-            )
+            with torch.inference_mode(False), torch.no_grad():
+                finished_items = self._run_continuous_batch_scheduler(
+                    pipeline.t2s_model.model,
+                    states,
+                    max_steps=max_steps,
+                )
         return {
             str(item.request_id): item.semantic_tokens.detach().to("cpu").contiguous().to(dtype=torch.long)
             for item in finished_items

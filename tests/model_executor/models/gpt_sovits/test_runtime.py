@@ -11,9 +11,11 @@ import torch
 import torch.nn as nn
 
 from vllm_omni.model_executor.models.gpt_sovits.runtime import (
+    GPTSoVITSActiveBatch,
     GPTSoVITSARFinishedItem,
     GPTSoVITSARSession,
     GPTSoVITSDecodedAudio,
+    GPTSoVITSNativePreparedCpuStage,
     GPTSoVITSPreparedAudioPhase,
     GPTSoVITSPreparedCpuStage,
     GPTSoVITSPrepareProfiledResult,
@@ -745,7 +747,6 @@ def test_prepare_cpu_stage_async_uses_runtime_native_text_cpu_pair(tmp_path):
     )
     runtime._normalize_prepare_sentence = Mock(return_value="normalized prompt")  # type: ignore[method-assign]
     runtime._run_text_cpu_stage_pair = AsyncMock(return_value=(prompt_cpu_profiled, target_cpu_profiled))  # type: ignore[method-assign]
-    runtime._get_prepare_cpu_stage_cls = Mock(side_effect=lambda: lambda **kwargs: SimpleNamespace(**kwargs))  # type: ignore[method-assign]
 
     stage = runtime._run_awaitable_sync(
         runtime._prepare_cpu_stage_async(
@@ -762,6 +763,7 @@ def test_prepare_cpu_stage_async_uses_runtime_native_text_cpu_pair(tmp_path):
         "target",
         "zh",
     )
+    assert isinstance(stage, GPTSoVITSNativePreparedCpuStage)
     assert stage.prompt_text == "normalized prompt"
     assert stage.text == "target"
     assert stage.current_inflight == 2
@@ -1289,7 +1291,6 @@ def test_merge_active_batches_uses_runtime_native_merge_helpers(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     runtime._build_next_xy_pos = Mock(return_value=torch.ones((2, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
     runtime._pack_active_batch_into_pool = Mock(return_value=False)  # type: ignore[method-assign]
-    runtime._get_t2s_active_batch_cls = Mock(return_value=SimpleNamespace)  # type: ignore[method-assign]
 
     left_batch = SimpleNamespace(
         request_ids=["left"],
@@ -1320,6 +1321,7 @@ def test_merge_active_batches_uses_runtime_native_merge_helpers(tmp_path):
 
     runtime._build_next_xy_pos.assert_called_once()
     runtime._pack_active_batch_into_pool.assert_called_once()
+    assert isinstance(merged, GPTSoVITSActiveBatch)
     assert merged.request_ids == ["left", "right"]
     assert torch.equal(merged.kv_lens, torch.tensor([2, 2], dtype=torch.long))
     assert torch.equal(merged.step_indices, torch.tensor([0, 1], dtype=torch.long))
@@ -1344,3 +1346,23 @@ def test_run_continuous_batch_scheduler_uses_runtime_native_loop(tmp_path):
     assert [item.request_id for item in finished] == ["a", "b"]
     assert runtime._run_prefill_active_batch.call_args_list[0].args[1] == [state_now]
     assert runtime._run_prefill_active_batch.call_args_list[1].args[1] == [state_late]
+
+
+def test_generate_semantic_tokens_runs_scheduler_under_no_grad(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._ensure_pipeline = Mock(return_value=SimpleNamespace(t2s_model=SimpleNamespace(model="fake-model")))  # type: ignore[method-assign]
+    runtime._estimate_scheduler_max_steps = Mock(return_value=8)  # type: ignore[method-assign]
+
+    def _fake_scheduler(model, states, max_steps):
+        assert model == "fake-model"
+        assert max_steps == 8
+        assert torch.is_grad_enabled() is False
+        assert torch.is_inference_mode_enabled() is False
+        return [GPTSoVITSARFinishedItem("req-a", torch.tensor([1, 2], dtype=torch.long), 0, "done")]
+
+    runtime._run_continuous_batch_scheduler = Mock(side_effect=_fake_scheduler)  # type: ignore[method-assign]
+    prepared = [SimpleNamespace(state=SimpleNamespace(request_id="req-a"), request_id="req-a")]
+
+    result = runtime.generate_semantic_tokens(prepared)
+
+    assert torch.equal(result["req-a"], torch.tensor([1, 2], dtype=torch.long))
