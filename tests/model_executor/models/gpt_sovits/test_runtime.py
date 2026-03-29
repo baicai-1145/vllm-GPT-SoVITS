@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import time
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
@@ -16,9 +17,16 @@ from vllm_omni.model_executor.models.gpt_sovits.runtime import (
     GPTSoVITSARSession,
     GPTSoVITSDecodedAudio,
     GPTSoVITSNativePreparedCpuStage,
+    GPTSoVITSPrepareAudioPhaseData,
     GPTSoVITSPreparedAudioPhase,
     GPTSoVITSPreparedCpuStage,
     GPTSoVITSPrepareProfiledResult,
+    GPTSoVITSReferSpec,
+    GPTSoVITSRefAudioBundle,
+    GPTSoVITSPrepareRefSpecResult,
+    GPTSoVITSPrepareRuntimeCoordinator,
+    GPTSoVITSPrepareTextPhaseData,
+    GPTSoVITSPreparedRefAudioAsset,
     GPTSoVITSPreparedRefSpecPhase,
     GPTSoVITSPreparedTextPhase,
     GPTSoVITSRuntime,
@@ -366,7 +374,7 @@ def test_decode_prepared_requests_batches_vocoder_groups_by_prompt_context(tmp_p
     other_prompt_key = ("other",)
     runtime._ensure_pipeline = Mock(return_value=pipeline)  # type: ignore[method-assign]
     runtime._build_refer_spec_from_prepared = Mock(  # type: ignore[method-assign]
-        side_effect=lambda prepared: (prepared.refer_audio_spec, None)
+        side_effect=lambda prepared: GPTSoVITSReferSpec(prepared.refer_audio_spec, None)
     )
     runtime._build_vocoder_prompt_cache_key = Mock(  # type: ignore[method-assign]
         side_effect=lambda prepared, refer_audio_spec: shared_prompt_key if prepared.request_id in {"a", "b"} else other_prompt_key
@@ -554,7 +562,7 @@ def test_decode_prepared_requests_grouped_vocoder_reuses_prompt_context_once(tmp
     pipeline = SimpleNamespace(configs=SimpleNamespace(device="cpu"))
     prompt_context = {"output_sr": 24000}
     runtime._build_refer_spec_from_prepared = Mock(  # type: ignore[method-assign]
-        side_effect=lambda prepared: (prepared.refer_audio_spec, None)
+        side_effect=lambda prepared: GPTSoVITSReferSpec(prepared.refer_audio_spec, None)
     )
     runtime._build_vocoder_prompt_context = Mock(return_value=prompt_context)  # type: ignore[method-assign]
     runtime._decode_vocoder_with_prompt_context = Mock(  # type: ignore[method-assign]
@@ -602,7 +610,7 @@ def test_decode_prepared_requests_grouped_vocoder_batches_same_target_config(tmp
     pipeline = SimpleNamespace(configs=SimpleNamespace(device="cpu"))
     prompt_context = {"output_sr": 24000}
     runtime._build_refer_spec_from_prepared = Mock(  # type: ignore[method-assign]
-        side_effect=lambda prepared: (prepared.refer_audio_spec, None)
+        side_effect=lambda prepared: GPTSoVITSReferSpec(prepared.refer_audio_spec, None)
     )
     runtime._build_vocoder_prompt_context = Mock(return_value=prompt_context)  # type: ignore[method-assign]
     runtime._decode_prepared_requests_batched_vocoder = Mock(  # type: ignore[method-assign]
@@ -718,13 +726,26 @@ def test_decode_prepared_requests_batched_vocoder_uses_native_components(tmp_pat
 def test_prepare_request_cpu_stage_uses_prepare_coordinator_and_ref_audio_preload(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     spec = SimpleNamespace(request_id="req-1", ref_audio_path="/tmp/ref.wav")
-    cpu_stage = SimpleNamespace(stage="cpu")
+    prompt_cpu_profiled = SimpleNamespace()
+    target_cpu_profiled = SimpleNamespace()
+    native_cpu_stage = GPTSoVITSNativePreparedCpuStage(
+        spec=spec,
+        prepare_submit_at=1.0,
+        prepare_start=2.0,
+        prompt_text="prompt",
+        text="text",
+        prepare_admission_wait_ms=3.0,
+        current_inflight=4,
+        peak_inflight=5,
+        prompt_cpu_profiled=prompt_cpu_profiled,
+        target_cpu_profiled=target_cpu_profiled,
+    )
     coordinator = SimpleNamespace()
     runtime._ensure_prepare_coordinator = Mock(return_value=coordinator)  # type: ignore[method-assign]
     runtime._build_scheduler_request_spec = Mock(return_value=spec)  # type: ignore[method-assign]
     runtime.preload_ref_audio_asset = Mock(return_value="future")  # type: ignore[method-assign]
     runtime._prepare_cpu_stage_async = Mock(return_value="awaitable")  # type: ignore[method-assign]
-    runtime._run_awaitable_sync = Mock(return_value=cpu_stage)  # type: ignore[method-assign]
+    runtime._run_awaitable_sync = Mock(return_value=native_cpu_stage)  # type: ignore[method-assign]
 
     prepared = runtime.prepare_request_cpu_stage({"text": "hello"}, request_id="req-1")
 
@@ -732,8 +753,44 @@ def test_prepare_request_cpu_stage_uses_prepare_coordinator_and_ref_audio_preloa
     runtime._prepare_cpu_stage_async.assert_called_once()
     assert prepared.request_id == "req-1"
     assert prepared.spec is spec
-    assert prepared.cpu_stage is cpu_stage
+    assert prepared.prompt_text == "prompt"
+    assert prepared.text == "text"
+    assert prepared.current_inflight == 4
+    assert prepared.prompt_cpu_profiled is prompt_cpu_profiled
     assert prepared.ref_audio_prepare_future == "future"
+
+
+def test_preload_ref_audio_asset_wraps_runtime_future_into_runtime_native_types(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    source_future: concurrent.futures.Future = concurrent.futures.Future()
+    runtime._prepare_coordinator = runtime._coerce_prepare_coordinator(
+        SimpleNamespace(
+            submit_prepare_ref_audio_asset=Mock(return_value=source_future),
+        )
+    )
+
+    wrapped_future = runtime.preload_ref_audio_asset("/tmp/ref.wav", submit_at=1.25)
+    source_future.set_result(
+        SimpleNamespace(
+            result=SimpleNamespace(
+                raw_audio=torch.tensor([0.1], dtype=torch.float32),
+                raw_sr=16000,
+                wav16k=torch.tensor([0.2], dtype=torch.float32),
+                profile={"prepared_ref_audio_cache_hit": 1.0},
+            ),
+            submit_at=1.25,
+            started_at=1.5,
+            finished_at=2.0,
+            profile={"future_profile": 3.0},
+        )
+    )
+    profiled = wrapped_future.result(timeout=1.0)
+
+    assert isinstance(profiled, GPTSoVITSPrepareProfiledResult)
+    assert isinstance(profiled.result, GPTSoVITSPreparedRefAudioAsset)
+    assert profiled.result.raw_sr == 16000
+    assert profiled.result.profile["prepared_ref_audio_cache_hit"] == 1.0
+    assert profiled.profile == {"future_profile": 3.0}
 
 
 def test_prepare_cpu_stage_async_uses_runtime_native_text_cpu_pair(tmp_path):
@@ -757,12 +814,15 @@ def test_prepare_cpu_stage_async_uses_runtime_native_text_cpu_pair(tmp_path):
     )
 
     runtime._run_text_cpu_stage_pair.assert_awaited_once_with(
-        coordinator,
+        ANY,
         "normalized prompt",
         "zh",
         "target",
         "zh",
     )
+    forwarded_coordinator = runtime._run_text_cpu_stage_pair.await_args.args[0]
+    assert isinstance(forwarded_coordinator, GPTSoVITSPrepareRuntimeCoordinator)
+    assert forwarded_coordinator.mark_prepare_enter() == (2, 4)
     assert isinstance(stage, GPTSoVITSNativePreparedCpuStage)
     assert stage.prompt_text == "normalized prompt"
     assert stage.text == "target"
@@ -775,9 +835,25 @@ def test_prepare_request_split_phase_helpers_build_state_from_explicit_phases(tm
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     coordinator = SimpleNamespace(_release_split_stage_slot=Mock())
     runtime._ensure_prepare_coordinator = Mock(return_value=coordinator)  # type: ignore[method-assign]
-    runtime._prepare_gpu_audio_phase_async = AsyncMock(return_value={"phase": "audio"})  # type: ignore[method-assign]
-    runtime._prepare_ref_spec_phase_async = AsyncMock(return_value=(("spec", "wav16k"), {"ref_spec_ms": 1.0}))  # type: ignore[method-assign]
-    runtime._prepare_gpu_text_phase_async = AsyncMock(return_value={"phase": "text"})  # type: ignore[method-assign]
+    audio_phase = GPTSoVITSPrepareAudioPhaseData(
+        prompt_g2pw_profiled="prompt-g2pw",
+        target_g2pw_profiled="target-g2pw",
+        ref_audio_profiled="ref-audio",
+        g2pw_pair_ms=1.0,
+        phase_wall_ms=2.0,
+    )
+    ref_spec_result = GPTSoVITSPrepareRefSpecResult(
+        refer_spec=GPTSoVITSReferSpec("spec", "wav16k"),
+        profile={"ref_spec_ms": 1.0},
+    )
+    text_phase = GPTSoVITSPrepareTextPhaseData(
+        prompt_feature_profiled="prompt-feature",
+        target_feature_profiled="target-feature",
+        phase_wall_ms=3.0,
+    )
+    runtime._prepare_gpu_audio_phase_async = AsyncMock(return_value=audio_phase)  # type: ignore[method-assign]
+    runtime._prepare_ref_spec_phase_async = AsyncMock(return_value=ref_spec_result)  # type: ignore[method-assign]
+    runtime._prepare_gpu_text_phase_async = AsyncMock(return_value=text_phase)  # type: ignore[method-assign]
     runtime._build_request_state_from_prepare_phases = Mock(return_value=SimpleNamespace(state="ok"))  # type: ignore[method-assign]
     runtime._state_to_transport_info = Mock(return_value={"transport": "ok"})  # type: ignore[method-assign]
 
@@ -785,7 +861,15 @@ def test_prepare_request_split_phase_helpers_build_state_from_explicit_phases(tm
         request_id="req-2",
         request={"text": "hello"},
         spec=SimpleNamespace(request_id="req-2", ref_audio_path="/tmp/ref.wav"),
-        cpu_stage=SimpleNamespace(stage="cpu"),
+        prepare_submit_at=0.0,
+        prepare_start=0.0,
+        prompt_text="prompt",
+        text="text",
+        prepare_admission_wait_ms=0.0,
+        current_inflight=0,
+        peak_inflight=0,
+        prompt_cpu_profiled=SimpleNamespace(),
+        target_cpu_profiled=SimpleNamespace(),
         ref_audio_prepare_future="future",
     )
 
@@ -798,16 +882,16 @@ def test_prepare_request_split_phase_helpers_build_state_from_explicit_phases(tm
     )
 
     assert isinstance(prepared_audio, GPTSoVITSPreparedAudioPhase)
-    assert prepared_audio.phase_one == {"phase": "audio"}
+    assert prepared_audio.phase_one is audio_phase
     assert isinstance(prepared_ref_spec, GPTSoVITSPreparedRefSpecPhase)
-    assert prepared_ref_spec.ref_spec_result == (("spec", "wav16k"), {"ref_spec_ms": 1.0})
+    assert prepared_ref_spec.ref_spec_result is ref_spec_result
     assert isinstance(prepared_text, GPTSoVITSPreparedTextPhase)
-    assert prepared_text.phase_two == {"phase": "text"}
+    assert prepared_text.phase_two is text_phase
     runtime._build_request_state_from_prepare_phases.assert_called_once_with(
         prepared_cpu,
-        {"phase": "audio"},
-        {"phase": "text"},
-        ref_spec_result=(("spec", "wav16k"), {"ref_spec_ms": 1.0}),
+        audio_phase,
+        text_phase,
+        ref_spec_result=ref_spec_result,
         extra_profile=None,
     )
     coordinator._release_split_stage_slot.assert_called_once_with()
@@ -827,18 +911,21 @@ def test_build_request_state_from_prepare_phases_uses_runtime_native_state_assem
     runtime._ensure_pipeline = Mock(return_value=pipeline)  # type: ignore[method-assign]
     runtime._build_prepare_profile_overrides = Mock(return_value={"custom_metric": 7.0})  # type: ignore[method-assign]
     runtime._build_ref_audio_bundle_from_phase = Mock(  # type: ignore[method-assign]
-        return_value={
-            "prompt_semantic": torch.tensor([5, 6], dtype=torch.int32),
-            "refer_spec": (torch.ones((1, 5, 4), dtype=torch.float32), torch.ones((1, 160), dtype=torch.float32)),
-            "raw_audio": torch.ones((1, 12), dtype=torch.float32),
-            "raw_sr": 16000,
-            "profile": {
+        return_value=GPTSoVITSRefAudioBundle(
+            prompt_semantic=torch.tensor([5, 6], dtype=torch.int32),
+            refer_spec=GPTSoVITSReferSpec(
+                torch.ones((1, 5, 4), dtype=torch.float32),
+                torch.ones((1, 160), dtype=torch.float32),
+            ),
+            raw_audio=torch.ones((1, 12), dtype=torch.float32),
+            raw_sr=16000,
+            profile={
                 "bundle_total_ms": 4.0,
                 "prompt_semantic_ms": 1.5,
                 "ref_spec_ms": 2.0,
                 "audio_load_ms": 0.5,
             },
-        }
+        )
     )
 
     prompt_result = SimpleNamespace(
@@ -861,35 +948,42 @@ def test_build_request_state_from_prepare_phases_uses_runtime_native_state_assem
     prepared_cpu_stage = GPTSoVITSPreparedCpuStage(
         request_id="req-native",
         request={"text": "hello"},
-        spec=SimpleNamespace(request_id="req-native"),
-        cpu_stage=SimpleNamespace(
-            spec=SimpleNamespace(
-                request_id="req-native",
-                ref_audio_path="/tmp/ref.wav",
-                prompt_lang="zh",
-                text_lang="zh",
-                top_k=5,
-                top_p=0.8,
-                temperature=1.0,
-                repetition_penalty=1.1,
-                early_stop_num=123,
-                ready_step=4,
-                aux_ref_audio_paths=[str(tmp_path / "aux.wav"), str(tmp_path / "missing.wav")],
-            ),
-            prompt_text="prompt",
-            text="target",
-            prepare_start=time.time() - 0.01,
+        spec=SimpleNamespace(
+            request_id="req-native",
+            ref_audio_path="/tmp/ref.wav",
+            prompt_lang="zh",
+            text_lang="zh",
+            top_k=5,
+            top_p=0.8,
+            temperature=1.0,
+            repetition_penalty=1.1,
+            early_stop_num=123,
+            ready_step=4,
+            aux_ref_audio_paths=[str(tmp_path / "aux.wav"), str(tmp_path / "missing.wav")],
         ),
+        prepare_submit_at=0.0,
+        prepare_start=time.time() - 0.01,
+        prompt_text="prompt",
+        text="target",
+        prepare_admission_wait_ms=0.0,
+        current_inflight=0,
+        peak_inflight=0,
+        prompt_cpu_profiled=SimpleNamespace(),
+        target_cpu_profiled=SimpleNamespace(),
     )
     (tmp_path / "aux.wav").write_bytes(b"wav")
 
     state = runtime._build_request_state_from_prepare_phases(
         prepared_cpu_stage,
-        {"phase": "audio"},
-        {
-            "prompt_feature_profiled": SimpleNamespace(result=prompt_result),
-            "target_feature_profiled": SimpleNamespace(result=target_result),
-        },
+        GPTSoVITSPrepareAudioPhaseData(
+            prompt_g2pw_profiled=SimpleNamespace(),
+            target_g2pw_profiled=SimpleNamespace(),
+            ref_audio_profiled=SimpleNamespace(),
+        ),
+        GPTSoVITSPrepareTextPhaseData(
+            prompt_feature_profiled=SimpleNamespace(result=prompt_result),
+            target_feature_profiled=SimpleNamespace(result=target_result),
+        ),
     )
 
     assert state.request_id == "req-native"
@@ -900,6 +994,7 @@ def test_build_request_state_from_prepare_phases_uses_runtime_native_state_assem
     assert state.all_phones.tolist() == [1, 2, 3, 4, 5]
     assert state.prompt_semantic.dtype == torch.long
     assert state.refer_spec is not None
+    assert state.refer_spec.spec_audio.shape == (1, 5, 4)
     assert state.raw_sr == 16000
     assert state.top_k == 5
     assert state.ready_step == 4
@@ -915,7 +1010,12 @@ def test_prepare_gpu_audio_phase_async_uses_runtime_native_prepare_kernels(tmp_p
     prompt_g2pw = GPTSoVITSPrepareProfiledResult(result=["prompt-g2pw"], submit_at=1.0, started_at=1.0, finished_at=2.0)
     target_g2pw = GPTSoVITSPrepareProfiledResult(result=["target-g2pw"], submit_at=1.0, started_at=1.0, finished_at=2.5)
     ref_audio = GPTSoVITSPrepareProfiledResult(
-        result={"raw_audio": torch.tensor([0.1]), "raw_sr": 16000, "profile": {}},
+        result=GPTSoVITSRefAudioBundle(
+            prompt_semantic=torch.tensor([1, 2], dtype=torch.long),
+            raw_audio=torch.tensor([0.1]),
+            raw_sr=16000,
+            profile={},
+        ),
         submit_at=1.0,
         started_at=1.0,
         finished_at=3.0,
@@ -927,11 +1027,15 @@ def test_prepare_gpu_audio_phase_async_uses_runtime_native_prepare_kernels(tmp_p
         request_id="req-audio",
         request={},
         spec=SimpleNamespace(ref_audio_path="/tmp/ref.wav"),
-        cpu_stage=SimpleNamespace(
-            spec=SimpleNamespace(ref_audio_path="/tmp/ref.wav"),
-            prompt_cpu_profiled=SimpleNamespace(result=["prompt"]),
-            target_cpu_profiled=SimpleNamespace(result=["target"]),
-        ),
+        prepare_submit_at=0.0,
+        prepare_start=0.0,
+        prompt_text="prompt",
+        text="target",
+        prepare_admission_wait_ms=0.0,
+        current_inflight=0,
+        peak_inflight=0,
+        prompt_cpu_profiled=SimpleNamespace(result=["prompt"]),
+        target_cpu_profiled=SimpleNamespace(result=["target"]),
         ref_audio_prepare_future="future",
     )
 
@@ -943,21 +1047,31 @@ def test_prepare_gpu_audio_phase_async_uses_runtime_native_prepare_kernels(tmp_p
         "/tmp/ref.wav",
         prepared_asset_future="future",
     )
-    assert phase_one["prompt_g2pw_profiled"] is prompt_g2pw
-    assert phase_one["target_g2pw_profiled"] is target_g2pw
-    assert phase_one["ref_audio_profiled"] is ref_audio
+    assert phase_one.prompt_g2pw_profiled is prompt_g2pw
+    assert phase_one.target_g2pw_profiled is target_g2pw
+    assert phase_one.ref_audio_profiled is ref_audio
 
 
 def test_prepare_request_gpu_audio_phases_batch_merge_uses_runtime_native_batch_helper(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     coordinator = SimpleNamespace(enable_g2pw_audio_batch_merge=True)
     runtime._ensure_prepare_coordinator = Mock(return_value=coordinator)  # type: ignore[method-assign]
-    runtime._prepare_gpu_audio_phase_batch_async = AsyncMock(return_value=[{"phase": "a"}, {"phase": "b"}])  # type: ignore[method-assign]
+    phase_a = GPTSoVITSPrepareAudioPhaseData(
+        prompt_g2pw_profiled="prompt-a",
+        target_g2pw_profiled="target-a",
+        ref_audio_profiled="ref-a",
+    )
+    phase_b = GPTSoVITSPrepareAudioPhaseData(
+        prompt_g2pw_profiled="prompt-b",
+        target_g2pw_profiled="target-b",
+        ref_audio_profiled="ref-b",
+    )
+    runtime._prepare_gpu_audio_phase_batch_async = AsyncMock(return_value=[phase_a, phase_b])  # type: ignore[method-assign]
 
     prepared_audio = runtime.prepare_request_gpu_audio_phases(
         [
-            GPTSoVITSPreparedCpuStage("req-a", {}, SimpleNamespace(), SimpleNamespace(), None),
-            GPTSoVITSPreparedCpuStage("req-b", {}, SimpleNamespace(), SimpleNamespace(), None),
+            GPTSoVITSPreparedCpuStage("req-a", {}, SimpleNamespace(), 0.0, 0.0, "", "", 0.0, 0, 0, SimpleNamespace(), SimpleNamespace(), None),
+            GPTSoVITSPreparedCpuStage("req-b", {}, SimpleNamespace(), 0.0, 0.0, "", "", 0.0, 0, 0, SimpleNamespace(), SimpleNamespace(), None),
         ]
     )
 
@@ -965,7 +1079,7 @@ def test_prepare_request_gpu_audio_phases_batch_merge_uses_runtime_native_batch_
         coordinator,
         ANY,
     )
-    assert [item.phase_one for item in prepared_audio] == [{"phase": "a"}, {"phase": "b"}]
+    assert [item.phase_one for item in prepared_audio] == [phase_a, phase_b]
 
 
 def test_prepare_request_uses_explicit_split_prepare_pipeline(tmp_path):
@@ -1014,29 +1128,39 @@ def test_prepare_gpu_text_and_ref_spec_phases_use_runtime_native_helpers(tmp_pat
             request_id="req-phase",
             request={},
             spec=SimpleNamespace(),
-            cpu_stage=SimpleNamespace(
-                prompt_cpu_profiled=SimpleNamespace(run_ms=5.0),
-                target_cpu_profiled=SimpleNamespace(run_ms=6.0),
-            ),
+            prepare_submit_at=0.0,
+            prepare_start=0.0,
+            prompt_text="prompt",
+            text="text",
+            prepare_admission_wait_ms=0.0,
+            current_inflight=0,
+            peak_inflight=0,
+            prompt_cpu_profiled=SimpleNamespace(run_ms=5.0),
+            target_cpu_profiled=SimpleNamespace(run_ms=6.0),
             ref_audio_prepare_future=None,
         ),
-        phase_one={
-            "prompt_g2pw_profiled": SimpleNamespace(result=["prompt"], profile={"a": 1.0}),
-            "target_g2pw_profiled": SimpleNamespace(result=["target"], profile={"b": 2.0}),
-            "ref_audio_profiled": GPTSoVITSPrepareProfiledResult(
-                result={"raw_audio": torch.tensor([0.2]), "raw_sr": 16000, "profile": {}},
+        phase_one=GPTSoVITSPrepareAudioPhaseData(
+            prompt_g2pw_profiled=SimpleNamespace(result=["prompt"], profile={"a": 1.0}),
+            target_g2pw_profiled=SimpleNamespace(result=["target"], profile={"b": 2.0}),
+            ref_audio_profiled=GPTSoVITSPrepareProfiledResult(
+                result=GPTSoVITSRefAudioBundle(
+                    prompt_semantic=torch.tensor([3, 4], dtype=torch.long),
+                    raw_audio=torch.tensor([0.2]),
+                    raw_sr=16000,
+                    profile={},
+                ),
                 submit_at=1.0,
                 started_at=1.0,
                 finished_at=1.0,
             ),
-        },
+        ),
     )
 
     phase_two = runtime._run_awaitable_sync(runtime._prepare_gpu_text_phase_async(coordinator, prepared_audio))
     ref_spec = runtime._run_awaitable_sync(runtime._prepare_ref_spec_phase_async(coordinator, prepared_audio))
 
     runtime._run_text_feature_pair_stage.assert_awaited_once_with(
-        coordinator,
+        ANY,
         ["prompt"],
         ["target"],
         5.0,
@@ -1044,12 +1168,16 @@ def test_prepare_gpu_text_and_ref_spec_phases_use_runtime_native_helpers(tmp_pat
         prompt_base_profile={"a": 1.0},
         target_base_profile={"b": 2.0},
     )
-    runtime._run_ref_spec_stage.assert_awaited_once_with(coordinator, ANY, 16000)
-    assert phase_two["prompt_feature_profiled"] == "prompt-feature"
-    assert phase_two["target_feature_profiled"] == "target-feature"
-    assert ref_spec[0] == ("spec", "wav16k")
-    assert ref_spec[1]["ref_spec_wait_ms"] == 500.0
-    assert ref_spec[1]["ref_spec_ms"] == 1500.0
+    forwarded_coordinator = runtime._run_text_feature_pair_stage.await_args.args[0]
+    assert isinstance(forwarded_coordinator, GPTSoVITSPrepareRuntimeCoordinator)
+    runtime._run_ref_spec_stage.assert_awaited_once_with(ANY, ANY, 16000)
+    assert isinstance(runtime._run_ref_spec_stage.await_args.args[0], GPTSoVITSPrepareRuntimeCoordinator)
+    assert phase_two.prompt_feature_profiled == "prompt-feature"
+    assert phase_two.target_feature_profiled == "target-feature"
+    assert ref_spec.refer_spec.spec_audio == "spec"
+    assert ref_spec.refer_spec.audio_16k == "wav16k"
+    assert ref_spec.profile["ref_spec_wait_ms"] == 500.0
+    assert ref_spec.profile["ref_spec_ms"] == 1500.0
 
 
 def test_prepare_request_cpu_stages_batches_cpu_prepare_calls(tmp_path):
@@ -1061,16 +1189,21 @@ def test_prepare_request_cpu_stages_batches_cpu_prepare_calls(tmp_path):
         SimpleNamespace(request_id="req-b", ref_audio_path="/tmp/b.wav"),
     ])
     runtime.preload_ref_audio_asset = Mock(side_effect=["future-a", "future-b"])  # type: ignore[method-assign]
-    runtime._prepare_cpu_stage_async = AsyncMock(side_effect=["cpu-a", "cpu-b"])  # type: ignore[method-assign]
+    runtime._prepare_cpu_stage_async = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            GPTSoVITSNativePreparedCpuStage(SimpleNamespace(request_id="req-a", ref_audio_path="/tmp/a.wav"), 1.0, 2.0, "pa", "ta", 0.1, 1, 2, SimpleNamespace(), SimpleNamespace()),
+            GPTSoVITSNativePreparedCpuStage(SimpleNamespace(request_id="req-b", ref_audio_path="/tmp/b.wav"), 1.5, 2.5, "pb", "tb", 0.2, 3, 4, SimpleNamespace(), SimpleNamespace()),
+        ]
+    )
 
     prepared = runtime.prepare_request_cpu_stages([{"text": "a"}, {"text": "b", "engine_request_id": "req-b"}])
 
     assert len(prepared) == 2
     assert prepared[0].request_id == "req-a"
-    assert prepared[0].cpu_stage == "cpu-a"
+    assert prepared[0].prompt_text == "pa"
     assert prepared[0].ref_audio_prepare_future == "future-a"
     assert prepared[1].request_id == "req-b"
-    assert prepared[1].cpu_stage == "cpu-b"
+    assert prepared[1].prompt_text == "pb"
     assert prepared[1].ref_audio_prepare_future == "future-b"
     assert runtime._prepare_cpu_stage_async.await_count == 2
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import sys
 import threading
@@ -97,8 +98,20 @@ class GPTSoVITSPreparedCpuStage:
     request_id: str
     request: dict[str, Any]
     spec: Any
-    cpu_stage: Any
+    prepare_submit_at: float
+    prepare_start: float
+    prompt_text: str
+    text: str
+    prepare_admission_wait_ms: float
+    current_inflight: int
+    peak_inflight: int
+    prompt_cpu_profiled: Any
+    target_cpu_profiled: Any
     ref_audio_prepare_future: Any | None = None
+
+    @property
+    def cpu_stage(self) -> "GPTSoVITSPreparedCpuStage":
+        return self
 
 
 @dataclass(slots=True)
@@ -116,24 +129,215 @@ class GPTSoVITSNativePreparedCpuStage:
 
 
 @dataclass(slots=True)
+class GPTSoVITSPrepareAudioPhaseData:
+    prompt_g2pw_profiled: Any
+    target_g2pw_profiled: Any
+    ref_audio_profiled: Any
+    g2pw_pair_ms: float = 0.0
+    phase_wall_ms: float = 0.0
+
+
+@dataclass(slots=True)
+class GPTSoVITSReferSpec:
+    spec_audio: Any
+    audio_16k: Any | None = None
+
+
+@dataclass(slots=True)
+class GPTSoVITSPrepareRefSpecResult:
+    refer_spec: GPTSoVITSReferSpec
+    profile: dict[str, float]
+
+
+@dataclass(slots=True)
+class GPTSoVITSPrepareTextPhaseData:
+    prompt_feature_profiled: Any
+    target_feature_profiled: Any
+    phase_wall_ms: float = 0.0
+
+
+@dataclass(slots=True)
+class GPTSoVITSPreparedRefAudioAsset:
+    raw_audio: Any
+    raw_sr: int
+    wav16k: Any
+    profile: dict[str, float]
+
+
+@dataclass(slots=True)
+class GPTSoVITSRefAudioBundle:
+    prompt_semantic: Any
+    raw_audio: Any
+    raw_sr: int
+    profile: dict[str, float]
+    refer_spec: GPTSoVITSReferSpec | None = None
+
+
+@dataclass(slots=True)
+class GPTSoVITSTextFeatures:
+    phones: list[int]
+    bert_features: torch.Tensor
+    norm_text: str
+    profile: dict[str, float]
+    total_ms: float
+    cpu_preprocess_ms: float
+
+
+class _GPTSoVITSNoopPrepareGate:
+    max_inflight = 0
+
+    async def acquire(self) -> dict[str, float]:
+        return {
+            "wait_ms": 0.0,
+            "inflight": 0.0,
+            "peak_inflight": 0.0,
+            "max_inflight": 0.0,
+        }
+
+    def release(self) -> None:
+        return None
+
+
+_GPTSOVITS_NOOP_PREPARE_GATE = _GPTSoVITSNoopPrepareGate()
+
+
+@dataclass(slots=True)
+class GPTSoVITSPrepareRuntimeCoordinator:
+    text_cpu_gate: Any = _GPTSOVITS_NOOP_PREPARE_GATE
+    inflight_gate: Any = _GPTSOVITS_NOOP_PREPARE_GATE
+    text_feature_gate: Any = _GPTSOVITS_NOOP_PREPARE_GATE
+    g2pw_gate: Any = _GPTSOVITS_NOOP_PREPARE_GATE
+    ref_audio_gate: Any = _GPTSOVITS_NOOP_PREPARE_GATE
+    ref_load_gate: Any = _GPTSOVITS_NOOP_PREPARE_GATE
+    ref_spec_gate: Any = _GPTSOVITS_NOOP_PREPARE_GATE
+    text_feature_executor: Any | None = None
+    g2pw_executor: Any | None = None
+    ref_audio_executor: Any | None = None
+    enable_g2pw_pair_batch: bool = False
+    enable_g2pw_audio_batch_merge: bool = False
+    g2pw_audio_batch_merge_group_size: int = 8
+    submit_prepare_ref_audio_asset_fn: Any | None = None
+    mark_enter_fn: Any | None = None
+    release_split_stage_slot_fn: Any | None = None
+
+    @classmethod
+    def from_runtime_coordinator(cls, coordinator: Any) -> "GPTSoVITSPrepareRuntimeCoordinator":
+        if isinstance(coordinator, cls):
+            return coordinator
+        return cls(
+            text_cpu_gate=getattr(coordinator, "text_cpu_gate", _GPTSOVITS_NOOP_PREPARE_GATE),
+            inflight_gate=getattr(coordinator, "_inflight_gate", _GPTSOVITS_NOOP_PREPARE_GATE),
+            text_feature_gate=getattr(coordinator, "text_feature_gate", _GPTSOVITS_NOOP_PREPARE_GATE),
+            g2pw_gate=getattr(coordinator, "g2pw_gate", _GPTSOVITS_NOOP_PREPARE_GATE),
+            ref_audio_gate=getattr(coordinator, "ref_audio_gate", _GPTSOVITS_NOOP_PREPARE_GATE),
+            ref_load_gate=getattr(coordinator, "ref_load_gate", _GPTSOVITS_NOOP_PREPARE_GATE),
+            ref_spec_gate=getattr(coordinator, "ref_spec_gate", _GPTSOVITS_NOOP_PREPARE_GATE),
+            text_feature_executor=getattr(coordinator, "text_feature_executor", None),
+            g2pw_executor=getattr(coordinator, "g2pw_executor", None),
+            ref_audio_executor=getattr(coordinator, "ref_audio_executor", None),
+            enable_g2pw_pair_batch=bool(getattr(coordinator, "enable_g2pw_pair_batch", False)),
+            enable_g2pw_audio_batch_merge=bool(getattr(coordinator, "enable_g2pw_audio_batch_merge", False)),
+            g2pw_audio_batch_merge_group_size=max(
+                1,
+                int(getattr(coordinator, "g2pw_audio_batch_merge_group_size", 8) or 8),
+            ),
+            submit_prepare_ref_audio_asset_fn=getattr(coordinator, "submit_prepare_ref_audio_asset", None),
+            mark_enter_fn=getattr(coordinator, "_mark_enter", None),
+            release_split_stage_slot_fn=getattr(coordinator, "_release_split_stage_slot", None),
+        )
+
+    @staticmethod
+    def _coerce_prepared_ref_audio_asset(asset: Any) -> Any:
+        if isinstance(asset, GPTSoVITSPreparedRefAudioAsset):
+            return asset
+        if all(hasattr(asset, name) for name in ("raw_audio", "raw_sr", "wav16k")):
+            return GPTSoVITSPreparedRefAudioAsset(
+                raw_audio=getattr(asset, "raw_audio"),
+                raw_sr=int(getattr(asset, "raw_sr")),
+                wav16k=getattr(asset, "wav16k"),
+                profile=dict(getattr(asset, "profile", {}) or {}),
+            )
+        return asset
+
+    @classmethod
+    def _coerce_prepare_profiled_result(cls, profiled: Any) -> Any:
+        if isinstance(profiled, GPTSoVITSPrepareProfiledResult):
+            native_result = cls._coerce_prepared_ref_audio_asset(profiled.result)
+            if native_result is profiled.result:
+                return profiled
+            return GPTSoVITSPrepareProfiledResult(
+                result=native_result,
+                submit_at=float(profiled.submit_at),
+                started_at=float(profiled.started_at),
+                finished_at=float(profiled.finished_at),
+                profile=dict(profiled.profile or {}) if profiled.profile is not None else None,
+            )
+        if all(hasattr(profiled, name) for name in ("result", "submit_at", "started_at", "finished_at")):
+            return GPTSoVITSPrepareProfiledResult(
+                result=cls._coerce_prepared_ref_audio_asset(getattr(profiled, "result")),
+                submit_at=float(getattr(profiled, "submit_at")),
+                started_at=float(getattr(profiled, "started_at")),
+                finished_at=float(getattr(profiled, "finished_at")),
+                profile=dict(getattr(profiled, "profile", {}) or {}) or None,
+            )
+        return profiled
+
+    @classmethod
+    def _wrap_prepare_future(cls, value: Any) -> Any:
+        if not (hasattr(value, "add_done_callback") and hasattr(value, "result")):
+            return cls._coerce_prepare_profiled_result(value)
+        wrapped: concurrent.futures.Future = concurrent.futures.Future()
+
+        def _forward(done_future: Any) -> None:
+            try:
+                wrapped.set_result(cls._coerce_prepare_profiled_result(done_future.result()))
+            except BaseException as exc:  # pragma: no cover - passthrough
+                wrapped.set_exception(exc)
+
+        value.add_done_callback(_forward)
+        return wrapped
+
+    def submit_prepare_ref_audio_asset(self, ref_audio_path: str, *, submit_at: float | None = None) -> Any:
+        submit_fn = self.submit_prepare_ref_audio_asset_fn
+        if not callable(submit_fn):
+            raise RuntimeError("GPT-SoVITS prepare coordinator does not provide ref-audio preload submission")
+        return self._wrap_prepare_future(submit_fn(ref_audio_path, submit_at=submit_at))
+
+    async def acquire_prepare_admission(self) -> dict[str, float]:
+        return await self.inflight_gate.acquire()
+
+    def mark_prepare_enter(self) -> tuple[int, int]:
+        mark_enter = self.mark_enter_fn
+        if callable(mark_enter):
+            current_inflight, peak_inflight = mark_enter()
+            return int(current_inflight), int(peak_inflight)
+        return 0, 0
+
+    def release_split_stage_slot(self) -> None:
+        release_slot = self.release_split_stage_slot_fn
+        if callable(release_slot):
+            release_slot()
+
+
+@dataclass(slots=True)
 class GPTSoVITSPreparedAudioPhase:
     request_id: str
     prepared_cpu_stage: GPTSoVITSPreparedCpuStage
-    phase_one: dict[str, Any]
+    phase_one: GPTSoVITSPrepareAudioPhaseData
 
 
 @dataclass(slots=True)
 class GPTSoVITSPreparedRefSpecPhase:
     request_id: str
     prepared_audio_phase: GPTSoVITSPreparedAudioPhase
-    ref_spec_result: tuple[tuple[Any, Any], dict[str, float]]
+    ref_spec_result: GPTSoVITSPrepareRefSpecResult
 
 
 @dataclass(slots=True)
 class GPTSoVITSPreparedTextPhase:
     request_id: str
     prepared_audio_phase: GPTSoVITSPreparedAudioPhase
-    phase_two: dict[str, Any]
+    phase_two: GPTSoVITSPrepareTextPhaseData
 
 
 @dataclass(slots=True)
@@ -151,7 +355,7 @@ class GPTSoVITST2SRequestState:
     all_phones: torch.LongTensor
     all_bert_features: torch.Tensor
     prompt_semantic: torch.LongTensor
-    refer_spec: tuple[torch.Tensor, torch.Tensor | None] | None
+    refer_spec: GPTSoVITSReferSpec | None
     aux_refer_specs: list[tuple[torch.Tensor, torch.Tensor | None]]
     raw_audio: torch.Tensor
     raw_sr: int
@@ -353,7 +557,11 @@ class GPTSoVITSRuntime:
         model = self.get_t2s_model()
         return int(model.vocab_size)
 
-    def _ensure_prepare_coordinator(self) -> Any:
+    @staticmethod
+    def _coerce_prepare_coordinator(coordinator: Any) -> GPTSoVITSPrepareRuntimeCoordinator:
+        return GPTSoVITSPrepareRuntimeCoordinator.from_runtime_coordinator(coordinator)
+
+    def _ensure_prepare_coordinator(self) -> GPTSoVITSPrepareRuntimeCoordinator:
         if self._prepare_coordinator is not None:
             return self._prepare_coordinator
         with self._init_lock:
@@ -363,7 +571,9 @@ class GPTSoVITSRuntime:
             with self._project_root_cwd():
                 from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import PrepareCoordinator
 
-                self._prepare_coordinator = PrepareCoordinator(pipeline)
+                self._prepare_coordinator = self._coerce_prepare_coordinator(
+                    PrepareCoordinator(pipeline)
+                )
         return self._prepare_coordinator
 
     @staticmethod
@@ -1331,8 +1541,8 @@ class GPTSoVITSRuntime:
 
     def _state_to_transport_info(self, state: Any, request: dict[str, Any]) -> dict[str, Any]:
         refer_spec = getattr(state, "refer_spec", None)
-        refer_audio_spec = refer_spec[0] if refer_spec is not None else None
-        refer_audio_16k = refer_spec[1] if refer_spec is not None else None
+        refer_audio_spec = refer_spec.spec_audio if refer_spec is not None else None
+        refer_audio_16k = refer_spec.audio_16k if refer_spec is not None else None
         return {
             "gpt_sovits_request_id": str(state.request_id),
             "gpt_sovits_phones": self._clone_tensor_to_cpu(getattr(state, "phones", None), dtype=torch.long),
@@ -1367,8 +1577,7 @@ class GPTSoVITSRuntime:
 
     def preload_ref_audio_asset(self, ref_audio_path: str, *, submit_at: float | None = None) -> Any:
         coordinator = self._ensure_prepare_coordinator()
-        with self._project_root_cwd():
-            return coordinator.submit_prepare_ref_audio_asset(ref_audio_path, submit_at=submit_at)
+        return coordinator.submit_prepare_ref_audio_asset(ref_audio_path, submit_at=submit_at)
 
     def _normalize_prepare_sentence(self, text: str, language: str) -> str:
         with self._project_root_cwd():
@@ -1403,10 +1612,18 @@ class GPTSoVITSRuntime:
         pipeline = self._ensure_pipeline()
         return pipeline._load_ref_audio_raw(ref_audio_path)
 
-    def _extract_ref_spec_from_raw(self, raw_audio: Any, raw_sr: int) -> tuple[tuple[Any, Any], dict[str, float]]:
+    def _extract_ref_spec_from_raw(self, raw_audio: Any, raw_sr: int) -> tuple[GPTSoVITSReferSpec, dict[str, float]]:
         pipeline = self._ensure_pipeline()
         spec, audio, _, _, profile = pipeline._extract_ref_spec_profile_from_raw(raw_audio, raw_sr)
-        return (spec, audio), profile
+        return GPTSoVITSReferSpec(spec_audio=spec, audio_16k=audio), profile
+
+    @staticmethod
+    def _coerce_refer_spec(value: Any) -> GPTSoVITSReferSpec:
+        if isinstance(value, GPTSoVITSReferSpec):
+            return value
+        if isinstance(value, tuple) and len(value) == 2:
+            return GPTSoVITSReferSpec(spec_audio=value[0], audio_16k=value[1])
+        raise TypeError(f"Unsupported GPT-SoVITS refer spec value: {type(value)!r}")
 
     @staticmethod
     def _build_text_cpu_profiled_result(
@@ -1457,7 +1674,26 @@ class GPTSoVITSRuntime:
             + profile.get("bert_scatter_ms", 0.0)
         )
 
-    def _build_empty_text_features_like(self, reference: Any | None = None) -> Any:
+    @staticmethod
+    def _make_text_features(
+        phones: Any,
+        bert_features: torch.Tensor,
+        norm_text: str,
+        *,
+        profile: dict[str, float] | None = None,
+        total_ms: float = 0.0,
+        cpu_preprocess_ms: float = 0.0,
+    ) -> GPTSoVITSTextFeatures:
+        return GPTSoVITSTextFeatures(
+            phones=[int(item) for item in list(phones or [])],
+            bert_features=bert_features,
+            norm_text=str(norm_text),
+            profile=dict(profile or {}),
+            total_ms=float(total_ms),
+            cpu_preprocess_ms=float(cpu_preprocess_ms),
+        )
+
+    def _build_empty_text_features_like(self, reference: Any | None = None) -> GPTSoVITSTextFeatures:
         feature_dim = 1024
         dtype = None
         if reference is not None:
@@ -1466,12 +1702,16 @@ class GPTSoVITSRuntime:
                 dtype = reference.bert_features.dtype
             except Exception:
                 pass
-        with self._project_root_cwd():
-            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import build_empty_text_features
-
-        return build_empty_text_features(
-            feature_dim=int(feature_dim),
-            dtype=(dtype if dtype is not None else None) or torch.float32,
+        return GPTSoVITSTextFeatures(
+            phones=[],
+            bert_features=torch.empty(
+                (int(feature_dim), 0),
+                dtype=((dtype if dtype is not None else None) or torch.float32),
+            ),
+            norm_text="",
+            profile={"cpu_preprocess_ms": 0.0, "bert_total_ms": 0.0},
+            total_ms=0.0,
+            cpu_preprocess_ms=0.0,
         )
 
     def _build_text_features(
@@ -1480,10 +1720,7 @@ class GPTSoVITSRuntime:
         language: str | None,
         cpu_run_ms: float,
         base_profile: dict[str, float] | None = None,
-    ) -> Any:
-        with self._project_root_cwd():
-            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import PreparedTextFeatures
-
+    ) -> GPTSoVITSTextFeatures:
         pipeline = self._ensure_pipeline()
         profile: dict[str, float] = dict(base_profile or {})
         profile["cpu_preprocess_ms"] = float(cpu_run_ms)
@@ -1494,16 +1731,16 @@ class GPTSoVITSRuntime:
         )
         total_ms = float(cpu_run_ms + (time.perf_counter() - branch_start) * 1000.0)
         profile["bert_total_ms"] = max(0.0, total_ms - float(cpu_run_ms))
-        return PreparedTextFeatures(
-            phones=phones,
-            bert_features=bert_features,
-            norm_text=norm_text,
+        return self._make_text_features(
+            phones,
+            bert_features,
+            norm_text,
             profile=profile,
             total_ms=total_ms,
-            cpu_preprocess_ms=float(cpu_run_ms),
+            cpu_preprocess_ms=cpu_run_ms,
         )
 
-    def _build_ref_prompt_semantic_from_raw(self, raw_audio: Any, raw_sr: int) -> dict[str, Any]:
+    def _build_ref_prompt_semantic_from_raw(self, raw_audio: Any, raw_sr: int) -> GPTSoVITSRefAudioBundle:
         pipeline = self._ensure_pipeline()
         load_profile = {"audio_load_ms": 0.0}
         if getattr(pipeline, "prepare_ref_semantic_batch_worker", None) is not None:
@@ -1513,11 +1750,11 @@ class GPTSoVITSRuntime:
                 raw_sr,
                 wav16k=wav16k,
             )
-            return {
-                "prompt_semantic": prompt_semantic,
-                "raw_audio": raw_audio,
-                "raw_sr": raw_sr,
-                "profile": {
+            return GPTSoVITSRefAudioBundle(
+                prompt_semantic=prompt_semantic,
+                raw_audio=raw_audio,
+                raw_sr=int(raw_sr),
+                profile={
                     **load_profile,
                     "audio_stage_wait_ms": float(worker_profile.get("prompt_semantic_wait_ms", 0.0)),
                     "audio_stage_slots": float(worker_profile.get("prompt_semantic_stage_slots", 0.0)),
@@ -1559,16 +1796,16 @@ class GPTSoVITSRuntime:
                     + float(worker_profile.get("prompt_semantic_forward_ms", 0.0))
                     + float(worker_profile.get("prompt_semantic_scatter_ms", 0.0)),
                 },
-            }
+            )
 
         wav16k, cpu_prepare_ms, limiter_stats = pipeline._prepare_prompt_semantic_wav16k_profile(raw_audio, raw_sr)
         with pipeline.prepare_ref_semantic_stage_limiter.enter() as stage_stats:
             prompt_semantic, runtime_profile = pipeline._extract_prompt_semantic_profile_from_prepared_wav16k(wav16k)
-        return {
-            "prompt_semantic": prompt_semantic,
-            "raw_audio": raw_audio,
-            "raw_sr": raw_sr,
-            "profile": {
+        return GPTSoVITSRefAudioBundle(
+            prompt_semantic=prompt_semantic,
+            raw_audio=raw_audio,
+            raw_sr=int(raw_sr),
+            profile={
                 "audio_load_ms": 0.0,
                 "audio_stage_wait_ms": float(stage_stats.get("wait_ms", 0.0)),
                 "audio_stage_slots": float(stage_stats.get("slots", 0.0)),
@@ -1605,7 +1842,7 @@ class GPTSoVITSRuntime:
                     + stage_stats.get("wait_ms", 0.0)
                 ),
             },
-        }
+        )
 
     async def _run_text_cpu_stage(
         self,
@@ -1613,6 +1850,7 @@ class GPTSoVITSRuntime:
         text: str,
         language: str,
     ) -> GPTSoVITSPrepareProfiledResult:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         await coordinator.text_cpu_gate.acquire()
         if text in [None, ""]:
             try:
@@ -1649,6 +1887,7 @@ class GPTSoVITSRuntime:
         text: str,
         text_lang: str,
     ) -> tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult]:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         pipeline = self._ensure_pipeline()
         text_cpu_worker = getattr(pipeline, "prepare_text_cpu_worker", None)
         if (
@@ -1697,13 +1936,14 @@ class GPTSoVITSRuntime:
         *,
         prepare_submit_at: float,
     ) -> Any:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         admission_start = time.perf_counter()
-        admission_stats = await coordinator._inflight_gate.acquire()
+        admission_stats = await coordinator.acquire_prepare_admission()
         prepare_admission_wait_ms = max(
             float(admission_stats.get("wait_ms", 0.0)),
             (time.perf_counter() - admission_start) * 1000.0,
         )
-        current_inflight, peak_inflight = coordinator._mark_enter()
+        current_inflight, peak_inflight = coordinator.mark_prepare_enter()
         prepare_start = time.perf_counter()
         prompt_text = self._normalize_prepare_sentence(spec.prompt_text, spec.prompt_lang)
         text = spec.text.strip("\n")
@@ -1751,7 +1991,15 @@ class GPTSoVITSRuntime:
             request_id=str(spec.request_id),
             request=dict(request),
             spec=spec,
-            cpu_stage=cpu_stage,
+            prepare_submit_at=float(cpu_stage.prepare_submit_at),
+            prepare_start=float(cpu_stage.prepare_start),
+            prompt_text=str(cpu_stage.prompt_text),
+            text=str(cpu_stage.text),
+            prepare_admission_wait_ms=float(cpu_stage.prepare_admission_wait_ms),
+            current_inflight=int(cpu_stage.current_inflight),
+            peak_inflight=int(cpu_stage.peak_inflight),
+            prompt_cpu_profiled=cpu_stage.prompt_cpu_profiled,
+            target_cpu_profiled=cpu_stage.target_cpu_profiled,
             ref_audio_prepare_future=ref_audio_prepare_future,
         )
 
@@ -1801,7 +2049,15 @@ class GPTSoVITSRuntime:
                     request_id=str(spec.request_id),
                     request=dict(request),
                     spec=spec,
-                    cpu_stage=cpu_stage,
+                    prepare_submit_at=float(cpu_stage.prepare_submit_at),
+                    prepare_start=float(cpu_stage.prepare_start),
+                    prompt_text=str(cpu_stage.prompt_text),
+                    text=str(cpu_stage.text),
+                    prepare_admission_wait_ms=float(cpu_stage.prepare_admission_wait_ms),
+                    current_inflight=int(cpu_stage.current_inflight),
+                    peak_inflight=int(cpu_stage.peak_inflight),
+                    prompt_cpu_profiled=cpu_stage.prompt_cpu_profiled,
+                    target_cpu_profiled=cpu_stage.target_cpu_profiled,
                     ref_audio_prepare_future=ref_audio_prepare_future,
                 )
             )
@@ -1815,6 +2071,7 @@ class GPTSoVITSRuntime:
         cpu_run_ms: float,
         base_profile: dict[str, float] | None = None,
     ) -> GPTSoVITSPrepareProfiledResult:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         if coordinator.text_feature_executor is not None:
             await coordinator.text_feature_gate.acquire()
             try:
@@ -1841,16 +2098,13 @@ class GPTSoVITSRuntime:
                 profile=profile,
             )
             finished_at = time.perf_counter()
-            with self._project_root_cwd():
-                from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import PreparedTextFeatures
-
-            result = PreparedTextFeatures(
-                phones=result_raw[0],
-                bert_features=result_raw[1],
-                norm_text=result_raw[2],
+            result = self._make_text_features(
+                result_raw[0],
+                result_raw[1],
+                result_raw[2],
                 profile=profile,
                 total_ms=float(cpu_run_ms + self._estimate_text_feature_run_ms(profile)),
-                cpu_preprocess_ms=float(cpu_run_ms),
+                cpu_preprocess_ms=cpu_run_ms,
             )
             profiled = GPTSoVITSPrepareProfiledResult(
                 result=result,
@@ -1874,6 +2128,7 @@ class GPTSoVITSRuntime:
         coordinator: Any,
         prepared_segments: Any,
     ) -> GPTSoVITSPrepareProfiledResult:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         has_pending = self._prepare_result_has_pending_g2pw(prepared_segments)
         if not has_pending:
             submit_at = time.perf_counter()
@@ -1918,6 +2173,7 @@ class GPTSoVITSRuntime:
         prompt_segments: Any,
         target_segments: Any,
     ) -> tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult]:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         pair_submit_at = time.perf_counter()
         prompt_is_empty = len(prompt_segments or []) == 0
         prompt_has_pending = self._prepare_result_has_pending_g2pw(prompt_segments)
@@ -1985,7 +2241,7 @@ class GPTSoVITSRuntime:
                 )
             return prompt_profiled, target_profiled
 
-        if bool(getattr(coordinator, "enable_g2pw_pair_batch", False)) and (prompt_has_pending or target_has_pending):
+        if coordinator.enable_g2pw_pair_batch and (prompt_has_pending or target_has_pending):
             gate_wait_start = time.perf_counter()
             await coordinator.g2pw_gate.acquire()
             gate_acquired_at = time.perf_counter()
@@ -2069,6 +2325,7 @@ class GPTSoVITSRuntime:
         coordinator: Any,
         cpu_stages: list[Any],
     ) -> list[tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult] | Exception]:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         pair_submit_at = time.perf_counter()
         if not cpu_stages:
             return []
@@ -2203,6 +2460,7 @@ class GPTSoVITSRuntime:
         prompt_base_profile: dict[str, float] | None = None,
         target_base_profile: dict[str, float] | None = None,
     ) -> tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult]:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         prompt_is_empty = len(prompt_segments or []) == 0
         pipeline = self._ensure_pipeline()
         if coordinator.text_feature_executor is not None:
@@ -2244,22 +2502,19 @@ class GPTSoVITSRuntime:
         submit_at = time.perf_counter()
         started_at = float(submit_at)
         try:
-            with self._project_root_cwd():
-                from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import PreparedTextFeatures
-
             if prompt_is_empty:
                 target_result_raw = await pipeline.build_text_features_from_segments_async(
                     target_segments,
                     profile=target_profile,
                 )
                 prompt_result = self._build_empty_text_features_like(
-                    PreparedTextFeatures(
-                        phones=target_result_raw[0],
-                        bert_features=target_result_raw[1],
-                        norm_text=target_result_raw[2],
+                    self._make_text_features(
+                        target_result_raw[0],
+                        target_result_raw[1],
+                        target_result_raw[2],
                         profile=target_profile,
                         total_ms=float(target_cpu_run_ms + self._estimate_text_feature_run_ms(target_profile)),
-                        cpu_preprocess_ms=float(target_cpu_run_ms),
+                        cpu_preprocess_ms=target_cpu_run_ms,
                     )
                 )
                 finished_at = time.perf_counter()
@@ -2269,13 +2524,13 @@ class GPTSoVITSRuntime:
                     started_at=float(submit_at),
                     finished_at=float(submit_at),
                 )
-                target_result = PreparedTextFeatures(
-                    phones=target_result_raw[0],
-                    bert_features=target_result_raw[1],
-                    norm_text=target_result_raw[2],
+                target_result = self._make_text_features(
+                    target_result_raw[0],
+                    target_result_raw[1],
+                    target_result_raw[2],
                     profile=target_profile,
                     total_ms=float(target_cpu_run_ms + self._estimate_text_feature_run_ms(target_profile)),
-                    cpu_preprocess_ms=float(target_cpu_run_ms),
+                    cpu_preprocess_ms=target_cpu_run_ms,
                 )
                 target_profiled = GPTSoVITSPrepareProfiledResult(
                     result=target_result,
@@ -2302,21 +2557,21 @@ class GPTSoVITSRuntime:
             )
             finished_at = time.perf_counter()
 
-            prompt_result = PreparedTextFeatures(
-                phones=prompt_result_raw[0],
-                bert_features=prompt_result_raw[1],
-                norm_text=prompt_result_raw[2],
+            prompt_result = self._make_text_features(
+                prompt_result_raw[0],
+                prompt_result_raw[1],
+                prompt_result_raw[2],
                 profile=prompt_profile,
                 total_ms=float(prompt_cpu_run_ms + self._estimate_text_feature_run_ms(prompt_profile)),
-                cpu_preprocess_ms=float(prompt_cpu_run_ms),
+                cpu_preprocess_ms=prompt_cpu_run_ms,
             )
-            target_result = PreparedTextFeatures(
-                phones=target_result_raw[0],
-                bert_features=target_result_raw[1],
-                norm_text=target_result_raw[2],
+            target_result = self._make_text_features(
+                target_result_raw[0],
+                target_result_raw[1],
+                target_result_raw[2],
                 profile=target_profile,
                 total_ms=float(target_cpu_run_ms + self._estimate_text_feature_run_ms(target_profile)),
-                cpu_preprocess_ms=float(target_cpu_run_ms),
+                cpu_preprocess_ms=target_cpu_run_ms,
             )
             prompt_profiled = GPTSoVITSPrepareProfiledResult(
                 result=prompt_result,
@@ -2353,6 +2608,7 @@ class GPTSoVITSRuntime:
         prepared_asset_future: Any | None = None,
         prepared_asset: Any | None = None,
     ) -> GPTSoVITSPrepareProfiledResult:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         pipeline = self._ensure_pipeline()
         if getattr(pipeline, "prepare_ref_semantic_batch_worker", None) is not None:
             submit_at = time.perf_counter()
@@ -2416,11 +2672,11 @@ class GPTSoVITSRuntime:
                 + float(prompt_semantic_profile.get("prompt_semantic_scatter_ms", 0.0))
             )
             finished_at = time.perf_counter()
-            result = {
-                "prompt_semantic": prompt_semantic,
-                "raw_audio": raw_audio,
-                "raw_sr": raw_sr,
-                "profile": {
+            result = GPTSoVITSRefAudioBundle(
+                prompt_semantic=prompt_semantic,
+                raw_audio=raw_audio,
+                raw_sr=int(raw_sr),
+                profile={
                     "audio_load_queue_ms": float(load_queue_ms),
                     "audio_load_ms": float(load_ms),
                     "audio_stage_wait_ms": float(prompt_semantic_profile.get("prompt_semantic_wait_ms", 0.0)),
@@ -2522,7 +2778,7 @@ class GPTSoVITSRuntime:
                         + prompt_semantic_ms
                     ),
                 },
-            }
+            )
             return GPTSoVITSPrepareProfiledResult(
                 result=result,
                 submit_at=float(submit_at),
@@ -2583,11 +2839,11 @@ class GPTSoVITSRuntime:
                         pipeline._extract_prompt_semantic_profile_from_prepared_wav16k,
                         wav16k,
                     )
-                result = {
-                    "prompt_semantic": prompt_semantic,
-                    "raw_audio": raw_audio,
-                    "raw_sr": raw_sr,
-                    "profile": {
+                result = GPTSoVITSRefAudioBundle(
+                    prompt_semantic=prompt_semantic,
+                    raw_audio=raw_audio,
+                    raw_sr=int(raw_sr),
+                    profile={
                         "audio_load_queue_ms": float(load_queue_ms),
                         "audio_load_ms": float(load_ms),
                         "audio_stage_wait_ms": float(stage_stats.get("wait_ms", 0.0)),
@@ -2628,10 +2884,9 @@ class GPTSoVITSRuntime:
                             + runtime_profile.get("prompt_semantic_forward_ms", 0.0)
                         ),
                     },
-                }
-            result.setdefault("profile", {})
-            result["profile"]["audio_load_queue_ms"] = float(load_queue_ms)
-            result["profile"]["audio_load_ms"] = float(load_ms)
+                )
+            result.profile.setdefault("audio_load_queue_ms", float(load_queue_ms))
+            result.profile.setdefault("audio_load_ms", float(load_ms))
             finished_at = time.perf_counter()
             return GPTSoVITSPrepareProfiledResult(
                 result=result,
@@ -2648,6 +2903,7 @@ class GPTSoVITSRuntime:
         raw_audio: Any,
         raw_sr: int,
     ) -> GPTSoVITSPrepareProfiledResult:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         await coordinator.ref_spec_gate.acquire()
         try:
             return await self._prepare_run_on_executor(
@@ -2663,11 +2919,11 @@ class GPTSoVITSRuntime:
         self,
         coordinator: Any,
         prepared_cpu_stages: list[GPTSoVITSPreparedCpuStage],
-    ) -> list[dict[str, Any] | Exception]:
+    ) -> list[GPTSoVITSPrepareAudioPhaseData | Exception]:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         if not prepared_cpu_stages:
             return []
         phase_start = time.perf_counter()
-        cpu_stages = [item.cpu_stage for item in prepared_cpu_stages]
         ref_audio_tasks = [
             asyncio.create_task(
                 self._run_ref_prompt_semantic_stage(
@@ -2681,17 +2937,19 @@ class GPTSoVITSRuntime:
         try:
             g2pw_pairs: list[tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult] | Exception | None] = [
                 None
-            ] * len(cpu_stages)
+            ] * len(prepared_cpu_stages)
             group_size = max(1, int(getattr(coordinator, "g2pw_audio_batch_merge_group_size", 8)))
-            for start_index in range(0, len(cpu_stages), group_size):
-                group = cpu_stages[start_index : start_index + group_size]
+            for start_index in range(0, len(prepared_cpu_stages), group_size):
+                group = prepared_cpu_stages[start_index : start_index + group_size]
                 group_pairs = await self._run_g2pw_pair_stage_batch(coordinator, group)
                 for offset, group_pair in enumerate(group_pairs):
                     g2pw_pairs[start_index + offset] = group_pair
             g2pw_pair_end = time.perf_counter()
             ref_audio_results = await asyncio.gather(*ref_audio_tasks, return_exceptions=True)
-            outputs: list[dict[str, Any] | Exception] = []
-            for cpu_stage, g2pw_pair, ref_audio_profiled in zip(cpu_stages, g2pw_pairs, ref_audio_results):
+            outputs: list[GPTSoVITSPrepareAudioPhaseData | Exception] = []
+            for prepared_cpu_stage, g2pw_pair, ref_audio_profiled in zip(
+                prepared_cpu_stages, g2pw_pairs, ref_audio_results
+            ):
                 if isinstance(g2pw_pair, Exception):
                     outputs.append(g2pw_pair)
                     continue
@@ -2702,14 +2960,13 @@ class GPTSoVITSRuntime:
                 prompt_g2pw_profiled, target_g2pw_profiled = g2pw_pair
                 phase_end = max(float(g2pw_pair_end), float(ref_audio_profiled.finished_at))
                 outputs.append(
-                    {
-                        "prompt_g2pw_profiled": prompt_g2pw_profiled,
-                        "target_g2pw_profiled": target_g2pw_profiled,
-                        "ref_audio_profiled": ref_audio_profiled,
-                        "ref_spec_result": None,
-                        "g2pw_pair_ms": max(0.0, (g2pw_pair_end - phase_start) * 1000.0),
-                        "phase_wall_ms": max(0.0, (phase_end - phase_start) * 1000.0),
-                    }
+                    GPTSoVITSPrepareAudioPhaseData(
+                        prompt_g2pw_profiled=prompt_g2pw_profiled,
+                        target_g2pw_profiled=target_g2pw_profiled,
+                        ref_audio_profiled=ref_audio_profiled,
+                        g2pw_pair_ms=max(0.0, (g2pw_pair_end - phase_start) * 1000.0),
+                        phase_wall_ms=max(0.0, (phase_end - phase_start) * 1000.0),
+                    )
                 )
             return outputs
         finally:
@@ -2721,20 +2978,20 @@ class GPTSoVITSRuntime:
         self,
         coordinator: Any,
         prepared_cpu_stage: GPTSoVITSPreparedCpuStage,
-    ) -> dict[str, Any]:
-        cpu_stage = prepared_cpu_stage.cpu_stage
+    ) -> GPTSoVITSPrepareAudioPhaseData:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
         phase_start = time.perf_counter()
         g2pw_pair_task = asyncio.create_task(
             self._run_g2pw_pair_stage(
                 coordinator,
-                cpu_stage.prompt_cpu_profiled.result,
-                cpu_stage.target_cpu_profiled.result,
+                prepared_cpu_stage.prompt_cpu_profiled.result,
+                prepared_cpu_stage.target_cpu_profiled.result,
             )
         )
         ref_audio_task = asyncio.create_task(
             self._run_ref_prompt_semantic_stage(
                 coordinator,
-                str(cpu_stage.spec.ref_audio_path),
+                str(prepared_cpu_stage.spec.ref_audio_path),
                 prepared_asset_future=prepared_cpu_stage.ref_audio_prepare_future,
             )
         )
@@ -2742,14 +2999,13 @@ class GPTSoVITSRuntime:
         g2pw_pair_end = time.perf_counter()
         ref_audio_profiled = await ref_audio_task
         phase_end = time.perf_counter()
-        return {
-            "prompt_g2pw_profiled": prompt_g2pw_profiled,
-            "target_g2pw_profiled": target_g2pw_profiled,
-            "ref_audio_profiled": ref_audio_profiled,
-            "ref_spec_result": None,
-            "g2pw_pair_ms": max(0.0, (g2pw_pair_end - phase_start) * 1000.0),
-            "phase_wall_ms": max(0.0, (phase_end - phase_start) * 1000.0),
-        }
+        return GPTSoVITSPrepareAudioPhaseData(
+            prompt_g2pw_profiled=prompt_g2pw_profiled,
+            target_g2pw_profiled=target_g2pw_profiled,
+            ref_audio_profiled=ref_audio_profiled,
+            g2pw_pair_ms=max(0.0, (g2pw_pair_end - phase_start) * 1000.0),
+            phase_wall_ms=max(0.0, (phase_end - phase_start) * 1000.0),
+        )
 
     def prepare_request_gpu_audio_phase(
         self,
@@ -2774,7 +3030,7 @@ class GPTSoVITSRuntime:
         coordinator = self._ensure_prepare_coordinator()
 
         async def _gather_phase_ones():
-            if bool(getattr(coordinator, "enable_g2pw_audio_batch_merge", False)) and len(prepared_cpu_stages) > 1:
+            if coordinator.enable_g2pw_audio_batch_merge and len(prepared_cpu_stages) > 1:
                 return await self._prepare_gpu_audio_phase_batch_async(coordinator, prepared_cpu_stages)
             return await asyncio.gather(
                 *[
@@ -2804,27 +3060,28 @@ class GPTSoVITSRuntime:
         self,
         coordinator: Any,
         prepared_audio_phase: GPTSoVITSPreparedAudioPhase,
-    ) -> dict[str, Any]:
-        cpu_stage = prepared_audio_phase.prepared_cpu_stage.cpu_stage
+    ) -> GPTSoVITSPrepareTextPhaseData:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
+        prepared_cpu_stage = prepared_audio_phase.prepared_cpu_stage
         phase_one = prepared_audio_phase.phase_one
         phase_start = time.perf_counter()
-        prompt_g2pw_profiled = phase_one["prompt_g2pw_profiled"]
-        target_g2pw_profiled = phase_one["target_g2pw_profiled"]
+        prompt_g2pw_profiled = phase_one.prompt_g2pw_profiled
+        target_g2pw_profiled = phase_one.target_g2pw_profiled
         prompt_feature_profiled, target_feature_profiled = await self._run_text_feature_pair_stage(
             coordinator,
             prompt_g2pw_profiled.result,
             target_g2pw_profiled.result,
-            cpu_stage.prompt_cpu_profiled.run_ms,
-            cpu_stage.target_cpu_profiled.run_ms,
+            prepared_cpu_stage.prompt_cpu_profiled.run_ms,
+            prepared_cpu_stage.target_cpu_profiled.run_ms,
             prompt_base_profile=dict(prompt_g2pw_profiled.profile or {}),
             target_base_profile=dict(target_g2pw_profiled.profile or {}),
         )
         phase_end = time.perf_counter()
-        return {
-            "prompt_feature_profiled": prompt_feature_profiled,
-            "target_feature_profiled": target_feature_profiled,
-            "phase_wall_ms": max(0.0, (phase_end - phase_start) * 1000.0),
-        }
+        return GPTSoVITSPrepareTextPhaseData(
+            prompt_feature_profiled=prompt_feature_profiled,
+            target_feature_profiled=target_feature_profiled,
+            phase_wall_ms=max(0.0, (phase_end - phase_start) * 1000.0),
+        )
 
     def prepare_request_gpu_text_phase(
         self,
@@ -2875,16 +3132,21 @@ class GPTSoVITSRuntime:
         self,
         coordinator: Any,
         prepared_audio_phase: GPTSoVITSPreparedAudioPhase,
-    ) -> tuple[tuple[Any, Any], dict[str, float]]:
-        ref_audio_profiled = prepared_audio_phase.phase_one["ref_audio_profiled"]
-        raw_audio = ref_audio_profiled.result["raw_audio"]
-        raw_sr = int(ref_audio_profiled.result["raw_sr"])
+    ) -> GPTSoVITSPrepareRefSpecResult:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
+        ref_audio_profiled = prepared_audio_phase.phase_one.ref_audio_profiled
+        raw_audio = ref_audio_profiled.result.raw_audio
+        raw_sr = int(ref_audio_profiled.result.raw_sr)
         profiled = await self._run_ref_spec_stage(coordinator, raw_audio, raw_sr)
-        refer_spec, profile = profiled.result
+        refer_spec_raw, profile = profiled.result
+        refer_spec = self._coerce_refer_spec(refer_spec_raw)
         merged_profile = dict(profile)
         merged_profile["ref_spec_wait_ms"] = float(profiled.queue_ms)
         merged_profile["ref_spec_ms"] = float(profiled.run_ms)
-        return refer_spec, merged_profile
+        return GPTSoVITSPrepareRefSpecResult(
+            refer_spec=refer_spec,
+            profile=merged_profile,
+        )
 
     def prepare_request_ref_spec_phase(
         self,
@@ -2938,16 +3200,16 @@ class GPTSoVITSRuntime:
     def _build_prepare_profile_overrides(
         self,
         cpu_stage: Any,
-        phase_one: dict[str, Any],
-        phase_two: dict[str, Any],
+        phase_one: GPTSoVITSPrepareAudioPhaseData,
+        phase_two: GPTSoVITSPrepareTextPhaseData,
         *,
         extra_profile: dict[str, float] | None = None,
     ) -> dict[str, float]:
-        prompt_g2pw_profiled = phase_one["prompt_g2pw_profiled"]
-        target_g2pw_profiled = phase_one["target_g2pw_profiled"]
-        ref_audio_profiled = phase_one["ref_audio_profiled"]
-        prompt_feature_profiled = phase_two["prompt_feature_profiled"]
-        target_feature_profiled = phase_two["target_feature_profiled"]
+        prompt_g2pw_profiled = phase_one.prompt_g2pw_profiled
+        target_g2pw_profiled = phase_one.target_g2pw_profiled
+        ref_audio_profiled = phase_one.ref_audio_profiled
+        prompt_feature_profiled = phase_two.prompt_feature_profiled
+        target_feature_profiled = phase_two.target_feature_profiled
         profile_overrides = {
             "executor_queue_ms": max(0.0, (cpu_stage.prepare_start - cpu_stage.prepare_submit_at) * 1000.0),
             "prepare_admission_wait_ms": float(cpu_stage.prepare_admission_wait_ms),
@@ -2961,8 +3223,8 @@ class GPTSoVITSRuntime:
             "text_cpu_start_ts": float(cpu_stage.target_cpu_profiled.started_at),
             "text_cpu_end_ts": float(cpu_stage.target_cpu_profiled.finished_at),
             "executor_run_wall_ms": max(0.0, (time.perf_counter() - cpu_stage.prepare_start) * 1000.0),
-            "text_feature_pair_ms": float(phase_two["phase_wall_ms"]),
-            "g2pw_pair_ms": float(phase_one["g2pw_pair_ms"]),
+            "text_feature_pair_ms": float(phase_two.phase_wall_ms),
+            "g2pw_pair_ms": float(phase_one.g2pw_pair_ms),
             "g2pw_pair_gate_wait_ms": self._profile_value(target_g2pw_profiled, "g2pw_pair_gate_wait_ms"),
             "g2pw_pair_executor_queue_ms": self._profile_value(target_g2pw_profiled, "g2pw_pair_executor_queue_ms"),
             "g2pw_pair_compute_ms": self._profile_value(target_g2pw_profiled, "g2pw_pair_compute_ms"),
@@ -3025,29 +3287,26 @@ class GPTSoVITSRuntime:
 
     def _build_ref_audio_bundle_from_phase(
         self,
-        phase_one: dict[str, Any],
+        phase_one: GPTSoVITSPrepareAudioPhaseData,
         *,
-        ref_spec_result: tuple[tuple[Any, Any], dict[str, float]] | None = None,
-    ) -> dict[str, Any]:
-        ref_audio_profiled = phase_one["ref_audio_profiled"]
-        ref_audio_bundle = dict(ref_audio_profiled.result)
-        ref_audio_profile = dict(ref_audio_bundle.get("profile", {}))
+        ref_spec_result: GPTSoVITSPrepareRefSpecResult | None = None,
+    ) -> GPTSoVITSRefAudioBundle:
+        ref_audio_profiled = phase_one.ref_audio_profiled
+        ref_audio_result = ref_audio_profiled.result
+        ref_audio_profile = dict(ref_audio_result.profile or {})
         if ref_spec_result is not None:
-            refer_spec, ref_spec_profile = ref_spec_result
-            ref_audio_bundle["refer_spec"] = refer_spec
             ref_audio_profile.update(
                 {
-                    "ref_spec_wait_ms": float(ref_spec_profile.get("ref_spec_wait_ms", 0.0)),
-                    "ref_spec_ms": float(ref_spec_profile.get("ref_spec_ms", 0.0)),
-                    "ref_spec_to_device_ms": float(ref_spec_profile.get("ref_spec_to_device_ms", 0.0)),
-                    "ref_spec_main_resample_ms": float(ref_spec_profile.get("ref_spec_main_resample_ms", 0.0)),
-                    "ref_spec_norm_ms": float(ref_spec_profile.get("ref_spec_norm_ms", 0.0)),
-                    "ref_spec_spectrogram_ms": float(ref_spec_profile.get("ref_spec_spectrogram_ms", 0.0)),
-                    "ref_spec_post_resample_ms": float(ref_spec_profile.get("ref_spec_post_resample_ms", 0.0)),
+                    "ref_spec_wait_ms": float(ref_spec_result.profile.get("ref_spec_wait_ms", 0.0)),
+                    "ref_spec_ms": float(ref_spec_result.profile.get("ref_spec_ms", 0.0)),
+                    "ref_spec_to_device_ms": float(ref_spec_result.profile.get("ref_spec_to_device_ms", 0.0)),
+                    "ref_spec_main_resample_ms": float(ref_spec_result.profile.get("ref_spec_main_resample_ms", 0.0)),
+                    "ref_spec_norm_ms": float(ref_spec_result.profile.get("ref_spec_norm_ms", 0.0)),
+                    "ref_spec_spectrogram_ms": float(ref_spec_result.profile.get("ref_spec_spectrogram_ms", 0.0)),
+                    "ref_spec_post_resample_ms": float(ref_spec_result.profile.get("ref_spec_post_resample_ms", 0.0)),
                 }
             )
         else:
-            ref_audio_bundle["refer_spec"] = None
             ref_audio_profile.setdefault("ref_spec_wait_ms", 0.0)
             ref_audio_profile.setdefault("ref_spec_ms", 0.0)
             ref_audio_profile.setdefault("ref_spec_to_device_ms", 0.0)
@@ -3055,8 +3314,13 @@ class GPTSoVITSRuntime:
             ref_audio_profile.setdefault("ref_spec_norm_ms", 0.0)
             ref_audio_profile.setdefault("ref_spec_spectrogram_ms", 0.0)
             ref_audio_profile.setdefault("ref_spec_post_resample_ms", 0.0)
-        ref_audio_bundle["profile"] = ref_audio_profile
-        return ref_audio_bundle
+        return GPTSoVITSRefAudioBundle(
+            prompt_semantic=ref_audio_result.prompt_semantic,
+            raw_audio=ref_audio_result.raw_audio,
+            raw_sr=int(ref_audio_result.raw_sr),
+            refer_spec=(None if ref_spec_result is None else self._coerce_refer_spec(ref_spec_result.refer_spec)),
+            profile=ref_audio_profile,
+        )
 
     def _build_request_state_native(
         self,
@@ -3067,21 +3331,22 @@ class GPTSoVITSRuntime:
         text: str,
         prompt_result: Any,
         target_result: Any,
-        ref_audio_bundle: dict[str, Any],
+        ref_audio_bundle: GPTSoVITSRefAudioBundle,
         prepare_start: float,
         prepare_sync_start: float,
         profile_overrides: dict[str, float] | None = None,
     ) -> GPTSoVITST2SRequestState:
         device = pipeline.configs.device
         _sync_runtime_device(device)
-        ref_audio_bundle_ms = float(ref_audio_bundle.get("profile", {}).get("bundle_total_ms", 0.0))
-        bundle_profile = ref_audio_bundle.get("profile", {})
-        prompt_semantic = ref_audio_bundle["prompt_semantic"].long()
-        refer_spec_value = ref_audio_bundle.get("refer_spec")
-        if refer_spec_value in [None, ()]:
+        ref_audio_bundle_ms = float(ref_audio_bundle.profile.get("bundle_total_ms", 0.0))
+        bundle_profile = ref_audio_bundle.profile
+        prompt_semantic = ref_audio_bundle.prompt_semantic.long()
+        refer_spec_value = ref_audio_bundle.refer_spec
+        if refer_spec_value is None:
             spec_audio, audio_16k = None, None
         else:
-            spec_audio, audio_16k = refer_spec_value
+            spec_audio = refer_spec_value.spec_audio
+            audio_16k = refer_spec_value.audio_16k
         aux_refer_specs: list[tuple[torch.Tensor, torch.Tensor | None]] = []
         for aux_ref_audio_path in list(getattr(spec, "aux_ref_audio_paths", []) or []):
             if aux_ref_audio_path in [None, ""]:
@@ -3090,8 +3355,8 @@ class GPTSoVITSRuntime:
                 continue
             aux_spec_audio, aux_audio_16k, _, _ = pipeline.extract_ref_spec(str(aux_ref_audio_path))
             aux_refer_specs.append((aux_spec_audio, aux_audio_16k))
-        raw_audio = ref_audio_bundle["raw_audio"]
-        raw_sr = int(ref_audio_bundle["raw_sr"])
+        raw_audio = ref_audio_bundle.raw_audio
+        raw_sr = int(ref_audio_bundle.raw_sr)
         prompt_semantic_ms = float(bundle_profile.get("prompt_semantic_ms", ref_audio_bundle_ms))
         ref_spec_ms = float(bundle_profile.get("ref_spec_ms", 0.0))
         audio_load_ms = float(bundle_profile.get("audio_load_ms", 0.0))
@@ -3306,7 +3571,11 @@ class GPTSoVITSRuntime:
             all_phones=all_phones,
             all_bert_features=all_bert_features,
             prompt_semantic=prompt_semantic,
-            refer_spec=(None if spec_audio is None else (spec_audio, audio_16k)),
+            refer_spec=(
+                None
+                if spec_audio is None
+                else GPTSoVITSReferSpec(spec_audio=spec_audio, audio_16k=audio_16k)
+            ),
             aux_refer_specs=aux_refer_specs,
             raw_audio=raw_audio,
             raw_sr=raw_sr,
@@ -3322,15 +3591,15 @@ class GPTSoVITSRuntime:
     def _build_request_state_from_prepare_phases(
         self,
         prepared_cpu_stage: GPTSoVITSPreparedCpuStage,
-        phase_one: dict[str, Any],
-        phase_two: dict[str, Any],
+        phase_one: GPTSoVITSPrepareAudioPhaseData,
+        phase_two: GPTSoVITSPrepareTextPhaseData,
         *,
-        ref_spec_result: tuple[tuple[Any, Any], dict[str, float]] | None = None,
+        ref_spec_result: GPTSoVITSPrepareRefSpecResult | None = None,
         extra_profile: dict[str, float] | None = None,
     ) -> Any:
         pipeline = self._ensure_pipeline()
         profile_overrides = self._build_prepare_profile_overrides(
-            prepared_cpu_stage.cpu_stage,
+            prepared_cpu_stage,
             phase_one,
             phase_two,
             extra_profile=extra_profile,
@@ -3341,27 +3610,26 @@ class GPTSoVITSRuntime:
         )
         state = self._build_request_state_native(
             pipeline=pipeline,
-            spec=prepared_cpu_stage.cpu_stage.spec,
-            prompt_text=prepared_cpu_stage.cpu_stage.prompt_text,
-            text=prepared_cpu_stage.cpu_stage.text,
-            prompt_result=phase_two["prompt_feature_profiled"].result,
-            target_result=phase_two["target_feature_profiled"].result,
+            spec=prepared_cpu_stage.spec,
+            prompt_text=prepared_cpu_stage.prompt_text,
+            text=prepared_cpu_stage.text,
+            prompt_result=phase_two.prompt_feature_profiled.result,
+            target_result=phase_two.target_feature_profiled.result,
             ref_audio_bundle=ref_audio_bundle,
-            prepare_start=prepared_cpu_stage.cpu_stage.prepare_start,
-            prepare_sync_start=prepared_cpu_stage.cpu_stage.prepare_start,
+            prepare_start=prepared_cpu_stage.prepare_start,
+            prepare_sync_start=prepared_cpu_stage.prepare_start,
             profile_overrides=profile_overrides,
         )
         prepare_exec_finished_at = time.perf_counter()
         state.prepare_profile["executor_run_wall_ms"] = max(
             0.0,
-            (prepare_exec_finished_at - prepared_cpu_stage.cpu_stage.prepare_start) * 1000.0,
+            (prepare_exec_finished_at - prepared_cpu_stage.prepare_start) * 1000.0,
         )
         return state
 
     def _release_prepare_split_stage_slot(self, coordinator: Any) -> None:
-        release_slot = getattr(coordinator, "_release_split_stage_slot", None)
-        if callable(release_slot):
-            release_slot()
+        coordinator = self._coerce_prepare_coordinator(coordinator)
+        coordinator.release_split_stage_slot()
 
     def build_prepared_request_from_phases(
         self,
@@ -3664,10 +3932,10 @@ class GPTSoVITSRuntime:
     @staticmethod
     def _build_refer_spec_from_prepared(
         prepared: GPTSoVITSDecodePreparedRequest,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return (
-            prepared.refer_audio_spec,
-            None if prepared.refer_audio_16k.numel() == 0 else prepared.refer_audio_16k,
+    ) -> GPTSoVITSReferSpec:
+        return GPTSoVITSReferSpec(
+            spec_audio=prepared.refer_audio_spec,
+            audio_16k=(None if prepared.refer_audio_16k.numel() == 0 else prepared.refer_audio_16k),
         )
 
     def _resample_audio(self, audio: torch.Tensor, sr0: int, sr1: int, device: torch.device) -> torch.Tensor:
@@ -4059,7 +4327,7 @@ class GPTSoVITSRuntime:
     ) -> list[GPTSoVITSDecodedAudio]:
         if not prepared_requests:
             return []
-        refer_audio_spec, _ = self._build_refer_spec_from_prepared(prepared_requests[0])
+        refer_audio_spec = self._build_refer_spec_from_prepared(prepared_requests[0]).spec_audio
         with self._run_lock:
             prompt_context = self._build_vocoder_prompt_context(
                 pipeline,
@@ -4112,13 +4380,13 @@ class GPTSoVITSRuntime:
             return self._decode_prepared_request_vocoder_fragment(
                 pipeline,
                 prepared,
-                refer_spec[0],
+                refer_spec.spec_audio,
             )
 
-        refer_audio_spec_list = [refer_spec[0].to(dtype=pipeline.precision, device=pipeline.configs.device)]
+        refer_audio_spec_list = [refer_spec.spec_audio.to(dtype=pipeline.precision, device=pipeline.configs.device)]
         sv_emb = None
         if bool(getattr(pipeline, "is_v2pro", False)):
-            audio_tensor = refer_spec[1]
+            audio_tensor = refer_spec.audio_16k
             if audio_tensor is None:
                 raise ValueError("GPT-SoVITS v2Pro request-local synthesis 缺少 16k 参考音频")
             sv_emb = [pipeline.sv_model.compute_embedding3(audio_tensor).to(pipeline.configs.device)]
@@ -4154,7 +4422,8 @@ class GPTSoVITSRuntime:
         shared_single_refer = False
         shared_refer_audio_spec = None
         if refer_specs:
-            first_spec, first_audio = refer_specs[0]
+            first_spec = refer_specs[0].spec_audio
+            first_audio = refer_specs[0].audio_16k
             first_spec_key = (
                 str(first_spec.device),
                 str(first_spec.dtype),
@@ -4170,7 +4439,9 @@ class GPTSoVITSRuntime:
                     int(first_audio.data_ptr()),
                 )
             shared_single_refer = True
-            for refer_audio_spec, audio_tensor in refer_specs[1:]:
+            for refer_spec in refer_specs[1:]:
+                refer_audio_spec = refer_spec.spec_audio
+                audio_tensor = refer_spec.audio_16k
                 refer_spec_key = (
                     str(refer_audio_spec.device),
                     str(refer_audio_spec.dtype),
@@ -4219,16 +4490,16 @@ class GPTSoVITSRuntime:
             phone_lengths.append(phone_len)
             if shared_single_refer:
                 continue
-            refer_audio_spec, audio_tensor = refer_specs[batch_index]
-            refer_audio_specs.append(refer_audio_spec.to(dtype=pipeline.precision, device=device))
+            refer_spec = refer_specs[batch_index]
+            refer_audio_specs.append(refer_spec.spec_audio.to(dtype=pipeline.precision, device=device))
             if bool(getattr(pipeline, "is_v2pro", False)):
-                if audio_tensor is None:
+                if refer_spec.audio_16k is None:
                     raise ValueError("GPT-SoVITS v2Pro batched non-vocoder decode 缺少 16k 参考音频")
-                sv_emb_list.append(pipeline.sv_model.compute_embedding3(audio_tensor).to(device))
+                sv_emb_list.append(pipeline.sv_model.compute_embedding3(refer_spec.audio_16k).to(device))
 
         if bool(getattr(pipeline, "is_v2pro", False)):
             if shared_single_refer:
-                shared_audio_tensor = refer_specs[0][1]
+                shared_audio_tensor = refer_specs[0].audio_16k
                 if shared_audio_tensor is None:
                     raise ValueError("GPT-SoVITS v2Pro batched non-vocoder decode 缺少 16k 参考音频")
                 sv_emb_batch = pipeline.sv_model.compute_embedding3(shared_audio_tensor).to(device)
@@ -4334,7 +4605,7 @@ class GPTSoVITSRuntime:
                 )
                 continue
             if bool(getattr(pipeline.configs, "use_vocoder", False)):
-                refer_audio_spec, _ = self._build_refer_spec_from_prepared(prepared)
+                refer_audio_spec = self._build_refer_spec_from_prepared(prepared).spec_audio
                 grouped_vocoder.setdefault(
                     self._build_vocoder_prompt_cache_key(prepared, refer_audio_spec),
                     [],
