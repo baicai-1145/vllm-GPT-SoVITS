@@ -189,19 +189,46 @@ class GPTSoVITSV2Decode(nn.Module):
         else:
             request_ids_list = [self._semantic_tokens_from_info(info) for info in request_infos]
 
+        prepared_by_index: list[Any | None] = [None] * len(request_ids_list)
+        batch_prepare_indices: list[int] = []
+        batch_prepare_semantic_ids: list[torch.Tensor] = []
+        batch_prepare_infos: list[dict[str, Any]] = []
+
         for index, semantic_ids in enumerate(request_ids_list):
             info = request_infos[index] if index < len(request_infos) else {}
             if not self._has_decode_conditioning(info):
+                continue
+            prepared = info.get(self._PREPARED_KEY)
+            if prepared is not None:
+                prepared_by_index[index] = prepared
+                continue
+            batch_prepare_indices.append(index)
+            batch_prepare_semantic_ids.append(semantic_ids)
+            batch_prepare_infos.append(info)
+
+        if batch_prepare_indices:
+            prepared_items = self.runtime.prepare_decode_requests(batch_prepare_semantic_ids, batch_prepare_infos)
+            for index, prepared in zip(batch_prepare_indices, prepared_items):
+                prepared_by_index[index] = prepared
+
+        runnable_indices: list[int] = []
+        runnable_prepared: list[Any] = []
+        for index, prepared in enumerate(prepared_by_index):
+            if prepared is None:
                 audio_outputs.append(empty)
                 sample_rates.append(default_sr)
                 continue
-            prepared = info.get(self._PREPARED_KEY)
-            if prepared is None:
-                prepared = self.runtime.prepare_decode_request(semantic_ids, info)
-            decoded = self.runtime.decode_prepared_request(prepared)
-            result = self.runtime.finalize_decoded_audio(decoded)
-            audio_outputs.append(torch.from_numpy(result.audio).to(dtype=torch.float32))
-            sample_rates.append(torch.tensor(int(result.sample_rate), dtype=torch.int32))
+            runnable_indices.append(index)
+            runnable_prepared.append(prepared)
+            audio_outputs.append(empty)
+            sample_rates.append(default_sr)
+
+        if runnable_prepared:
+            decoded_items = self.runtime.decode_prepared_requests(runnable_prepared)
+            finalized_items = self.runtime.finalize_decoded_audios(decoded_items)
+            for index, result in zip(runnable_indices, finalized_items):
+                audio_outputs[index] = torch.from_numpy(result.audio).to(dtype=torch.float32)
+                sample_rates[index] = torch.tensor(int(result.sample_rate), dtype=torch.int32)
 
         return OmniOutput(
             text_hidden_states=None,

@@ -27,6 +27,7 @@ def _make_stage_output(
         "gpt_sovits_raw_sr": torch.tensor([32000], dtype=torch.int32),
     }
     return SimpleNamespace(
+        request_id="req-1",
         finished=finished,
         outputs=[SimpleNamespace(multimodal_output=multimodal_output)],
     )
@@ -58,10 +59,12 @@ def test_t2s2decode_transfers_conditioning_and_prompt_metadata():
 
     assert len(result) == 1
     engine_input = result[0]
-    assert engine_input["prompt_token_ids"] == [101, 102, 103]
+    assert engine_input["prompt_token_ids"] == [0]
     assert engine_input["multi_modal_data"] is None
 
     info = engine_input["additional_information"]
+    assert info["gpt_sovits_request_id"] == "req-1"
+    assert torch.equal(info["gpt_sovits_semantic_tokens"], torch.tensor([101, 102, 103], dtype=torch.long))
     assert info["gpt_sovits_semantic_token_count"] == 3
     assert info["gpt_sovits_raw_sr"] == 32000
     assert info["gpt_sovits_speed_factor"] == pytest.approx(1.25)

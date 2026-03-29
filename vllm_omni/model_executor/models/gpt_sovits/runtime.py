@@ -34,6 +34,17 @@ _DEFAULT_PROJECT_ROOT = os.path.abspath(
 _DEFAULT_CONFIG_PATH = "GPT_SoVITS/configs/tts_infer.yaml"
 
 
+def _sync_runtime_device(device: Any) -> None:
+    try:
+        device_str = str(device)
+        if device_str.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        elif device_str == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+            torch.mps.synchronize()
+    except Exception:
+        pass
+
+
 def _left_pad_hidden(hidden: torch.Tensor, target_len: int) -> torch.Tensor:
     if hidden.shape[0] >= target_len:
         return hidden
@@ -50,6 +61,22 @@ def _make_pad_mask_left(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
     expanded_lengths = seq_range.unsqueeze(0).repeat(lengths.size(0), 1)
     expanded_lengths -= (max_len - lengths).unsqueeze(-1)
     return expanded_lengths < 0
+
+
+def _pad_token_sequences(
+    token_sequences: Sequence[torch.LongTensor],
+) -> tuple[torch.LongTensor, torch.BoolTensor]:
+    if not token_sequences:
+        raise ValueError("token_sequences 不能为空")
+    device = token_sequences[0].device
+    max_len = max(int(sequence.shape[0]) for sequence in token_sequences)
+    padded = torch.zeros((len(token_sequences), max_len), dtype=token_sequences[0].dtype, device=device)
+    mask = torch.zeros((len(token_sequences), max_len), dtype=torch.bool, device=device)
+    for row_index, sequence in enumerate(token_sequences):
+        seq_len = int(sequence.shape[0])
+        padded[row_index, :seq_len] = sequence
+        mask[row_index, :seq_len] = True
+    return padded, mask
 
 
 @dataclass(slots=True)
@@ -96,6 +123,34 @@ class GPTSoVITSPreparedTextPhase:
 
 
 @dataclass(slots=True)
+class GPTSoVITST2SRequestState:
+    request_id: str
+    ref_audio_path: Any
+    prompt_text: str
+    prompt_lang: str
+    text: str
+    text_lang: str
+    norm_prompt_text: str
+    norm_text: str
+    phones: torch.LongTensor
+    prompt_phones: torch.LongTensor
+    all_phones: torch.LongTensor
+    all_bert_features: torch.Tensor
+    prompt_semantic: torch.LongTensor
+    refer_spec: tuple[torch.Tensor, torch.Tensor | None] | None
+    aux_refer_specs: list[tuple[torch.Tensor, torch.Tensor | None]]
+    raw_audio: torch.Tensor
+    raw_sr: int
+    top_k: int
+    top_p: float
+    temperature: float
+    repetition_penalty: float
+    early_stop_num: int
+    ready_step: int
+    prepare_profile: dict[str, float]
+
+
+@dataclass(slots=True)
 class GPTSoVITSDecodePreparedRequest:
     request_id: str
     semantic_tokens: torch.Tensor
@@ -136,6 +191,23 @@ class GPTSoVITSARFinishedItem:
     finish_reason: str
 
 
+@dataclass(slots=True)
+class GPTSoVITSPrepareProfiledResult:
+    result: Any
+    submit_at: float
+    started_at: float
+    finished_at: float
+    profile: dict[str, float] | None = None
+
+    @property
+    def queue_ms(self) -> float:
+        return max(0.0, (self.started_at - self.submit_at) * 1000.0)
+
+    @property
+    def run_ms(self) -> float:
+        return max(0.0, (self.finished_at - self.started_at) * 1000.0)
+
+
 class GPTSoVITSRuntime:
     """Thin, process-local wrapper around GPT-SoVITS TTS.run()."""
 
@@ -154,6 +226,7 @@ class GPTSoVITSRuntime:
         self._pipeline: Any | None = None
         self._config: Any | None = None
         self._prepare_coordinator: Any | None = None
+        self._prepared_cpu_stage_cls: Any | None = None
         self._t2s_active_batch_cls: Any | None = None
         self._native_runtime_ready = False
 
@@ -272,6 +345,20 @@ class GPTSoVITSRuntime:
 
             self._t2s_active_batch_cls = T2SActiveBatch
         return self._t2s_active_batch_cls
+
+    def _get_prepare_cpu_stage_cls(self) -> Any:
+        if self._prepared_cpu_stage_cls is not None:
+            return self._prepared_cpu_stage_cls
+        with self._init_lock:
+            if self._prepared_cpu_stage_cls is not None:
+                return self._prepared_cpu_stage_cls
+            self._ensure_import_path()
+            self._ensure_native_runtime_deps()
+            with self._project_root_cwd():
+                from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import PreparedCpuStage
+
+            self._prepared_cpu_stage_cls = PreparedCpuStage
+        return self._prepared_cpu_stage_cls
 
     @staticmethod
     def _ensure_audio_position_encoding(
@@ -566,6 +653,150 @@ class GPTSoVITSRuntime:
         self._set_kv_pool_active_rows(model, len(active_batch.request_ids))
         return True
 
+    def _get_sampling_ops(self) -> tuple[Any, Any]:
+        self._ensure_import_path()
+        self._ensure_native_runtime_deps()
+        with self._project_root_cwd():
+            from AR.models.utils import logits_to_probs, multinomial_sample_one_no_sync
+
+        return logits_to_probs, multinomial_sample_one_no_sync
+
+    @staticmethod
+    def _stack_token_sequences_if_same_length(
+        token_sequences: Sequence[torch.LongTensor],
+    ) -> torch.LongTensor | None:
+        if not token_sequences:
+            raise ValueError("token_sequences 不能为空")
+        target_len = int(token_sequences[0].shape[0])
+        for sequence in token_sequences[1:]:
+            if int(sequence.shape[0]) != target_len:
+                return None
+        return torch.stack(list(token_sequences), dim=0)
+
+    @staticmethod
+    def _sampling_group_key(
+        top_k: int,
+        top_p: float,
+        temperature: float,
+        repetition_penalty: float,
+        trim_eos: bool,
+    ) -> tuple[int, float, float, float, bool]:
+        return (
+            int(top_k),
+            float(top_p),
+            float(temperature),
+            float(repetition_penalty),
+            bool(trim_eos),
+        )
+
+    @staticmethod
+    def _iter_contiguous_sampling_groups(
+        sampling_keys: Sequence[tuple[int, float, float, float, bool]],
+    ) -> list[tuple[tuple[int, float, float, float, bool], list[int]]]:
+        groups: list[tuple[tuple[int, float, float, float, bool], list[int]]] = []
+        if not sampling_keys:
+            return groups
+        current_key = sampling_keys[0]
+        current_indices: list[int] = [0]
+        for index in range(1, len(sampling_keys)):
+            key = sampling_keys[index]
+            if key == current_key:
+                current_indices.append(index)
+                continue
+            groups.append((current_key, current_indices))
+            current_key = key
+            current_indices = [index]
+        groups.append((current_key, current_indices))
+        return groups
+
+    def _uniform_sampling_group_key(self, active_batch: Any) -> tuple[int, float, float, float, bool] | None:
+        if not active_batch.states:
+            return None
+        if active_batch.step_indices.numel() <= 0:
+            return None
+        first_step_index = int(active_batch.step_indices[0].item())
+        if bool((active_batch.step_indices != first_step_index).any().item()):
+            return None
+        first_state = active_batch.states[0]
+        first_key = self._sampling_group_key(
+            top_k=first_state.top_k,
+            top_p=first_state.top_p,
+            temperature=first_state.temperature,
+            repetition_penalty=first_state.repetition_penalty,
+            trim_eos=first_step_index < 11,
+        )
+        for state in active_batch.states[1:]:
+            if (
+                state.top_k != first_state.top_k
+                or state.top_p != first_state.top_p
+                or state.temperature != first_state.temperature
+                or state.repetition_penalty != first_state.repetition_penalty
+            ):
+                return None
+        return first_key
+
+    def _batched_sample_uniform(
+        self,
+        logits: torch.Tensor,
+        histories: Sequence[torch.LongTensor],
+        sampling_key: tuple[int, float, float, float, bool],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits_to_probs, multinomial_sample_one_no_sync = self._get_sampling_ops()
+        top_k, top_p, temperature, repetition_penalty, trim_eos = sampling_key
+        sample_logits = logits[:, :-1] if trim_eos else logits
+        padded_histories = self._stack_token_sequences_if_same_length(histories)
+        history_mask = None
+        if padded_histories is None:
+            padded_histories, history_mask = _pad_token_sequences(histories)
+        probs = logits_to_probs(
+            logits=sample_logits,
+            previous_tokens=padded_histories,
+            previous_token_mask=history_mask,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
+        )
+        sampled = multinomial_sample_one_no_sync(probs)
+        argmax_tokens = torch.argmax(sample_logits, dim=-1)
+        return sampled, argmax_tokens
+
+    def _batched_sample_by_group(
+        self,
+        logits: torch.Tensor,
+        histories: Sequence[torch.LongTensor],
+        sampling_keys: Sequence[tuple[int, float, float, float, bool]],
+    ) -> tuple[list[torch.Tensor], list[int]]:
+        logits_to_probs, multinomial_sample_one_no_sync = self._get_sampling_ops()
+        sampled_list: list[torch.Tensor | None] = [None] * len(histories)
+        argmax_list: list[int | None] = [None] * len(histories)
+        for group_key, group_indices in self._iter_contiguous_sampling_groups(sampling_keys):
+            top_k, top_p, temperature, repetition_penalty, trim_eos = group_key
+            index_tensor = torch.tensor(group_indices, dtype=torch.long, device=logits.device)
+            group_logits = torch.index_select(logits, dim=0, index=index_tensor)
+            if trim_eos:
+                group_logits = group_logits[:, :-1]
+            group_histories = [histories[index] for index in group_indices]
+            padded_histories = self._stack_token_sequences_if_same_length(group_histories)
+            history_mask = None
+            if padded_histories is None:
+                padded_histories, history_mask = _pad_token_sequences(group_histories)
+            probs = logits_to_probs(
+                logits=group_logits,
+                previous_tokens=padded_histories,
+                previous_token_mask=history_mask,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                temperature=temperature,
+            )
+            argmax_tokens = torch.argmax(group_logits, dim=-1)
+            for local_index, global_index in enumerate(group_indices):
+                sampled_list[global_index] = multinomial_sample_one_no_sync(probs[local_index : local_index + 1])
+                argmax_list[global_index] = int(argmax_tokens[local_index].item())
+
+        return [item for item in sampled_list if item is not None], [int(item) for item in argmax_list if item is not None]
+
     def _sample_active_batch_requests(
         self,
         model: Any,
@@ -574,33 +805,24 @@ class GPTSoVITSRuntime:
         *,
         max_steps: int,
     ) -> tuple[list[GPTSoVITSARFinishedItem], list[int], list[torch.LongTensor]]:
-        with self._project_root_cwd():
-            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import (
-                _batched_sample_by_group,
-                _batched_sample_uniform,
-                _sampling_group_key,
-                _stack_token_sequences_if_same_length,
-                _uniform_sampling_group_key,
-            )
-
         finished_items: list[GPTSoVITSARFinishedItem] = []
         keep_indices: list[int] = []
         updated_sequences: list[torch.LongTensor] = []
 
-        uniform_sampling_key = _uniform_sampling_group_key(active_batch)
+        uniform_sampling_key = self._uniform_sampling_group_key(active_batch)
         sampled_items: list[torch.Tensor]
         argmax_tokens: list[int]
         sampled_token_tensor: torch.Tensor | None = None
         argmax_token_tensor: torch.Tensor | None = None
         if uniform_sampling_key is not None:
-            sampled_tensor, argmax_tensor = _batched_sample_uniform(
+            sampled_tensor, argmax_tensor = self._batched_sample_uniform(
                 logits=logits,
                 histories=active_batch.y_sequences,
                 sampling_key=uniform_sampling_key,
             )
             sampled_token_tensor = sampled_tensor.view(-1)
             argmax_token_tensor = argmax_tensor.view(-1)
-            stacked_histories = _stack_token_sequences_if_same_length(active_batch.y_sequences)
+            stacked_histories = self._stack_token_sequences_if_same_length(active_batch.y_sequences)
             if (
                 all(state.early_stop_num == -1 for state in active_batch.states)
                 and int(active_batch.step_indices[0].item()) + 1 < max_steps
@@ -621,7 +843,7 @@ class GPTSoVITSRuntime:
             argmax_tokens = [int(item) for item in argmax_tensor.tolist()]
         else:
             sampling_keys = [
-                _sampling_group_key(
+                self._sampling_group_key(
                     top_k=state.top_k,
                     top_p=state.top_p,
                     temperature=state.temperature,
@@ -630,7 +852,7 @@ class GPTSoVITSRuntime:
                 )
                 for batch_index, state in enumerate(active_batch.states)
             ]
-            sampled_items, argmax_tokens = _batched_sample_by_group(
+            sampled_items, argmax_tokens = self._batched_sample_by_group(
                 logits=logits,
                 histories=active_batch.y_sequences,
                 sampling_keys=sampling_keys,
@@ -1144,6 +1366,368 @@ class GPTSoVITSRuntime:
         with self._project_root_cwd():
             return coordinator.submit_prepare_ref_audio_asset(ref_audio_path, submit_at=submit_at)
 
+    def _normalize_prepare_sentence(self, text: str, language: str) -> str:
+        with self._project_root_cwd():
+            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import normalize_sentence
+
+        return normalize_sentence(text, language)
+
+    @staticmethod
+    def _prepare_result_has_pending_g2pw(prepared_segments: Any) -> bool:
+        return any(bool(getattr(segment, "needs_g2pw", False)) for segment in (prepared_segments or []))
+
+    def _prepare_text_cpu(self, text: str, language: str) -> Any:
+        pipeline = self._ensure_pipeline()
+        return pipeline.prepare_text_segments(text, language)
+
+    def _resolve_g2pw_segments(self, prepared_segments: Any) -> tuple[Any, dict[str, float]]:
+        pipeline = self._ensure_pipeline()
+        profile: dict[str, float] = {}
+        resolved_segments = pipeline.resolve_g2pw_segments(prepared_segments, profile=profile)
+        return resolved_segments, profile
+
+    def _resolve_g2pw_segment_batches(
+        self,
+        prepared_segment_batches: list[Any],
+    ) -> tuple[Any, list[dict[str, float]]]:
+        pipeline = self._ensure_pipeline()
+        profiles: list[dict[str, float]] = [{} for _ in prepared_segment_batches]
+        resolved_batches = pipeline.resolve_g2pw_segments_batch(prepared_segment_batches, profiles=profiles)
+        return resolved_batches, profiles
+
+    def _load_ref_audio_raw(self, ref_audio_path: str) -> Any:
+        pipeline = self._ensure_pipeline()
+        return pipeline._load_ref_audio_raw(ref_audio_path)
+
+    def _extract_ref_spec_from_raw(self, raw_audio: Any, raw_sr: int) -> tuple[tuple[Any, Any], dict[str, float]]:
+        pipeline = self._ensure_pipeline()
+        spec, audio, _, _, profile = pipeline._extract_ref_spec_profile_from_raw(raw_audio, raw_sr)
+        return (spec, audio), profile
+
+    @staticmethod
+    def _build_text_cpu_profiled_result(
+        submit_at: float,
+        result: Any,
+        worker_profile: dict[str, float],
+    ) -> GPTSoVITSPrepareProfiledResult:
+        started_at = float(
+            submit_at
+            + (
+                float(worker_profile.get("text_cpu_admission_wait_ms", 0.0))
+                + float(worker_profile.get("text_cpu_queue_wait_ms", 0.0))
+            )
+            / 1000.0
+        )
+        finished_at = float(started_at + float(worker_profile.get("text_cpu_run_ms", 0.0)) / 1000.0)
+        return GPTSoVITSPrepareProfiledResult(
+            result=result,
+            submit_at=float(submit_at),
+            started_at=started_at,
+            finished_at=finished_at,
+            profile=dict(worker_profile),
+        )
+
+    @staticmethod
+    def _prepare_run_profiled(fn: Any, submit_at: float, *args: Any) -> GPTSoVITSPrepareProfiledResult:
+        started_at = time.perf_counter()
+        result = fn(*args)
+        finished_at = time.perf_counter()
+        return GPTSoVITSPrepareProfiledResult(
+            result=result,
+            submit_at=float(submit_at),
+            started_at=float(started_at),
+            finished_at=float(finished_at),
+        )
+
+    async def _prepare_run_on_executor(self, executor: Any, fn: Any, *args: Any) -> GPTSoVITSPrepareProfiledResult:
+        loop = asyncio.get_running_loop()
+        submit_at = time.perf_counter()
+        return await loop.run_in_executor(executor, self._prepare_run_profiled, fn, float(submit_at), *args)
+
+    @staticmethod
+    def _estimate_text_feature_run_ms(profile: dict[str, float]) -> float:
+        return float(
+            profile.get("bert_wait_ms", 0.0)
+            + profile.get("bert_tokenize_ms", 0.0)
+            + profile.get("bert_forward_ms", 0.0)
+            + profile.get("bert_scatter_ms", 0.0)
+        )
+
+    def _build_empty_text_features_like(self, reference: Any | None = None) -> Any:
+        feature_dim = 1024
+        dtype = None
+        if reference is not None:
+            try:
+                feature_dim = int(reference.bert_features.shape[0])
+                dtype = reference.bert_features.dtype
+            except Exception:
+                pass
+        with self._project_root_cwd():
+            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import build_empty_text_features
+
+        return build_empty_text_features(
+            feature_dim=int(feature_dim),
+            dtype=(dtype if dtype is not None else None) or torch.float32,
+        )
+
+    def _build_text_features(
+        self,
+        prepared_segments: Any,
+        language: str | None,
+        cpu_run_ms: float,
+        base_profile: dict[str, float] | None = None,
+    ) -> Any:
+        with self._project_root_cwd():
+            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import PreparedTextFeatures
+
+        pipeline = self._ensure_pipeline()
+        profile: dict[str, float] = dict(base_profile or {})
+        profile["cpu_preprocess_ms"] = float(cpu_run_ms)
+        branch_start = time.perf_counter()
+        phones, bert_features, norm_text = pipeline.build_text_features_from_segments(
+            prepared_segments,
+            profile=profile,
+        )
+        total_ms = float(cpu_run_ms + (time.perf_counter() - branch_start) * 1000.0)
+        profile["bert_total_ms"] = max(0.0, total_ms - float(cpu_run_ms))
+        return PreparedTextFeatures(
+            phones=phones,
+            bert_features=bert_features,
+            norm_text=norm_text,
+            profile=profile,
+            total_ms=total_ms,
+            cpu_preprocess_ms=float(cpu_run_ms),
+        )
+
+    def _build_ref_prompt_semantic_from_raw(self, raw_audio: Any, raw_sr: int) -> dict[str, Any]:
+        pipeline = self._ensure_pipeline()
+        load_profile = {"audio_load_ms": 0.0}
+        if getattr(pipeline, "prepare_ref_semantic_batch_worker", None) is not None:
+            wav16k, local_cpu_prepare_profile = pipeline._prepare_ref_prompt_wav16k_for_worker(raw_audio, raw_sr)
+            prompt_semantic, worker_profile = pipeline.prepare_ref_semantic_batch_worker.submit(
+                raw_audio,
+                raw_sr,
+                wav16k=wav16k,
+            )
+            return {
+                "prompt_semantic": prompt_semantic,
+                "raw_audio": raw_audio,
+                "raw_sr": raw_sr,
+                "profile": {
+                    **load_profile,
+                    "audio_stage_wait_ms": float(worker_profile.get("prompt_semantic_wait_ms", 0.0)),
+                    "audio_stage_slots": float(worker_profile.get("prompt_semantic_stage_slots", 0.0)),
+                    "audio_stage_inflight_peak": float(
+                        worker_profile.get("prompt_semantic_stage_inflight_peak", 0.0)
+                    ),
+                    "prompt_semantic_ms": float(
+                        worker_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
+                        + local_cpu_prepare_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
+                        + worker_profile.get("prompt_semantic_forward_ms", 0.0)
+                        + worker_profile.get("prompt_semantic_scatter_ms", 0.0)
+                    ),
+                    **{key: float(value) for key, value in worker_profile.items()},
+                    "prompt_semantic_cpu_prepare_ms": float(
+                        worker_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
+                        + local_cpu_prepare_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
+                    ),
+                    "prompt_semantic_cpu_prepare_wait_ms": float(
+                        worker_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0)
+                        + local_cpu_prepare_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0)
+                    ),
+                    "prompt_semantic_cpu_prepare_slots": float(
+                        max(
+                            worker_profile.get("prompt_semantic_cpu_prepare_slots", 0.0),
+                            local_cpu_prepare_profile.get("prompt_semantic_cpu_prepare_slots", 0.0),
+                        )
+                    ),
+                    "prompt_semantic_cpu_prepare_inflight_peak": float(
+                        max(
+                            worker_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0),
+                            local_cpu_prepare_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0),
+                        )
+                    ),
+                    "ref_spec_wait_ms": 0.0,
+                    "ref_spec_ms": 0.0,
+                    "bundle_total_ms": float(worker_profile.get("prompt_semantic_wait_ms", 0.0))
+                    + float(local_cpu_prepare_profile.get("prompt_semantic_cpu_prepare_ms", 0.0))
+                    + float(worker_profile.get("prompt_semantic_cpu_prepare_ms", 0.0))
+                    + float(worker_profile.get("prompt_semantic_forward_ms", 0.0))
+                    + float(worker_profile.get("prompt_semantic_scatter_ms", 0.0)),
+                },
+            }
+
+        wav16k, cpu_prepare_ms, limiter_stats = pipeline._prepare_prompt_semantic_wav16k_profile(raw_audio, raw_sr)
+        with pipeline.prepare_ref_semantic_stage_limiter.enter() as stage_stats:
+            prompt_semantic, runtime_profile = pipeline._extract_prompt_semantic_profile_from_prepared_wav16k(wav16k)
+        return {
+            "prompt_semantic": prompt_semantic,
+            "raw_audio": raw_audio,
+            "raw_sr": raw_sr,
+            "profile": {
+                "audio_load_ms": 0.0,
+                "audio_stage_wait_ms": float(stage_stats.get("wait_ms", 0.0)),
+                "audio_stage_slots": float(stage_stats.get("slots", 0.0)),
+                "audio_stage_inflight_peak": float(stage_stats.get("peak_inflight", 0.0)),
+                "prompt_semantic_wait_ms": float(stage_stats.get("wait_ms", 0.0)),
+                "prompt_semantic_cpu_prepare_wait_ms": float(limiter_stats.get("wait_ms", 0.0)),
+                "prompt_semantic_cpu_prepare_slots": float(limiter_stats.get("slots", 0.0)),
+                "prompt_semantic_cpu_prepare_inflight_peak": float(limiter_stats.get("peak_inflight", 0.0)),
+                "prompt_semantic_worker_queue_wait_ms": 0.0,
+                "prompt_semantic_batch_collect_wait_ms": 0.0,
+                "prompt_semantic_stage_limiter_wait_ms": float(stage_stats.get("wait_ms", 0.0)),
+                "prompt_semantic_batch_dispatch_delay_ms": 0.0,
+                "prompt_semantic_cpu_prepare_ms": float(cpu_prepare_ms),
+                "prompt_semantic_pack_ms": 0.0,
+                "prompt_semantic_h2d_ms": float(runtime_profile.get("prompt_semantic_h2d_ms", 0.0)),
+                "prompt_semantic_ssl_forward_ms": float(runtime_profile.get("prompt_semantic_ssl_forward_ms", 0.0)),
+                "prompt_semantic_hidden_length_ms": float(
+                    runtime_profile.get("prompt_semantic_hidden_length_ms", 0.0)
+                ),
+                "prompt_semantic_extract_latent_ms": float(
+                    runtime_profile.get("prompt_semantic_extract_latent_ms", 0.0)
+                ),
+                "prompt_semantic_forward_ms": float(runtime_profile.get("prompt_semantic_forward_ms", 0.0)),
+                "prompt_semantic_scatter_ms": 0.0,
+                "prompt_semantic_stage_slots": float(stage_stats.get("slots", 0.0)),
+                "prompt_semantic_stage_inflight_peak": float(stage_stats.get("peak_inflight", 0.0)),
+                "prompt_semantic_batch_size": 1.0,
+                "prompt_semantic_batch_samples": 0.0,
+                "ref_spec_wait_ms": 0.0,
+                "ref_spec_ms": 0.0,
+                "bundle_total_ms": float(
+                    cpu_prepare_ms
+                    + runtime_profile.get("prompt_semantic_forward_ms", 0.0)
+                    + stage_stats.get("wait_ms", 0.0)
+                ),
+            },
+        }
+
+    async def _run_text_cpu_stage(
+        self,
+        coordinator: Any,
+        text: str,
+        language: str,
+    ) -> GPTSoVITSPrepareProfiledResult:
+        await coordinator.text_cpu_gate.acquire()
+        if text in [None, ""]:
+            try:
+                submit_at = time.perf_counter()
+                return GPTSoVITSPrepareProfiledResult(
+                    result=[],
+                    submit_at=submit_at,
+                    started_at=submit_at,
+                    finished_at=submit_at,
+                )
+            finally:
+                coordinator.text_cpu_gate.release()
+
+        pipeline = self._ensure_pipeline()
+        text_cpu_worker = getattr(pipeline, "prepare_text_cpu_worker", None)
+        executor = getattr(pipeline, "prepare_text_cpu_executor", None)
+        try:
+            if text_cpu_worker is not None:
+                submit_at = time.perf_counter()
+                result, worker_profile = await text_cpu_worker.submit_async(text, language)
+                return self._build_text_cpu_profiled_result(submit_at, result, dict(worker_profile))
+            if executor is None:
+                submit_at = time.perf_counter()
+                return self._prepare_run_profiled(self._prepare_text_cpu, submit_at, text, language)
+            return await self._prepare_run_on_executor(executor, self._prepare_text_cpu, text, language)
+        finally:
+            coordinator.text_cpu_gate.release()
+
+    async def _run_text_cpu_stage_pair(
+        self,
+        coordinator: Any,
+        prompt_text: str,
+        prompt_lang: str,
+        text: str,
+        text_lang: str,
+    ) -> tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult]:
+        pipeline = self._ensure_pipeline()
+        text_cpu_worker = getattr(pipeline, "prepare_text_cpu_worker", None)
+        if (
+            text_cpu_worker is None
+            or not hasattr(text_cpu_worker, "submit_many_async")
+            or int(getattr(coordinator.text_cpu_gate, "max_inflight", 0)) > 0
+        ):
+            prompt_cpu_task = asyncio.create_task(self._run_text_cpu_stage(coordinator, prompt_text, prompt_lang))
+            target_cpu_task = asyncio.create_task(self._run_text_cpu_stage(coordinator, text, text_lang))
+            return await asyncio.gather(prompt_cpu_task, target_cpu_task)
+
+        items = []
+        item_indices = []
+        profiled_results: list[GPTSoVITSPrepareProfiledResult | None] = [None, None]
+        for index, (item_text, item_lang) in enumerate(((prompt_text, prompt_lang), (text, text_lang))):
+            if item_text in [None, ""]:
+                submit_at = time.perf_counter()
+                profiled_results[index] = GPTSoVITSPrepareProfiledResult(
+                    result=[],
+                    submit_at=submit_at,
+                    started_at=submit_at,
+                    finished_at=submit_at,
+                )
+                continue
+            items.append((item_text, item_lang))
+            item_indices.append(index)
+
+        if items:
+            submit_at = time.perf_counter()
+            worker_results = await text_cpu_worker.submit_many_async(items)
+            for item_index, (result, worker_profile) in zip(item_indices, worker_results):
+                profiled_results[item_index] = self._build_text_cpu_profiled_result(
+                    submit_at,
+                    result,
+                    dict(worker_profile),
+                )
+
+        assert profiled_results[0] is not None
+        assert profiled_results[1] is not None
+        return profiled_results[0], profiled_results[1]
+
+    async def _prepare_cpu_stage_async(
+        self,
+        coordinator: Any,
+        spec: Any,
+        *,
+        prepare_submit_at: float,
+    ) -> Any:
+        admission_start = time.perf_counter()
+        admission_stats = await coordinator._inflight_gate.acquire()
+        prepare_admission_wait_ms = max(
+            float(admission_stats.get("wait_ms", 0.0)),
+            (time.perf_counter() - admission_start) * 1000.0,
+        )
+        current_inflight, peak_inflight = coordinator._mark_enter()
+        prepare_start = time.perf_counter()
+        prompt_text = self._normalize_prepare_sentence(spec.prompt_text, spec.prompt_lang)
+        text = spec.text.strip("\n")
+        try:
+            prompt_cpu_profiled, target_cpu_profiled = await self._run_text_cpu_stage_pair(
+                coordinator,
+                prompt_text,
+                spec.prompt_lang,
+                text,
+                spec.text_lang,
+            )
+            prepared_cpu_stage_cls = self._get_prepare_cpu_stage_cls()
+            return prepared_cpu_stage_cls(
+                spec=spec,
+                prepare_submit_at=float(prepare_submit_at),
+                prepare_start=float(prepare_start),
+                prompt_text=prompt_text,
+                text=text,
+                prepare_admission_wait_ms=float(prepare_admission_wait_ms),
+                current_inflight=int(current_inflight),
+                peak_inflight=int(peak_inflight),
+                prompt_cpu_profiled=prompt_cpu_profiled,
+                target_cpu_profiled=target_cpu_profiled,
+            )
+        except Exception:
+            self._release_prepare_split_stage_slot(coordinator)
+            raise
+
     def prepare_request_cpu_stage(
         self,
         request: dict[str, Any],
@@ -1154,10 +1738,11 @@ class GPTSoVITSRuntime:
         coordinator = self._ensure_prepare_coordinator()
         spec = self._build_scheduler_request_spec(request, request_id=request_id)
         ref_audio_prepare_future = None
+        submit_at = time.perf_counter()
         if preload_ref_audio:
-            ref_audio_prepare_future = self.preload_ref_audio_asset(str(spec.ref_audio_path), submit_at=time.perf_counter())
+            ref_audio_prepare_future = self.preload_ref_audio_asset(str(spec.ref_audio_path), submit_at=submit_at)
         cpu_stage = self._run_awaitable_sync(
-            coordinator.prepare_cpu_stage_profiled_async(spec, time.perf_counter())
+            self._prepare_cpu_stage_async(coordinator, spec, prepare_submit_at=submit_at)
         )
         return GPTSoVITSPreparedCpuStage(
             request_id=str(spec.request_id),
@@ -1167,67 +1752,1181 @@ class GPTSoVITSRuntime:
             ref_audio_prepare_future=ref_audio_prepare_future,
         )
 
+    def prepare_request_cpu_stages(
+        self,
+        requests: list[dict[str, Any]],
+    ) -> list[GPTSoVITSPreparedCpuStage]:
+        if not requests:
+            return []
+        coordinator = self._ensure_prepare_coordinator()
+        specs: list[Any] = []
+        submit_ats: list[float] = []
+        ref_audio_prepare_futures: list[Any | None] = []
+        for index, request in enumerate(requests):
+            request_id = str(request.get("engine_request_id") or f"gpt_sovits_{index}")
+            spec = self._build_scheduler_request_spec(request, request_id=request_id)
+            specs.append(spec)
+            submit_at = time.perf_counter()
+            submit_ats.append(submit_at)
+            ref_audio_prepare_futures.append(
+                self.preload_ref_audio_asset(str(spec.ref_audio_path), submit_at=submit_at)
+            )
+
+        async def _gather_cpu_stages():
+            return await asyncio.gather(
+                *[
+                    self._prepare_cpu_stage_async(coordinator, spec, prepare_submit_at=submit_at)
+                    for spec, submit_at in zip(specs, submit_ats)
+                ],
+                return_exceptions=True,
+            )
+
+        cpu_stage_results = self._run_awaitable_sync(_gather_cpu_stages())
+        if len(cpu_stage_results) != len(requests):
+            raise ValueError("GPT-SoVITS batch prepare CPU stage count mismatch")
+        prepared_cpu_stages: list[GPTSoVITSPreparedCpuStage] = []
+        for request, spec, cpu_stage, ref_audio_prepare_future in zip(
+            requests,
+            specs,
+            cpu_stage_results,
+            ref_audio_prepare_futures,
+        ):
+            if isinstance(cpu_stage, Exception):
+                raise cpu_stage
+            prepared_cpu_stages.append(
+                GPTSoVITSPreparedCpuStage(
+                    request_id=str(spec.request_id),
+                    request=dict(request),
+                    spec=spec,
+                    cpu_stage=cpu_stage,
+                    ref_audio_prepare_future=ref_audio_prepare_future,
+                )
+            )
+        return prepared_cpu_stages
+
+    async def _run_text_feature_stage(
+        self,
+        coordinator: Any,
+        prepared_segments: Any,
+        language: str | None,
+        cpu_run_ms: float,
+        base_profile: dict[str, float] | None = None,
+    ) -> GPTSoVITSPrepareProfiledResult:
+        if coordinator.text_feature_executor is not None:
+            await coordinator.text_feature_gate.acquire()
+            try:
+                return await self._prepare_run_on_executor(
+                    coordinator.text_feature_executor,
+                    self._build_text_features,
+                    prepared_segments,
+                    language,
+                    cpu_run_ms,
+                    base_profile,
+                )
+            finally:
+                coordinator.text_feature_gate.release()
+
+        pipeline = self._ensure_pipeline()
+        await coordinator.text_feature_gate.acquire()
+        profile: dict[str, float] = dict(base_profile or {})
+        profile["cpu_preprocess_ms"] = float(cpu_run_ms)
+        submit_at = time.perf_counter()
+        started_at = float(submit_at)
+        try:
+            result_raw = await pipeline.build_text_features_from_segments_async(
+                prepared_segments,
+                profile=profile,
+            )
+            finished_at = time.perf_counter()
+            with self._project_root_cwd():
+                from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import PreparedTextFeatures
+
+            result = PreparedTextFeatures(
+                phones=result_raw[0],
+                bert_features=result_raw[1],
+                norm_text=result_raw[2],
+                profile=profile,
+                total_ms=float(cpu_run_ms + self._estimate_text_feature_run_ms(profile)),
+                cpu_preprocess_ms=float(cpu_run_ms),
+            )
+            profiled = GPTSoVITSPrepareProfiledResult(
+                result=result,
+                submit_at=float(submit_at),
+                started_at=started_at,
+                finished_at=float(submit_at + self._estimate_text_feature_run_ms(profile) / 1000.0),
+            )
+            if finished_at > profiled.finished_at:
+                result.profile["bert_total_ms"] = max(
+                    self._estimate_text_feature_run_ms(profile),
+                    (finished_at - submit_at) * 1000.0,
+                )
+            else:
+                result.profile["bert_total_ms"] = self._estimate_text_feature_run_ms(profile)
+            return profiled
+        finally:
+            coordinator.text_feature_gate.release()
+
+    async def _run_g2pw_stage(
+        self,
+        coordinator: Any,
+        prepared_segments: Any,
+    ) -> GPTSoVITSPrepareProfiledResult:
+        has_pending = self._prepare_result_has_pending_g2pw(prepared_segments)
+        if not has_pending:
+            submit_at = time.perf_counter()
+            return GPTSoVITSPrepareProfiledResult(
+                result=prepared_segments,
+                submit_at=float(submit_at),
+                started_at=float(submit_at),
+                finished_at=float(submit_at),
+                profile={},
+            )
+        await coordinator.g2pw_gate.acquire()
+        try:
+            profiled = await self._prepare_run_on_executor(
+                coordinator.g2pw_executor,
+                self._resolve_g2pw_segments,
+                prepared_segments,
+            )
+            result, stage_profile = profiled.result
+            return GPTSoVITSPrepareProfiledResult(
+                result=result,
+                submit_at=float(profiled.submit_at),
+                started_at=float(profiled.started_at),
+                finished_at=float(profiled.finished_at),
+                profile=dict(stage_profile),
+            )
+        finally:
+            coordinator.g2pw_gate.release()
+
+    @staticmethod
+    def _merge_g2pw_pair_stage_profile(
+        profile: dict[str, float] | None,
+        pair_profile: dict[str, float],
+    ) -> dict[str, float]:
+        merged = dict(profile or {})
+        for key, value in pair_profile.items():
+            merged[key] = float(value)
+        return merged
+
+    async def _run_g2pw_pair_stage(
+        self,
+        coordinator: Any,
+        prompt_segments: Any,
+        target_segments: Any,
+    ) -> tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult]:
+        pair_submit_at = time.perf_counter()
+        prompt_is_empty = len(prompt_segments or []) == 0
+        prompt_has_pending = self._prepare_result_has_pending_g2pw(prompt_segments)
+        target_has_pending = self._prepare_result_has_pending_g2pw(target_segments)
+        pipeline = self._ensure_pipeline()
+        g2pw_batch_worker = getattr(pipeline, "prepare_g2pw_batch_worker", None)
+        if g2pw_batch_worker is not None and (prompt_has_pending or target_has_pending):
+            resolved_batches, batch_profiles, worker_profile, submit_at, started_at, finished_at = (
+                await g2pw_batch_worker.submit_async([prompt_segments or [], target_segments or []])
+            )
+            prompt_result, target_result = resolved_batches
+            prompt_profile, target_profile = batch_profiles
+            pair_finished_at = time.perf_counter()
+            pair_compute_ms = max(0.0, (float(finished_at) - float(started_at)) * 1000.0)
+            pair_profile = {
+                "g2pw_pair_gate_wait_ms": 0.0,
+                "g2pw_pair_executor_queue_ms": 0.0,
+                "g2pw_pair_compute_ms": float(pair_compute_ms),
+                "g2pw_pair_stage_overhead_ms": max(
+                    0.0,
+                    (pair_finished_at - pair_submit_at) * 1000.0 - float(pair_compute_ms),
+                ),
+            }
+            prompt_profile = self._merge_g2pw_pair_stage_profile(
+                {**dict(prompt_profile), **dict(worker_profile)},
+                pair_profile,
+            )
+            target_profile = self._merge_g2pw_pair_stage_profile(
+                {**dict(target_profile), **dict(worker_profile)},
+                pair_profile,
+            )
+            if prompt_has_pending:
+                prompt_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=prompt_result,
+                    submit_at=float(submit_at),
+                    started_at=float(started_at),
+                    finished_at=float(finished_at),
+                    profile=prompt_profile,
+                )
+            else:
+                idle_ts = time.perf_counter()
+                prompt_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=prompt_segments,
+                    submit_at=float(idle_ts),
+                    started_at=float(idle_ts),
+                    finished_at=float(idle_ts),
+                    profile={},
+                )
+            if target_has_pending:
+                target_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=target_result,
+                    submit_at=float(submit_at),
+                    started_at=float(started_at),
+                    finished_at=float(finished_at),
+                    profile=target_profile,
+                )
+            else:
+                idle_ts = time.perf_counter()
+                target_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=target_segments,
+                    submit_at=float(idle_ts),
+                    started_at=float(idle_ts),
+                    finished_at=float(idle_ts),
+                    profile={},
+                )
+            return prompt_profiled, target_profiled
+
+        if bool(getattr(coordinator, "enable_g2pw_pair_batch", False)) and (prompt_has_pending or target_has_pending):
+            gate_wait_start = time.perf_counter()
+            await coordinator.g2pw_gate.acquire()
+            gate_acquired_at = time.perf_counter()
+            try:
+                profiled = await self._prepare_run_on_executor(
+                    coordinator.g2pw_executor,
+                    self._resolve_g2pw_segment_batches,
+                    [prompt_segments or [], target_segments or []],
+                )
+                pair_finished_at = time.perf_counter()
+                pair_profile = {
+                    "g2pw_pair_gate_wait_ms": max(0.0, (gate_acquired_at - gate_wait_start) * 1000.0),
+                    "g2pw_pair_executor_queue_ms": float(profiled.queue_ms),
+                    "g2pw_pair_compute_ms": float(profiled.run_ms),
+                    "g2pw_pair_stage_overhead_ms": max(
+                        0.0,
+                        (pair_finished_at - pair_submit_at) * 1000.0
+                        - max(0.0, (gate_acquired_at - gate_wait_start) * 1000.0)
+                        - float(profiled.queue_ms)
+                        - float(profiled.run_ms),
+                    ),
+                }
+                resolved_batches, batch_profiles = profiled.result
+                prompt_result, target_result = resolved_batches
+                prompt_profile, target_profile = batch_profiles
+                if prompt_has_pending:
+                    prompt_profiled = GPTSoVITSPrepareProfiledResult(
+                        result=prompt_result,
+                        submit_at=float(profiled.submit_at),
+                        started_at=float(profiled.started_at),
+                        finished_at=float(profiled.finished_at),
+                        profile=self._merge_g2pw_pair_stage_profile(prompt_profile, pair_profile),
+                    )
+                else:
+                    idle_ts = time.perf_counter()
+                    prompt_profiled = GPTSoVITSPrepareProfiledResult(
+                        result=prompt_segments,
+                        submit_at=float(idle_ts),
+                        started_at=float(idle_ts),
+                        finished_at=float(idle_ts),
+                        profile={},
+                    )
+                if target_has_pending:
+                    target_profiled = GPTSoVITSPrepareProfiledResult(
+                        result=target_result,
+                        submit_at=float(profiled.submit_at),
+                        started_at=float(profiled.started_at),
+                        finished_at=float(profiled.finished_at),
+                        profile=self._merge_g2pw_pair_stage_profile(target_profile, pair_profile),
+                    )
+                else:
+                    idle_ts = time.perf_counter()
+                    target_profiled = GPTSoVITSPrepareProfiledResult(
+                        result=target_segments,
+                        submit_at=float(idle_ts),
+                        started_at=float(idle_ts),
+                        finished_at=float(idle_ts),
+                        profile={},
+                    )
+                return prompt_profiled, target_profiled
+            finally:
+                coordinator.g2pw_gate.release()
+
+        target_task = asyncio.create_task(self._run_g2pw_stage(coordinator, target_segments))
+        if not prompt_is_empty:
+            prompt_task = asyncio.create_task(self._run_g2pw_stage(coordinator, prompt_segments))
+            return await asyncio.gather(prompt_task, target_task)
+        target_profiled = await target_task
+        submit_at = time.perf_counter()
+        prompt_profiled = GPTSoVITSPrepareProfiledResult(
+            result=prompt_segments,
+            submit_at=float(submit_at),
+            started_at=float(submit_at),
+            finished_at=float(submit_at),
+            profile={},
+        )
+        return prompt_profiled, target_profiled
+
+    async def _run_g2pw_pair_stage_batch(
+        self,
+        coordinator: Any,
+        cpu_stages: list[Any],
+    ) -> list[tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult] | Exception]:
+        pair_submit_at = time.perf_counter()
+        if not cpu_stages:
+            return []
+
+        group_batches: list[list[Any]] = []
+        group_request_index: list[tuple[int, str]] = []
+        has_pending_pairs: list[tuple[bool, bool]] = []
+        idle_prompt_target: list[tuple[Any, Any]] = []
+        for index, cpu_stage in enumerate(cpu_stages):
+            prompt_segments = cpu_stage.prompt_cpu_profiled.result
+            target_segments = cpu_stage.target_cpu_profiled.result
+            prompt_has_pending = self._prepare_result_has_pending_g2pw(prompt_segments)
+            target_has_pending = self._prepare_result_has_pending_g2pw(target_segments)
+            has_pending_pairs.append((prompt_has_pending, target_has_pending))
+            idle_prompt_target.append((prompt_segments, target_segments))
+            if prompt_has_pending:
+                group_request_index.append((index, "prompt"))
+                group_batches.append(prompt_segments or [])
+            if target_has_pending:
+                group_request_index.append((index, "target"))
+                group_batches.append(target_segments or [])
+
+        if not group_batches:
+            profiled_results: list[tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult]] = []
+            for prompt_segments, target_segments in idle_prompt_target:
+                idle_ts = time.perf_counter()
+                profiled_results.append(
+                    (
+                        GPTSoVITSPrepareProfiledResult(
+                            result=prompt_segments,
+                            submit_at=float(idle_ts),
+                            started_at=float(idle_ts),
+                            finished_at=float(idle_ts),
+                            profile={},
+                        ),
+                        GPTSoVITSPrepareProfiledResult(
+                            result=target_segments,
+                            submit_at=float(idle_ts),
+                            started_at=float(idle_ts),
+                            finished_at=float(idle_ts),
+                            profile={},
+                        ),
+                    )
+                )
+            return profiled_results
+
+        gate_wait_start = time.perf_counter()
+        await coordinator.g2pw_gate.acquire()
+        gate_acquired_at = time.perf_counter()
+        try:
+            profiled = await self._prepare_run_on_executor(
+                coordinator.g2pw_executor,
+                self._resolve_g2pw_segment_batches,
+                group_batches,
+            )
+        finally:
+            coordinator.g2pw_gate.release()
+
+        pair_finished_at = time.perf_counter()
+        pair_profile = {
+            "g2pw_pair_gate_wait_ms": max(0.0, (gate_acquired_at - gate_wait_start) * 1000.0),
+            "g2pw_pair_executor_queue_ms": float(profiled.queue_ms),
+            "g2pw_pair_compute_ms": float(profiled.run_ms),
+            "g2pw_pair_stage_overhead_ms": max(
+                0.0,
+                (pair_finished_at - pair_submit_at) * 1000.0
+                - max(0.0, (gate_acquired_at - gate_wait_start) * 1000.0)
+                - float(profiled.queue_ms)
+                - float(profiled.run_ms),
+            ),
+            "g2pw_pair_audio_batch_merge_size": float(len(cpu_stages)),
+        }
+        resolved_batches, batch_profiles = profiled.result
+
+        prompt_results: list[GPTSoVITSPrepareProfiledResult | None] = [None] * len(cpu_stages)
+        target_results: list[GPTSoVITSPrepareProfiledResult | None] = [None] * len(cpu_stages)
+        for (request_index, branch), resolved_segments, stage_profile in zip(
+            group_request_index,
+            resolved_batches,
+            batch_profiles,
+        ):
+            branch_profile = self._merge_g2pw_pair_stage_profile(stage_profile, pair_profile)
+            branch_result = GPTSoVITSPrepareProfiledResult(
+                result=resolved_segments,
+                submit_at=float(profiled.submit_at),
+                started_at=float(profiled.started_at),
+                finished_at=float(profiled.finished_at),
+                profile=branch_profile,
+            )
+            if branch == "prompt":
+                prompt_results[request_index] = branch_result
+            else:
+                target_results[request_index] = branch_result
+
+        profiled_results = []
+        for index, (prompt_has_pending, target_has_pending) in enumerate(has_pending_pairs):
+            prompt_segments, target_segments = idle_prompt_target[index]
+            if prompt_has_pending:
+                prompt_profiled = prompt_results[index]
+            else:
+                idle_ts = time.perf_counter()
+                prompt_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=prompt_segments,
+                    submit_at=float(idle_ts),
+                    started_at=float(idle_ts),
+                    finished_at=float(idle_ts),
+                    profile={},
+                )
+            if target_has_pending:
+                target_profiled = target_results[index]
+            else:
+                idle_ts = time.perf_counter()
+                target_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=target_segments,
+                    submit_at=float(idle_ts),
+                    started_at=float(idle_ts),
+                    finished_at=float(idle_ts),
+                    profile={},
+                )
+            assert prompt_profiled is not None
+            assert target_profiled is not None
+            profiled_results.append((prompt_profiled, target_profiled))
+        return profiled_results
+
+    async def _run_text_feature_pair_stage(
+        self,
+        coordinator: Any,
+        prompt_segments: Any,
+        target_segments: Any,
+        prompt_cpu_run_ms: float,
+        target_cpu_run_ms: float,
+        prompt_base_profile: dict[str, float] | None = None,
+        target_base_profile: dict[str, float] | None = None,
+    ) -> tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult]:
+        prompt_is_empty = len(prompt_segments or []) == 0
+        pipeline = self._ensure_pipeline()
+        if coordinator.text_feature_executor is not None:
+            target_feature_task = asyncio.create_task(
+                self._prepare_run_on_executor(
+                    coordinator.text_feature_executor,
+                    self._build_text_features,
+                    target_segments,
+                    None,
+                    target_cpu_run_ms,
+                    target_base_profile,
+                )
+            )
+            if not prompt_is_empty:
+                prompt_feature_task = asyncio.create_task(
+                    self._prepare_run_on_executor(
+                        coordinator.text_feature_executor,
+                        self._build_text_features,
+                        prompt_segments,
+                        None,
+                        prompt_cpu_run_ms,
+                        prompt_base_profile,
+                    )
+                )
+                return await asyncio.gather(prompt_feature_task, target_feature_task)
+            target_profiled = await target_feature_task
+            submit_at = time.perf_counter()
+            prompt_profiled = GPTSoVITSPrepareProfiledResult(
+                result=self._build_empty_text_features_like(target_profiled.result),
+                submit_at=float(submit_at),
+                started_at=float(submit_at),
+                finished_at=float(submit_at),
+            )
+            return prompt_profiled, target_profiled
+
+        await coordinator.text_feature_gate.acquire()
+        target_profile: dict[str, float] = dict(target_base_profile or {})
+        target_profile["cpu_preprocess_ms"] = float(target_cpu_run_ms)
+        submit_at = time.perf_counter()
+        started_at = float(submit_at)
+        try:
+            with self._project_root_cwd():
+                from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import PreparedTextFeatures
+
+            if prompt_is_empty:
+                target_result_raw = await pipeline.build_text_features_from_segments_async(
+                    target_segments,
+                    profile=target_profile,
+                )
+                prompt_result = self._build_empty_text_features_like(
+                    PreparedTextFeatures(
+                        phones=target_result_raw[0],
+                        bert_features=target_result_raw[1],
+                        norm_text=target_result_raw[2],
+                        profile=target_profile,
+                        total_ms=float(target_cpu_run_ms + self._estimate_text_feature_run_ms(target_profile)),
+                        cpu_preprocess_ms=float(target_cpu_run_ms),
+                    )
+                )
+                finished_at = time.perf_counter()
+                prompt_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=prompt_result,
+                    submit_at=float(submit_at),
+                    started_at=float(submit_at),
+                    finished_at=float(submit_at),
+                )
+                target_result = PreparedTextFeatures(
+                    phones=target_result_raw[0],
+                    bert_features=target_result_raw[1],
+                    norm_text=target_result_raw[2],
+                    profile=target_profile,
+                    total_ms=float(target_cpu_run_ms + self._estimate_text_feature_run_ms(target_profile)),
+                    cpu_preprocess_ms=float(target_cpu_run_ms),
+                )
+                target_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=target_result,
+                    submit_at=float(submit_at),
+                    started_at=started_at,
+                    finished_at=float(submit_at + self._estimate_text_feature_run_ms(target_profile) / 1000.0),
+                )
+                if finished_at > target_profiled.finished_at:
+                    target_result.profile["bert_total_ms"] = max(
+                        self._estimate_text_feature_run_ms(target_profile),
+                        (finished_at - submit_at) * 1000.0,
+                    )
+                else:
+                    target_result.profile["bert_total_ms"] = self._estimate_text_feature_run_ms(target_profile)
+                return prompt_profiled, target_profiled
+
+            prompt_profile: dict[str, float] = dict(prompt_base_profile or {})
+            prompt_profile["cpu_preprocess_ms"] = float(prompt_cpu_run_ms)
+            prompt_result_raw, target_result_raw = await pipeline.build_text_feature_pair_from_segments_async(
+                prompt_segments,
+                target_segments,
+                prompt_profile=prompt_profile,
+                target_profile=target_profile,
+            )
+            finished_at = time.perf_counter()
+
+            prompt_result = PreparedTextFeatures(
+                phones=prompt_result_raw[0],
+                bert_features=prompt_result_raw[1],
+                norm_text=prompt_result_raw[2],
+                profile=prompt_profile,
+                total_ms=float(prompt_cpu_run_ms + self._estimate_text_feature_run_ms(prompt_profile)),
+                cpu_preprocess_ms=float(prompt_cpu_run_ms),
+            )
+            target_result = PreparedTextFeatures(
+                phones=target_result_raw[0],
+                bert_features=target_result_raw[1],
+                norm_text=target_result_raw[2],
+                profile=target_profile,
+                total_ms=float(target_cpu_run_ms + self._estimate_text_feature_run_ms(target_profile)),
+                cpu_preprocess_ms=float(target_cpu_run_ms),
+            )
+            prompt_profiled = GPTSoVITSPrepareProfiledResult(
+                result=prompt_result,
+                submit_at=float(submit_at),
+                started_at=started_at,
+                finished_at=float(submit_at + self._estimate_text_feature_run_ms(prompt_profile) / 1000.0),
+            )
+            target_profiled = GPTSoVITSPrepareProfiledResult(
+                result=target_result,
+                submit_at=float(submit_at),
+                started_at=started_at,
+                finished_at=float(submit_at + self._estimate_text_feature_run_ms(target_profile) / 1000.0),
+            )
+            if finished_at > prompt_profiled.finished_at:
+                prompt_result.profile["bert_total_ms"] = max(
+                    self._estimate_text_feature_run_ms(prompt_profile),
+                    (finished_at - submit_at) * 1000.0,
+                )
+                target_result.profile["bert_total_ms"] = max(
+                    self._estimate_text_feature_run_ms(target_profile),
+                    (finished_at - submit_at) * 1000.0,
+                )
+            else:
+                prompt_result.profile["bert_total_ms"] = self._estimate_text_feature_run_ms(prompt_profile)
+                target_result.profile["bert_total_ms"] = self._estimate_text_feature_run_ms(target_profile)
+            return prompt_profiled, target_profiled
+        finally:
+            coordinator.text_feature_gate.release()
+
+    async def _run_ref_prompt_semantic_stage(
+        self,
+        coordinator: Any,
+        ref_audio_path: str,
+        prepared_asset_future: Any | None = None,
+        prepared_asset: Any | None = None,
+    ) -> GPTSoVITSPrepareProfiledResult:
+        pipeline = self._ensure_pipeline()
+        if getattr(pipeline, "prepare_ref_semantic_batch_worker", None) is not None:
+            submit_at = time.perf_counter()
+            started_at = float(submit_at)
+            preload_profiled: Any | None = None
+            if prepared_asset is not None:
+                preload_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=prepared_asset,
+                    submit_at=float(submit_at),
+                    started_at=float(submit_at),
+                    finished_at=float(submit_at),
+                )
+            elif prepared_asset_future is not None:
+                preload_profiled = await asyncio.wrap_future(prepared_asset_future)
+
+            if preload_profiled is None:
+                await coordinator.ref_load_gate.acquire()
+                try:
+                    load_profiled = await self._prepare_run_on_executor(
+                        coordinator.ref_audio_executor,
+                        self._load_ref_audio_raw,
+                        ref_audio_path,
+                    )
+                finally:
+                    coordinator.ref_load_gate.release()
+                raw_audio, raw_sr = load_profiled.result
+                wav16k = None
+                load_queue_ms = float(load_profiled.queue_ms)
+                load_ms = float(load_profiled.run_ms)
+                cpu_prepare_wait_ms = 0.0
+                cpu_prepare_slots = 0.0
+                cpu_prepare_inflight_peak = 0.0
+                preload_cpu_prepare_ms = 0.0
+            else:
+                prepared_result = preload_profiled.result
+                raw_audio = prepared_result.raw_audio
+                raw_sr = prepared_result.raw_sr
+                wav16k = prepared_result.wav16k
+                preload_profile = dict(getattr(prepared_result, "profile", {}) or {})
+                load_queue_ms = float(preload_profiled.queue_ms)
+                load_ms = float(preload_profile.get("audio_load_ms", 0.0))
+                cpu_prepare_wait_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0))
+                cpu_prepare_slots = float(preload_profile.get("prompt_semantic_cpu_prepare_slots", 0.0))
+                cpu_prepare_inflight_peak = float(
+                    preload_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0)
+                )
+                preload_cpu_prepare_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_ms", 0.0))
+
+            prompt_semantic_task = asyncio.create_task(
+                pipeline.prepare_ref_semantic_batch_worker.submit_async(raw_audio, raw_sr, wav16k=wav16k)
+            )
+            prompt_semantic, prompt_semantic_profile = await prompt_semantic_task
+            limiter_snapshot = (
+                pipeline.prepare_ref_semantic_stage_limiter.snapshot()
+                if getattr(pipeline, "prepare_ref_semantic_stage_limiter", None) is not None
+                else {}
+            )
+            prompt_semantic_ms = (
+                float(prompt_semantic_profile.get("prompt_semantic_cpu_prepare_ms", 0.0))
+                + float(prompt_semantic_profile.get("prompt_semantic_forward_ms", 0.0))
+                + float(prompt_semantic_profile.get("prompt_semantic_scatter_ms", 0.0))
+            )
+            finished_at = time.perf_counter()
+            result = {
+                "prompt_semantic": prompt_semantic,
+                "raw_audio": raw_audio,
+                "raw_sr": raw_sr,
+                "profile": {
+                    "audio_load_queue_ms": float(load_queue_ms),
+                    "audio_load_ms": float(load_ms),
+                    "audio_stage_wait_ms": float(prompt_semantic_profile.get("prompt_semantic_wait_ms", 0.0)),
+                    "audio_stage_slots": float(
+                        max(
+                            float(prompt_semantic_profile.get("prompt_semantic_stage_slots", 0.0)),
+                            float(limiter_snapshot.get("slots", 0.0)),
+                        )
+                    ),
+                    "audio_stage_inflight_peak": float(
+                        max(
+                            float(prompt_semantic_profile.get("prompt_semantic_stage_inflight_peak", 0.0)),
+                            float(limiter_snapshot.get("peak_inflight", 0.0)),
+                        )
+                    ),
+                    "prompt_semantic_ms": float(prompt_semantic_ms),
+                    "prompt_semantic_wait_ms": float(prompt_semantic_profile.get("prompt_semantic_wait_ms", 0.0)),
+                    "prompt_semantic_worker_queue_wait_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_worker_queue_wait_ms", 0.0)
+                    ),
+                    "prompt_semantic_batch_collect_wait_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_batch_collect_wait_ms", 0.0)
+                    ),
+                    "prompt_semantic_stage_limiter_wait_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_stage_limiter_wait_ms", 0.0)
+                    ),
+                    "prompt_semantic_batch_dispatch_delay_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_batch_dispatch_delay_ms", 0.0)
+                    ),
+                    "prompt_semantic_cpu_prepare_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
+                    ),
+                    "prompt_semantic_preload_cpu_prepare_ms": float(preload_cpu_prepare_ms),
+                    "prompt_semantic_cpu_prepare_wait_ms": float(cpu_prepare_wait_ms),
+                    "prompt_semantic_cpu_prepare_slots": float(cpu_prepare_slots),
+                    "prompt_semantic_cpu_prepare_inflight_peak": float(cpu_prepare_inflight_peak),
+                    "prompt_semantic_preload_queue_ms": float(load_queue_ms),
+                    "prompt_semantic_pack_ms": float(prompt_semantic_profile.get("prompt_semantic_pack_ms", 0.0)),
+                    "prompt_semantic_h2d_ms": float(prompt_semantic_profile.get("prompt_semantic_h2d_ms", 0.0)),
+                    "prompt_semantic_ssl_forward_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_ssl_forward_ms", 0.0)
+                    ),
+                    "prompt_semantic_hidden_length_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_hidden_length_ms", 0.0)
+                    ),
+                    "prompt_semantic_extract_latent_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_extract_latent_ms", 0.0)
+                    ),
+                    "prompt_semantic_forward_ms": float(prompt_semantic_profile.get("prompt_semantic_forward_ms", 0.0)),
+                    "prompt_semantic_scatter_ms": float(prompt_semantic_profile.get("prompt_semantic_scatter_ms", 0.0)),
+                    "prompt_semantic_stage_slots": float(prompt_semantic_profile.get("prompt_semantic_stage_slots", 0.0)),
+                    "prompt_semantic_stage_inflight_peak": float(
+                        prompt_semantic_profile.get("prompt_semantic_stage_inflight_peak", 0.0)
+                    ),
+                    "prompt_semantic_batch_size": float(prompt_semantic_profile.get("prompt_semantic_batch_size", 1.0)),
+                    "prompt_semantic_batch_samples": float(
+                        prompt_semantic_profile.get("prompt_semantic_batch_samples", 0.0)
+                    ),
+                    "prompt_semantic_padded_batch_samples": float(
+                        prompt_semantic_profile.get("prompt_semantic_padded_batch_samples", 0.0)
+                    ),
+                    "prompt_semantic_batch_pad_ratio": float(
+                        prompt_semantic_profile.get("prompt_semantic_batch_pad_ratio", 0.0)
+                    ),
+                    "prompt_semantic_ssl_skip_attention_mask": float(
+                        prompt_semantic_profile.get("prompt_semantic_ssl_skip_attention_mask", 0.0)
+                    ),
+                    "prompt_semantic_pool_workers": float(
+                        prompt_semantic_profile.get("prompt_semantic_pool_workers", 0.0)
+                    ),
+                    "prompt_semantic_pool_bucket_index": float(
+                        prompt_semantic_profile.get("prompt_semantic_pool_bucket_index", 0.0)
+                    ),
+                    "prompt_semantic_bucket_first_hit_serialized": float(
+                        prompt_semantic_profile.get("prompt_semantic_bucket_first_hit_serialized", 0.0)
+                    ),
+                    "prompt_semantic_runtime_exact_prewarm_applied": float(
+                        prompt_semantic_profile.get("prompt_semantic_runtime_exact_prewarm_applied", 0.0)
+                    ),
+                    "prompt_semantic_runtime_exact_prewarm_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_runtime_exact_prewarm_ms", 0.0)
+                    ),
+                    "prompt_semantic_runtime_exact_prewarm_target_samples": float(
+                        prompt_semantic_profile.get("prompt_semantic_runtime_exact_prewarm_target_samples", 0.0)
+                    ),
+                    "prompt_semantic_runtime_exact_prewarm_batch_sizes": float(
+                        prompt_semantic_profile.get("prompt_semantic_runtime_exact_prewarm_batch_sizes", 0.0)
+                    ),
+                    "prompt_semantic_runtime_exact_prewarm_skipped_capacity": float(
+                        prompt_semantic_profile.get("prompt_semantic_runtime_exact_prewarm_skipped_capacity", 0.0)
+                    ),
+                    "prompt_semantic_shard_index": float(
+                        prompt_semantic_profile.get("prompt_semantic_shard_index", 0.0)
+                    ),
+                    "bundle_total_ms": float(
+                        load_queue_ms
+                        + load_ms
+                        + preload_cpu_prepare_ms
+                        + prompt_semantic_ms
+                    ),
+                },
+            }
+            return GPTSoVITSPrepareProfiledResult(
+                result=result,
+                submit_at=float(submit_at),
+                started_at=started_at,
+                finished_at=float(finished_at),
+            )
+
+        await coordinator.ref_audio_gate.acquire()
+        try:
+            preload_profiled: Any | None = None
+            if prepared_asset is not None:
+                submit_at = time.perf_counter()
+                preload_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=prepared_asset,
+                    submit_at=float(submit_at),
+                    started_at=float(submit_at),
+                    finished_at=float(submit_at),
+                )
+            elif prepared_asset_future is not None:
+                preload_profiled = await asyncio.wrap_future(prepared_asset_future)
+
+            if preload_profiled is None:
+                load_profiled = await self._prepare_run_on_executor(
+                    coordinator.ref_audio_executor,
+                    self._load_ref_audio_raw,
+                    ref_audio_path,
+                )
+                raw_audio, raw_sr = load_profiled.result
+                wav16k = None
+                load_queue_ms = float(load_profiled.queue_ms)
+                load_ms = float(load_profiled.run_ms)
+                cpu_prepare_wait_ms = 0.0
+                cpu_prepare_slots = 0.0
+                cpu_prepare_inflight_peak = 0.0
+                preload_cpu_prepare_ms = 0.0
+            else:
+                prepared_result = preload_profiled.result
+                raw_audio = prepared_result.raw_audio
+                raw_sr = prepared_result.raw_sr
+                wav16k = prepared_result.wav16k
+                preload_profile = dict(getattr(prepared_result, "profile", {}) or {})
+                load_queue_ms = float(preload_profiled.queue_ms)
+                load_ms = float(preload_profile.get("audio_load_ms", 0.0))
+                cpu_prepare_wait_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0))
+                cpu_prepare_slots = float(preload_profile.get("prompt_semantic_cpu_prepare_slots", 0.0))
+                cpu_prepare_inflight_peak = float(
+                    preload_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0)
+                )
+                preload_cpu_prepare_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_ms", 0.0))
+
+            submit_at = time.perf_counter()
+            started_at = time.perf_counter()
+            if wav16k is None:
+                result = await asyncio.to_thread(self._build_ref_prompt_semantic_from_raw, raw_audio, raw_sr)
+            else:
+                with pipeline.prepare_ref_semantic_stage_limiter.enter() as stage_stats:
+                    prompt_semantic, runtime_profile = await asyncio.to_thread(
+                        pipeline._extract_prompt_semantic_profile_from_prepared_wav16k,
+                        wav16k,
+                    )
+                result = {
+                    "prompt_semantic": prompt_semantic,
+                    "raw_audio": raw_audio,
+                    "raw_sr": raw_sr,
+                    "profile": {
+                        "audio_load_queue_ms": float(load_queue_ms),
+                        "audio_load_ms": float(load_ms),
+                        "audio_stage_wait_ms": float(stage_stats.get("wait_ms", 0.0)),
+                        "audio_stage_slots": float(stage_stats.get("slots", 0.0)),
+                        "audio_stage_inflight_peak": float(stage_stats.get("peak_inflight", 0.0)),
+                        "prompt_semantic_wait_ms": float(stage_stats.get("wait_ms", 0.0)),
+                        "prompt_semantic_cpu_prepare_wait_ms": float(cpu_prepare_wait_ms),
+                        "prompt_semantic_cpu_prepare_slots": float(cpu_prepare_slots),
+                        "prompt_semantic_cpu_prepare_inflight_peak": float(cpu_prepare_inflight_peak),
+                        "prompt_semantic_worker_queue_wait_ms": 0.0,
+                        "prompt_semantic_batch_collect_wait_ms": 0.0,
+                        "prompt_semantic_stage_limiter_wait_ms": float(stage_stats.get("wait_ms", 0.0)),
+                        "prompt_semantic_batch_dispatch_delay_ms": 0.0,
+                        "prompt_semantic_cpu_prepare_ms": 0.0,
+                        "prompt_semantic_preload_cpu_prepare_ms": float(preload_cpu_prepare_ms),
+                        "prompt_semantic_preload_queue_ms": float(load_queue_ms),
+                        "prompt_semantic_pack_ms": 0.0,
+                        "prompt_semantic_h2d_ms": float(runtime_profile.get("prompt_semantic_h2d_ms", 0.0)),
+                        "prompt_semantic_ssl_forward_ms": float(
+                            runtime_profile.get("prompt_semantic_ssl_forward_ms", 0.0)
+                        ),
+                        "prompt_semantic_hidden_length_ms": float(
+                            runtime_profile.get("prompt_semantic_hidden_length_ms", 0.0)
+                        ),
+                        "prompt_semantic_extract_latent_ms": float(
+                            runtime_profile.get("prompt_semantic_extract_latent_ms", 0.0)
+                        ),
+                        "prompt_semantic_forward_ms": float(runtime_profile.get("prompt_semantic_forward_ms", 0.0)),
+                        "prompt_semantic_scatter_ms": 0.0,
+                        "prompt_semantic_stage_slots": float(stage_stats.get("slots", 0.0)),
+                        "prompt_semantic_stage_inflight_peak": float(stage_stats.get("peak_inflight", 0.0)),
+                        "prompt_semantic_batch_size": 1.0,
+                        "prompt_semantic_batch_samples": float(wav16k.shape[0]),
+                        "bundle_total_ms": float(
+                            load_queue_ms
+                            + load_ms
+                            + preload_cpu_prepare_ms
+                            + runtime_profile.get("prompt_semantic_forward_ms", 0.0)
+                        ),
+                    },
+                }
+            result.setdefault("profile", {})
+            result["profile"]["audio_load_queue_ms"] = float(load_queue_ms)
+            result["profile"]["audio_load_ms"] = float(load_ms)
+            finished_at = time.perf_counter()
+            return GPTSoVITSPrepareProfiledResult(
+                result=result,
+                submit_at=float(submit_at),
+                started_at=float(started_at),
+                finished_at=float(finished_at),
+            )
+        finally:
+            coordinator.ref_audio_gate.release()
+
+    async def _run_ref_spec_stage(
+        self,
+        coordinator: Any,
+        raw_audio: Any,
+        raw_sr: int,
+    ) -> GPTSoVITSPrepareProfiledResult:
+        await coordinator.ref_spec_gate.acquire()
+        try:
+            return await self._prepare_run_on_executor(
+                coordinator.ref_audio_executor,
+                self._extract_ref_spec_from_raw,
+                raw_audio,
+                raw_sr,
+            )
+        finally:
+            coordinator.ref_spec_gate.release()
+
+    async def _prepare_gpu_audio_phase_batch_async(
+        self,
+        coordinator: Any,
+        prepared_cpu_stages: list[GPTSoVITSPreparedCpuStage],
+    ) -> list[dict[str, Any] | Exception]:
+        if not prepared_cpu_stages:
+            return []
+        phase_start = time.perf_counter()
+        cpu_stages = [item.cpu_stage for item in prepared_cpu_stages]
+        ref_audio_tasks = [
+            asyncio.create_task(
+                self._run_ref_prompt_semantic_stage(
+                    coordinator,
+                    str(prepared_cpu_stage.spec.ref_audio_path),
+                    prepared_asset_future=prepared_cpu_stage.ref_audio_prepare_future,
+                )
+            )
+            for prepared_cpu_stage in prepared_cpu_stages
+        ]
+        try:
+            g2pw_pairs: list[tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult] | Exception | None] = [
+                None
+            ] * len(cpu_stages)
+            group_size = max(1, int(getattr(coordinator, "g2pw_audio_batch_merge_group_size", 8)))
+            for start_index in range(0, len(cpu_stages), group_size):
+                group = cpu_stages[start_index : start_index + group_size]
+                group_pairs = await self._run_g2pw_pair_stage_batch(coordinator, group)
+                for offset, group_pair in enumerate(group_pairs):
+                    g2pw_pairs[start_index + offset] = group_pair
+            g2pw_pair_end = time.perf_counter()
+            ref_audio_results = await asyncio.gather(*ref_audio_tasks, return_exceptions=True)
+            outputs: list[dict[str, Any] | Exception] = []
+            for cpu_stage, g2pw_pair, ref_audio_profiled in zip(cpu_stages, g2pw_pairs, ref_audio_results):
+                if isinstance(g2pw_pair, Exception):
+                    outputs.append(g2pw_pair)
+                    continue
+                if isinstance(ref_audio_profiled, Exception):
+                    outputs.append(ref_audio_profiled)
+                    continue
+                assert g2pw_pair is not None
+                prompt_g2pw_profiled, target_g2pw_profiled = g2pw_pair
+                phase_end = max(float(g2pw_pair_end), float(ref_audio_profiled.finished_at))
+                outputs.append(
+                    {
+                        "prompt_g2pw_profiled": prompt_g2pw_profiled,
+                        "target_g2pw_profiled": target_g2pw_profiled,
+                        "ref_audio_profiled": ref_audio_profiled,
+                        "ref_spec_result": None,
+                        "g2pw_pair_ms": max(0.0, (g2pw_pair_end - phase_start) * 1000.0),
+                        "phase_wall_ms": max(0.0, (phase_end - phase_start) * 1000.0),
+                    }
+                )
+            return outputs
+        finally:
+            for task in ref_audio_tasks:
+                if not task.done():
+                    task.cancel()
+
+    async def _prepare_gpu_audio_phase_async(
+        self,
+        coordinator: Any,
+        prepared_cpu_stage: GPTSoVITSPreparedCpuStage,
+    ) -> dict[str, Any]:
+        cpu_stage = prepared_cpu_stage.cpu_stage
+        phase_start = time.perf_counter()
+        g2pw_pair_task = asyncio.create_task(
+            self._run_g2pw_pair_stage(
+                coordinator,
+                cpu_stage.prompt_cpu_profiled.result,
+                cpu_stage.target_cpu_profiled.result,
+            )
+        )
+        ref_audio_task = asyncio.create_task(
+            self._run_ref_prompt_semantic_stage(
+                coordinator,
+                str(cpu_stage.spec.ref_audio_path),
+                prepared_asset_future=prepared_cpu_stage.ref_audio_prepare_future,
+            )
+        )
+        prompt_g2pw_profiled, target_g2pw_profiled = await g2pw_pair_task
+        g2pw_pair_end = time.perf_counter()
+        ref_audio_profiled = await ref_audio_task
+        phase_end = time.perf_counter()
+        return {
+            "prompt_g2pw_profiled": prompt_g2pw_profiled,
+            "target_g2pw_profiled": target_g2pw_profiled,
+            "ref_audio_profiled": ref_audio_profiled,
+            "ref_spec_result": None,
+            "g2pw_pair_ms": max(0.0, (g2pw_pair_end - phase_start) * 1000.0),
+            "phase_wall_ms": max(0.0, (phase_end - phase_start) * 1000.0),
+        }
+
     def prepare_request_gpu_audio_phase(
         self,
         prepared_cpu_stage: GPTSoVITSPreparedCpuStage,
     ) -> GPTSoVITSPreparedAudioPhase:
         coordinator = self._ensure_prepare_coordinator()
-        phase_one_results = self._run_awaitable_sync(
-            coordinator.prepare_gpu_audio_phases_async(
-                [prepared_cpu_stage.cpu_stage],
-                prepared_ref_audio_futures=[prepared_cpu_stage.ref_audio_prepare_future],
-            )
+        phase_one = self._run_awaitable_sync(
+            self._prepare_gpu_audio_phase_async(coordinator, prepared_cpu_stage)
         )
-        if not phase_one_results:
-            raise ValueError("GPT-SoVITS prepare_gpu_audio_phases_async returned no results")
-        phase_one = phase_one_results[0]
-        if isinstance(phase_one, Exception):
-            raise phase_one
         return GPTSoVITSPreparedAudioPhase(
             request_id=prepared_cpu_stage.request_id,
             prepared_cpu_stage=prepared_cpu_stage,
             phase_one=phase_one,
         )
 
+    def prepare_request_gpu_audio_phases(
+        self,
+        prepared_cpu_stages: list[GPTSoVITSPreparedCpuStage],
+    ) -> list[GPTSoVITSPreparedAudioPhase]:
+        if not prepared_cpu_stages:
+            return []
+        coordinator = self._ensure_prepare_coordinator()
+
+        async def _gather_phase_ones():
+            if bool(getattr(coordinator, "enable_g2pw_audio_batch_merge", False)) and len(prepared_cpu_stages) > 1:
+                return await self._prepare_gpu_audio_phase_batch_async(coordinator, prepared_cpu_stages)
+            return await asyncio.gather(
+                *[
+                    self._prepare_gpu_audio_phase_async(coordinator, prepared_cpu_stage)
+                    for prepared_cpu_stage in prepared_cpu_stages
+                ],
+                return_exceptions=True,
+            )
+
+        phase_one_results = self._run_awaitable_sync(_gather_phase_ones())
+        if len(phase_one_results) != len(prepared_cpu_stages):
+            raise ValueError("GPT-SoVITS batch prepare audio phase count mismatch")
+        prepared_audio_phases: list[GPTSoVITSPreparedAudioPhase] = []
+        for prepared_cpu_stage, phase_one in zip(prepared_cpu_stages, phase_one_results):
+            if isinstance(phase_one, Exception):
+                raise phase_one
+            prepared_audio_phases.append(
+                GPTSoVITSPreparedAudioPhase(
+                    request_id=prepared_cpu_stage.request_id,
+                    prepared_cpu_stage=prepared_cpu_stage,
+                    phase_one=phase_one,
+                )
+            )
+        return prepared_audio_phases
+
+    async def _prepare_gpu_text_phase_async(
+        self,
+        coordinator: Any,
+        prepared_audio_phase: GPTSoVITSPreparedAudioPhase,
+    ) -> dict[str, Any]:
+        cpu_stage = prepared_audio_phase.prepared_cpu_stage.cpu_stage
+        phase_one = prepared_audio_phase.phase_one
+        phase_start = time.perf_counter()
+        prompt_g2pw_profiled = phase_one["prompt_g2pw_profiled"]
+        target_g2pw_profiled = phase_one["target_g2pw_profiled"]
+        prompt_feature_profiled, target_feature_profiled = await self._run_text_feature_pair_stage(
+            coordinator,
+            prompt_g2pw_profiled.result,
+            target_g2pw_profiled.result,
+            cpu_stage.prompt_cpu_profiled.run_ms,
+            cpu_stage.target_cpu_profiled.run_ms,
+            prompt_base_profile=dict(prompt_g2pw_profiled.profile or {}),
+            target_base_profile=dict(target_g2pw_profiled.profile or {}),
+        )
+        phase_end = time.perf_counter()
+        return {
+            "prompt_feature_profiled": prompt_feature_profiled,
+            "target_feature_profiled": target_feature_profiled,
+            "phase_wall_ms": max(0.0, (phase_end - phase_start) * 1000.0),
+        }
+
     def prepare_request_gpu_text_phase(
         self,
         prepared_audio_phase: GPTSoVITSPreparedAudioPhase,
     ) -> GPTSoVITSPreparedTextPhase:
         coordinator = self._ensure_prepare_coordinator()
-        phase_two_results = self._run_awaitable_sync(
-            coordinator.prepare_gpu_text_phases_async(
-                [(prepared_audio_phase.prepared_cpu_stage.cpu_stage, prepared_audio_phase.phase_one)]
-            )
+        phase_two = self._run_awaitable_sync(
+            self._prepare_gpu_text_phase_async(coordinator, prepared_audio_phase)
         )
-        if not phase_two_results:
-            raise ValueError("GPT-SoVITS prepare_gpu_text_phases_async returned no results")
-        phase_two = phase_two_results[0]
-        if isinstance(phase_two, Exception):
-            raise phase_two
         return GPTSoVITSPreparedTextPhase(
             request_id=prepared_audio_phase.request_id,
             prepared_audio_phase=prepared_audio_phase,
             phase_two=phase_two,
         )
 
+    def prepare_request_gpu_text_phases(
+        self,
+        prepared_audio_phases: list[GPTSoVITSPreparedAudioPhase],
+    ) -> list[GPTSoVITSPreparedTextPhase]:
+        if not prepared_audio_phases:
+            return []
+        coordinator = self._ensure_prepare_coordinator()
+        async def _gather_phase_twos():
+            return await asyncio.gather(
+                *[
+                    self._prepare_gpu_text_phase_async(coordinator, prepared_audio_phase)
+                    for prepared_audio_phase in prepared_audio_phases
+                ],
+                return_exceptions=True,
+            )
+        phase_two_results = self._run_awaitable_sync(_gather_phase_twos())
+        if len(phase_two_results) != len(prepared_audio_phases):
+            raise ValueError("GPT-SoVITS batch prepare text phase count mismatch")
+        prepared_text_phases: list[GPTSoVITSPreparedTextPhase] = []
+        for prepared_audio_phase, phase_two in zip(prepared_audio_phases, phase_two_results):
+            if isinstance(phase_two, Exception):
+                raise phase_two
+            prepared_text_phases.append(
+                GPTSoVITSPreparedTextPhase(
+                    request_id=prepared_audio_phase.request_id,
+                    prepared_audio_phase=prepared_audio_phase,
+                    phase_two=phase_two,
+                )
+            )
+        return prepared_text_phases
+
+    async def _prepare_ref_spec_phase_async(
+        self,
+        coordinator: Any,
+        prepared_audio_phase: GPTSoVITSPreparedAudioPhase,
+    ) -> tuple[tuple[Any, Any], dict[str, float]]:
+        ref_audio_profiled = prepared_audio_phase.phase_one["ref_audio_profiled"]
+        raw_audio = ref_audio_profiled.result["raw_audio"]
+        raw_sr = int(ref_audio_profiled.result["raw_sr"])
+        profiled = await self._run_ref_spec_stage(coordinator, raw_audio, raw_sr)
+        refer_spec, profile = profiled.result
+        merged_profile = dict(profile)
+        merged_profile["ref_spec_wait_ms"] = float(profiled.queue_ms)
+        merged_profile["ref_spec_ms"] = float(profiled.run_ms)
+        return refer_spec, merged_profile
+
     def prepare_request_ref_spec_phase(
         self,
         prepared_audio_phase: GPTSoVITSPreparedAudioPhase,
     ) -> GPTSoVITSPreparedRefSpecPhase:
         coordinator = self._ensure_prepare_coordinator()
-        ref_spec_results = self._run_awaitable_sync(
-            coordinator.prepare_ref_spec_stages_async([prepared_audio_phase.phase_one])
+        ref_spec_result = self._run_awaitable_sync(
+            self._prepare_ref_spec_phase_async(coordinator, prepared_audio_phase)
         )
-        if not ref_spec_results:
-            raise ValueError("GPT-SoVITS prepare_ref_spec_stages_async returned no results")
-        ref_spec_result = ref_spec_results[0]
-        if isinstance(ref_spec_result, Exception):
-            raise ref_spec_result
         return GPTSoVITSPreparedRefSpecPhase(
             request_id=prepared_audio_phase.request_id,
             prepared_audio_phase=prepared_audio_phase,
             ref_spec_result=ref_spec_result,
         )
+
+    def prepare_request_ref_spec_phases(
+        self,
+        prepared_audio_phases: list[GPTSoVITSPreparedAudioPhase],
+    ) -> list[GPTSoVITSPreparedRefSpecPhase]:
+        if not prepared_audio_phases:
+            return []
+        coordinator = self._ensure_prepare_coordinator()
+        async def _gather_ref_specs():
+            return await asyncio.gather(
+                *[
+                    self._prepare_ref_spec_phase_async(coordinator, prepared_audio_phase)
+                    for prepared_audio_phase in prepared_audio_phases
+                ],
+                return_exceptions=True,
+            )
+        ref_spec_results = self._run_awaitable_sync(_gather_ref_specs())
+        if len(ref_spec_results) != len(prepared_audio_phases):
+            raise ValueError("GPT-SoVITS batch prepare ref spec phase count mismatch")
+        prepared_ref_spec_phases: list[GPTSoVITSPreparedRefSpecPhase] = []
+        for prepared_audio_phase, ref_spec_result in zip(prepared_audio_phases, ref_spec_results):
+            if isinstance(ref_spec_result, Exception):
+                raise ref_spec_result
+            prepared_ref_spec_phases.append(
+                GPTSoVITSPreparedRefSpecPhase(
+                    request_id=prepared_audio_phase.request_id,
+                    prepared_audio_phase=prepared_audio_phase,
+                    ref_spec_result=ref_spec_result,
+                )
+            )
+        return prepared_ref_spec_phases
 
     @staticmethod
     def _profile_value(profiled: Any, key: str, default: float = 0.0) -> float:
@@ -1356,6 +3055,267 @@ class GPTSoVITSRuntime:
         ref_audio_bundle["profile"] = ref_audio_profile
         return ref_audio_bundle
 
+    def _build_request_state_native(
+        self,
+        *,
+        pipeline: Any,
+        spec: Any,
+        prompt_text: str,
+        text: str,
+        prompt_result: Any,
+        target_result: Any,
+        ref_audio_bundle: dict[str, Any],
+        prepare_start: float,
+        prepare_sync_start: float,
+        profile_overrides: dict[str, float] | None = None,
+    ) -> GPTSoVITST2SRequestState:
+        device = pipeline.configs.device
+        _sync_runtime_device(device)
+        ref_audio_bundle_ms = float(ref_audio_bundle.get("profile", {}).get("bundle_total_ms", 0.0))
+        bundle_profile = ref_audio_bundle.get("profile", {})
+        prompt_semantic = ref_audio_bundle["prompt_semantic"].long()
+        refer_spec_value = ref_audio_bundle.get("refer_spec")
+        if refer_spec_value in [None, ()]:
+            spec_audio, audio_16k = None, None
+        else:
+            spec_audio, audio_16k = refer_spec_value
+        aux_refer_specs: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+        for aux_ref_audio_path in list(getattr(spec, "aux_ref_audio_paths", []) or []):
+            if aux_ref_audio_path in [None, ""]:
+                continue
+            if not os.path.exists(str(aux_ref_audio_path)):
+                continue
+            aux_spec_audio, aux_audio_16k, _, _ = pipeline.extract_ref_spec(str(aux_ref_audio_path))
+            aux_refer_specs.append((aux_spec_audio, aux_audio_16k))
+        raw_audio = ref_audio_bundle["raw_audio"]
+        raw_sr = int(ref_audio_bundle["raw_sr"])
+        prompt_semantic_ms = float(bundle_profile.get("prompt_semantic_ms", ref_audio_bundle_ms))
+        ref_spec_ms = float(bundle_profile.get("ref_spec_ms", 0.0))
+        audio_load_ms = float(bundle_profile.get("audio_load_ms", 0.0))
+
+        _sync_runtime_device(device)
+        tensorize_start = time.perf_counter()
+        phones_tensor = torch.LongTensor(target_result.phones).to(pipeline.configs.device)
+        prompt_phones_tensor = torch.LongTensor(prompt_result.phones).to(pipeline.configs.device)
+        all_phones = torch.LongTensor(prompt_result.phones + target_result.phones).to(pipeline.configs.device)
+        prompt_bert_features = prompt_result.bert_features.to(dtype=pipeline.precision, device=pipeline.configs.device)
+        target_bert_features = target_result.bert_features.to(dtype=pipeline.precision, device=pipeline.configs.device)
+        all_bert_features = torch.cat([prompt_bert_features, target_bert_features], dim=1)
+        _sync_runtime_device(device)
+        tensorize_ms = (time.perf_counter() - tensorize_start) * 1000.0
+
+        prepare_profile = {
+            "prompt_text_features_ms": float(prompt_result.total_ms),
+            "text_features_ms": float(target_result.total_ms),
+            "prompt_text_cpu_preprocess_ms": float(prompt_result.cpu_preprocess_ms),
+            "text_cpu_preprocess_ms": float(target_result.cpu_preprocess_ms),
+            "prompt_text_bert_wait_ms": float(prompt_result.profile.get("bert_wait_ms", 0.0)),
+            "prompt_text_bert_admission_wait_ms": float(prompt_result.profile.get("bert_admission_wait_ms", 0.0)),
+            "prompt_text_bert_queue_wait_ms": float(prompt_result.profile.get("bert_queue_wait_ms", 0.0)),
+            "prompt_text_bert_worker_queue_wait_ms": float(prompt_result.profile.get("bert_worker_queue_wait_ms", 0.0)),
+            "prompt_text_bert_submit_offset_first_ms": float(prompt_result.profile.get("bert_submit_offset_first_ms", 0.0)),
+            "prompt_text_bert_submit_offset_last_ms": float(prompt_result.profile.get("bert_submit_offset_last_ms", 0.0)),
+            "prompt_text_bert_batch_collect_wait_ms": float(prompt_result.profile.get("bert_batch_collect_wait_ms", 0.0)),
+            "prompt_text_bert_batch_dispatch_delay_ms": float(
+                prompt_result.profile.get("bert_batch_dispatch_delay_ms", 0.0)
+            ),
+            "prompt_text_bert_forward_ms": float(prompt_result.profile.get("bert_forward_ms", 0.0)),
+            "prompt_text_bert_tokenize_ms": float(prompt_result.profile.get("bert_tokenize_ms", 0.0)),
+            "prompt_text_bert_scatter_ms": float(prompt_result.profile.get("bert_scatter_ms", 0.0)),
+            "prompt_text_bert_calls": float(prompt_result.profile.get("bert_calls", 0.0)),
+            "prompt_text_bert_stage_slots": float(prompt_result.profile.get("bert_stage_slots", 0.0)),
+            "prompt_text_bert_stage_inflight_peak": float(prompt_result.profile.get("bert_stage_inflight_peak", 0.0)),
+            "prompt_text_bert_batch_size_peak": float(prompt_result.profile.get("bert_batch_size_peak", 0.0)),
+            "prompt_text_bert_batch_tokens_peak": float(prompt_result.profile.get("bert_batch_tokens_peak", 0.0)),
+            "prompt_text_bert_pending_depth_on_enqueue_peak": float(
+                prompt_result.profile.get("bert_pending_depth_on_enqueue_peak", 0.0)
+            ),
+            "prompt_text_bert_pending_depth_on_collect_peak": float(
+                prompt_result.profile.get("bert_pending_depth_on_collect_peak", 0.0)
+            ),
+            "prompt_text_bert_high_pressure_mode_peak": float(
+                prompt_result.profile.get("bert_high_pressure_mode_peak", 0.0)
+            ),
+            "prompt_text_bert_batch_window_ms": float(prompt_result.profile.get("bert_batch_window_ms", 0.0)),
+            "prompt_text_g2pw_total_ms": float(prompt_result.profile.get("g2pw_total_ms", 0.0)),
+            "prompt_text_g2pw_prepare_ms": float(prompt_result.profile.get("g2pw_prepare_ms", 0.0)),
+            "prompt_text_g2pw_predict_ms": float(prompt_result.profile.get("g2pw_predict_ms", 0.0)),
+            "prompt_text_g2pw_post_ms": float(prompt_result.profile.get("g2pw_post_ms", 0.0)),
+            "prompt_text_g2pw_runtime_total_ms": float(prompt_result.profile.get("g2pw_runtime_total_ms", 0.0)),
+            "prompt_text_g2pw_runtime_queue_wait_ms": float(
+                prompt_result.profile.get("g2pw_runtime_queue_wait_ms", 0.0)
+            ),
+            "prompt_text_g2pw_runtime_collect_wait_ms": float(
+                prompt_result.profile.get("g2pw_runtime_collect_wait_ms", 0.0)
+            ),
+            "prompt_text_g2pw_runtime_run_ms": float(prompt_result.profile.get("g2pw_runtime_run_ms", 0.0)),
+            "prompt_text_g2pw_runtime_batch_rows_peak": float(
+                prompt_result.profile.get("g2pw_runtime_batch_rows_peak", 0.0)
+            ),
+            "prompt_text_g2pw_runtime_batch_requests_peak": float(
+                prompt_result.profile.get("g2pw_runtime_batch_requests_peak", 0.0)
+            ),
+            "prompt_text_parallel_future_wait_ms": 0.0,
+            "prompt_text_parallel_future_executor_queue_ms": 0.0,
+            "prompt_text_parallel_future_run_ms": float(prompt_result.total_ms),
+            "prompt_text_parallel_future_finish_after_submit_ms": float(prompt_result.total_ms),
+            "prompt_text_parallel_future_queue_tail_after_target_ms": 0.0,
+            "prompt_text_parallel_future_run_tail_after_target_ms": 0.0,
+            "text_bert_wait_ms": float(target_result.profile.get("bert_wait_ms", 0.0)),
+            "text_bert_admission_wait_ms": float(target_result.profile.get("bert_admission_wait_ms", 0.0)),
+            "text_bert_queue_wait_ms": float(target_result.profile.get("bert_queue_wait_ms", 0.0)),
+            "text_bert_worker_queue_wait_ms": float(target_result.profile.get("bert_worker_queue_wait_ms", 0.0)),
+            "text_bert_submit_offset_first_ms": float(target_result.profile.get("bert_submit_offset_first_ms", 0.0)),
+            "text_bert_submit_offset_last_ms": float(target_result.profile.get("bert_submit_offset_last_ms", 0.0)),
+            "text_bert_batch_collect_wait_ms": float(target_result.profile.get("bert_batch_collect_wait_ms", 0.0)),
+            "text_bert_batch_dispatch_delay_ms": float(target_result.profile.get("bert_batch_dispatch_delay_ms", 0.0)),
+            "text_bert_forward_ms": float(target_result.profile.get("bert_forward_ms", 0.0)),
+            "text_bert_tokenize_ms": float(target_result.profile.get("bert_tokenize_ms", 0.0)),
+            "text_bert_scatter_ms": float(target_result.profile.get("bert_scatter_ms", 0.0)),
+            "text_bert_calls": float(target_result.profile.get("bert_calls", 0.0)),
+            "text_bert_stage_slots": float(target_result.profile.get("bert_stage_slots", 0.0)),
+            "text_bert_stage_inflight_peak": float(target_result.profile.get("bert_stage_inflight_peak", 0.0)),
+            "text_bert_batch_size_peak": float(target_result.profile.get("bert_batch_size_peak", 0.0)),
+            "text_bert_batch_tokens_peak": float(target_result.profile.get("bert_batch_tokens_peak", 0.0)),
+            "text_bert_pending_depth_on_enqueue_peak": float(
+                target_result.profile.get("bert_pending_depth_on_enqueue_peak", 0.0)
+            ),
+            "text_bert_pending_depth_on_collect_peak": float(
+                target_result.profile.get("bert_pending_depth_on_collect_peak", 0.0)
+            ),
+            "text_bert_high_pressure_mode_peak": float(target_result.profile.get("bert_high_pressure_mode_peak", 0.0)),
+            "text_bert_batch_window_ms": float(target_result.profile.get("bert_batch_window_ms", 0.0)),
+            "text_g2pw_total_ms": float(target_result.profile.get("g2pw_total_ms", 0.0)),
+            "text_g2pw_prepare_ms": float(target_result.profile.get("g2pw_prepare_ms", 0.0)),
+            "text_g2pw_predict_ms": float(target_result.profile.get("g2pw_predict_ms", 0.0)),
+            "text_g2pw_post_ms": float(target_result.profile.get("g2pw_post_ms", 0.0)),
+            "text_g2pw_runtime_total_ms": float(target_result.profile.get("g2pw_runtime_total_ms", 0.0)),
+            "text_g2pw_runtime_queue_wait_ms": float(target_result.profile.get("g2pw_runtime_queue_wait_ms", 0.0)),
+            "text_g2pw_runtime_collect_wait_ms": float(target_result.profile.get("g2pw_runtime_collect_wait_ms", 0.0)),
+            "text_g2pw_runtime_run_ms": float(target_result.profile.get("g2pw_runtime_run_ms", 0.0)),
+            "text_g2pw_runtime_batch_rows_peak": float(target_result.profile.get("g2pw_runtime_batch_rows_peak", 0.0)),
+            "text_g2pw_runtime_batch_requests_peak": float(
+                target_result.profile.get("g2pw_runtime_batch_requests_peak", 0.0)
+            ),
+            "text_feature_pair_ms": float(max(prompt_result.total_ms, target_result.total_ms)),
+            "text_cpu_parallel_workers": float(getattr(pipeline, "prepare_text_cpu_workers", 0)),
+            "audio_load_ms": audio_load_ms,
+            "audio_stage_wait_ms": float(bundle_profile.get("audio_stage_wait_ms", 0.0)),
+            "audio_stage_slots": float(bundle_profile.get("audio_stage_slots", 0.0)),
+            "audio_stage_inflight_peak": float(bundle_profile.get("audio_stage_inflight_peak", 0.0)),
+            "prompt_semantic_ms": prompt_semantic_ms,
+            "prompt_semantic_wait_ms": float(bundle_profile.get("prompt_semantic_wait_ms", 0.0)),
+            "prompt_semantic_submit_offset_ms": float(bundle_profile.get("prompt_semantic_submit_offset_ms", 0.0)),
+            "prompt_semantic_submit_after_load_ms": float(
+                bundle_profile.get("prompt_semantic_submit_after_load_ms", 0.0)
+            ),
+            "prompt_semantic_cpu_prepare_wait_ms": float(
+                bundle_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0)
+            ),
+            "prompt_semantic_cpu_prepare_slots": float(
+                bundle_profile.get("prompt_semantic_cpu_prepare_slots", 0.0)
+            ),
+            "prompt_semantic_cpu_prepare_inflight_peak": float(
+                bundle_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0)
+            ),
+            "prompt_semantic_worker_queue_wait_ms": float(
+                bundle_profile.get("prompt_semantic_worker_queue_wait_ms", 0.0)
+            ),
+            "prompt_semantic_batch_collect_wait_ms": float(
+                bundle_profile.get("prompt_semantic_batch_collect_wait_ms", 0.0)
+            ),
+            "prompt_semantic_stage_limiter_wait_ms": float(
+                bundle_profile.get("prompt_semantic_stage_limiter_wait_ms", 0.0)
+            ),
+            "prompt_semantic_batch_dispatch_delay_ms": float(
+                bundle_profile.get("prompt_semantic_batch_dispatch_delay_ms", 0.0)
+            ),
+            "prompt_semantic_cpu_prepare_ms": float(bundle_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)),
+            "prompt_semantic_pack_ms": float(bundle_profile.get("prompt_semantic_pack_ms", 0.0)),
+            "prompt_semantic_h2d_ms": float(bundle_profile.get("prompt_semantic_h2d_ms", 0.0)),
+            "prompt_semantic_ssl_forward_ms": float(bundle_profile.get("prompt_semantic_ssl_forward_ms", 0.0)),
+            "prompt_semantic_hidden_length_ms": float(
+                bundle_profile.get("prompt_semantic_hidden_length_ms", 0.0)
+            ),
+            "prompt_semantic_extract_latent_ms": float(
+                bundle_profile.get("prompt_semantic_extract_latent_ms", 0.0)
+            ),
+            "prompt_semantic_forward_ms": float(bundle_profile.get("prompt_semantic_forward_ms", 0.0)),
+            "prompt_semantic_scatter_ms": float(bundle_profile.get("prompt_semantic_scatter_ms", 0.0)),
+            "prompt_semantic_stage_slots": float(bundle_profile.get("prompt_semantic_stage_slots", 0.0)),
+            "prompt_semantic_stage_inflight_peak": float(
+                bundle_profile.get("prompt_semantic_stage_inflight_peak", 0.0)
+            ),
+            "prompt_semantic_batch_size": float(bundle_profile.get("prompt_semantic_batch_size", 0.0)),
+            "prompt_semantic_batch_samples": float(bundle_profile.get("prompt_semantic_batch_samples", 0.0)),
+            "prompt_semantic_padded_batch_samples": float(
+                bundle_profile.get("prompt_semantic_padded_batch_samples", 0.0)
+            ),
+            "prompt_semantic_batch_pad_ratio": float(bundle_profile.get("prompt_semantic_batch_pad_ratio", 0.0)),
+            "prompt_semantic_pool_bucket_index": float(
+                bundle_profile.get("prompt_semantic_pool_bucket_index", 0.0)
+            ),
+            "prompt_semantic_pool_workers": float(bundle_profile.get("prompt_semantic_pool_workers", 0.0)),
+            "prompt_semantic_bucket_first_hit_serialized": float(
+                bundle_profile.get("prompt_semantic_bucket_first_hit_serialized", 0.0)
+            ),
+            "prompt_semantic_runtime_exact_prewarm_applied": float(
+                bundle_profile.get("prompt_semantic_runtime_exact_prewarm_applied", 0.0)
+            ),
+            "prompt_semantic_runtime_exact_prewarm_ms": float(
+                bundle_profile.get("prompt_semantic_runtime_exact_prewarm_ms", 0.0)
+            ),
+            "prompt_semantic_runtime_exact_prewarm_target_samples": float(
+                bundle_profile.get("prompt_semantic_runtime_exact_prewarm_target_samples", 0.0)
+            ),
+            "prompt_semantic_runtime_exact_prewarm_batch_sizes": float(
+                bundle_profile.get("prompt_semantic_runtime_exact_prewarm_batch_sizes", 0.0)
+            ),
+            "prompt_semantic_runtime_exact_prewarm_skipped_capacity": float(
+                bundle_profile.get("prompt_semantic_runtime_exact_prewarm_skipped_capacity", 0.0)
+            ),
+            "prompt_semantic_shard_index": float(bundle_profile.get("prompt_semantic_shard_index", 0.0)),
+            "ref_spec_wait_ms": float(bundle_profile.get("ref_spec_wait_ms", 0.0)),
+            "ref_spec_ms": ref_spec_ms,
+            "ref_spec_to_device_ms": float(bundle_profile.get("ref_spec_to_device_ms", 0.0)),
+            "ref_spec_main_resample_ms": float(bundle_profile.get("ref_spec_main_resample_ms", 0.0)),
+            "ref_spec_norm_ms": float(bundle_profile.get("ref_spec_norm_ms", 0.0)),
+            "ref_spec_spectrogram_ms": float(bundle_profile.get("ref_spec_spectrogram_ms", 0.0)),
+            "ref_spec_post_resample_ms": float(bundle_profile.get("ref_spec_post_resample_ms", 0.0)),
+            "ref_audio_bundle_ms": ref_audio_bundle_ms,
+            "tensorize_ms": tensorize_ms,
+            "total_ms": (time.perf_counter() - prepare_sync_start) * 1000.0,
+            "wall_total_ms": (time.perf_counter() - prepare_start) * 1000.0,
+        }
+        if profile_overrides:
+            prepare_profile.update({key: float(value) for key, value in profile_overrides.items()})
+        return GPTSoVITST2SRequestState(
+            request_id=str(spec.request_id),
+            ref_audio_path=spec.ref_audio_path,
+            prompt_text=str(prompt_text),
+            prompt_lang=str(spec.prompt_lang),
+            text=str(text),
+            text_lang=str(spec.text_lang),
+            norm_prompt_text=str(prompt_result.norm_text),
+            norm_text=str(target_result.norm_text),
+            phones=phones_tensor,
+            prompt_phones=prompt_phones_tensor,
+            all_phones=all_phones,
+            all_bert_features=all_bert_features,
+            prompt_semantic=prompt_semantic,
+            refer_spec=(None if spec_audio is None else (spec_audio, audio_16k)),
+            aux_refer_specs=aux_refer_specs,
+            raw_audio=raw_audio,
+            raw_sr=raw_sr,
+            top_k=int(spec.top_k),
+            top_p=float(spec.top_p),
+            temperature=float(spec.temperature),
+            repetition_penalty=float(spec.repetition_penalty),
+            early_stop_num=int(spec.early_stop_num),
+            ready_step=int(spec.ready_step),
+            prepare_profile=prepare_profile,
+        )
+
     def _build_request_state_from_prepare_phases(
         self,
         prepared_cpu_stage: GPTSoVITSPreparedCpuStage,
@@ -1376,21 +3336,18 @@ class GPTSoVITSRuntime:
             phase_one,
             ref_spec_result=ref_spec_result,
         )
-        with self._project_root_cwd():
-            from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import build_request_state_from_parts
-
-            state = build_request_state_from_parts(
-                tts=pipeline,
-                spec=prepared_cpu_stage.cpu_stage.spec,
-                prompt_text=prepared_cpu_stage.cpu_stage.prompt_text,
-                text=prepared_cpu_stage.cpu_stage.text,
-                prompt_result=phase_two["prompt_feature_profiled"].result,
-                target_result=phase_two["target_feature_profiled"].result,
-                ref_audio_bundle=ref_audio_bundle,
-                prepare_start=prepared_cpu_stage.cpu_stage.prepare_start,
-                prepare_sync_start=prepared_cpu_stage.cpu_stage.prepare_start,
-                profile_overrides=profile_overrides,
-            )
+        state = self._build_request_state_native(
+            pipeline=pipeline,
+            spec=prepared_cpu_stage.cpu_stage.spec,
+            prompt_text=prepared_cpu_stage.cpu_stage.prompt_text,
+            text=prepared_cpu_stage.cpu_stage.text,
+            prompt_result=phase_two["prompt_feature_profiled"].result,
+            target_result=phase_two["target_feature_profiled"].result,
+            ref_audio_bundle=ref_audio_bundle,
+            prepare_start=prepared_cpu_stage.cpu_stage.prepare_start,
+            prepare_sync_start=prepared_cpu_stage.cpu_stage.prepare_start,
+            profile_overrides=profile_overrides,
+        )
         prepare_exec_finished_at = time.perf_counter()
         state.prepare_profile["executor_run_wall_ms"] = max(
             0.0,
@@ -1407,6 +3364,8 @@ class GPTSoVITSRuntime:
         self,
         prepared_text_phase: GPTSoVITSPreparedTextPhase,
         prepared_ref_spec_phase: GPTSoVITSPreparedRefSpecPhase | None = None,
+        *,
+        extra_profile: dict[str, float] | None = None,
     ) -> GPTSoVITSPreparedRequest:
         coordinator = self._ensure_prepare_coordinator()
         prepared_cpu_stage = prepared_text_phase.prepared_audio_phase.prepared_cpu_stage
@@ -1418,7 +3377,7 @@ class GPTSoVITSRuntime:
                 ref_spec_result=(
                     prepared_ref_spec_phase.ref_spec_result if prepared_ref_spec_phase is not None else None
                 ),
-                extra_profile=None,
+                extra_profile=extra_profile,
             )
         finally:
             self._release_prepare_split_stage_slot(coordinator)
@@ -1436,9 +3395,35 @@ class GPTSoVITSRuntime:
         return self.build_prepared_request_from_phases(prepared_text_phase, prepared_ref_spec_phase=prepared_ref_spec_phase)
 
     def prepare_requests(self, requests: list[dict[str, Any]]) -> list[GPTSoVITSPreparedRequest]:
+        if not requests:
+            return []
+        prepared_cpu_stages = self.prepare_request_cpu_stages(requests)
+        audio_phase_start = time.perf_counter()
+        prepared_audio_phases = self.prepare_request_gpu_audio_phases(prepared_cpu_stages)
+        audio_phase_wall_ms = max(0.0, (time.perf_counter() - audio_phase_start) * 1000.0)
+        prepared_ref_spec_phases = self.prepare_request_ref_spec_phases(prepared_audio_phases)
+        text_phase_start = time.perf_counter()
+        prepared_text_phases = self.prepare_request_gpu_text_phases(prepared_audio_phases)
+        text_phase_wall_ms = max(0.0, (time.perf_counter() - text_phase_start) * 1000.0)
+        if len(prepared_text_phases) != len(prepared_ref_spec_phases):
+            raise ValueError("GPT-SoVITS batch prepare text/ref-spec phase count mismatch")
+
         prepared: list[GPTSoVITSPreparedRequest] = []
-        for index, request in enumerate(requests):
-            prepared.append(self.prepare_request(request, request_id=str(request.get("engine_request_id") or f"gpt_sovits_{index}")))
+        extra_profile = {
+            "engine_prepare_audio_phase_mode": 1.0,
+            "engine_prepare_audio_phase_wall_ms": float(audio_phase_wall_ms),
+            "engine_prepare_audio_phase_batch_size": float(len(prepared_audio_phases)),
+            "engine_prepare_text_phase_wall_ms": float(text_phase_wall_ms),
+            "engine_prepare_text_phase_batch_size": float(len(prepared_text_phases)),
+        }
+        for prepared_text_phase, prepared_ref_spec_phase in zip(prepared_text_phases, prepared_ref_spec_phases):
+            prepared.append(
+                self.build_prepared_request_from_phases(
+                    prepared_text_phase,
+                    prepared_ref_spec_phase=prepared_ref_spec_phase,
+                    extra_profile=extra_profile,
+                )
+            )
         return prepared
 
     def _build_ar_session_from_prepared(self, prepared: GPTSoVITSPreparedRequest) -> GPTSoVITSARSession:
@@ -1660,6 +3645,643 @@ class GPTSoVITSRuntime:
             super_sampling=bool(transport_info.get("gpt_sovits_super_sampling", False)),
         )
 
+    def prepare_decode_requests(
+        self,
+        semantic_tokens_list: list[torch.Tensor],
+        transport_infos: list[dict[str, Any]],
+    ) -> list[GPTSoVITSDecodePreparedRequest]:
+        if len(semantic_tokens_list) != len(transport_infos):
+            raise ValueError("GPT-SoVITS decode prepare batch input count mismatch")
+        return [
+            self.prepare_decode_request(semantic_tokens, transport_info)
+            for semantic_tokens, transport_info in zip(semantic_tokens_list, transport_infos)
+        ]
+
+    @staticmethod
+    def _build_refer_spec_from_prepared(
+        prepared: GPTSoVITSDecodePreparedRequest,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return (
+            prepared.refer_audio_spec,
+            None if prepared.refer_audio_16k.numel() == 0 else prepared.refer_audio_16k,
+        )
+
+    def _resample_audio(self, audio: torch.Tensor, sr0: int, sr1: int, device: torch.device) -> torch.Tensor:
+        if int(sr0) == int(sr1):
+            return audio
+        cache = getattr(self, "_resample_transform_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_resample_transform_cache", cache)
+        key = f"{int(sr0)}-{int(sr1)}-{device}"
+        transform = cache.get(key)
+        if transform is None:
+            import torchaudio
+
+            transform = torchaudio.transforms.Resample(int(sr0), int(sr1)).to(device)
+            cache[key] = transform
+        return transform(audio)
+
+    @staticmethod
+    def _norm_vocoder_spec(x: torch.Tensor) -> torch.Tensor:
+        spec_min = -12.0
+        spec_max = 2.0
+        return (x - spec_min) / (spec_max - spec_min) * 2 - 1
+
+    @staticmethod
+    def _denorm_vocoder_spec(x: torch.Tensor) -> torch.Tensor:
+        spec_min = -12.0
+        spec_max = 2.0
+        return (x + 1) / 2 * (spec_max - spec_min) + spec_min
+
+    def _compute_vocoder_mel(self, audio: torch.Tensor, *, version: str) -> torch.Tensor:
+        with self._project_root_cwd():
+            from GPT_SoVITS.module.mel_processing import mel_spectrogram_torch
+
+        if version == "v3":
+            kwargs = {
+                "n_fft": 1024,
+                "win_size": 1024,
+                "hop_size": 256,
+                "num_mels": 100,
+                "sampling_rate": 24000,
+                "fmin": 0,
+                "fmax": None,
+                "center": False,
+            }
+        else:
+            kwargs = {
+                "n_fft": 1280,
+                "win_size": 1280,
+                "hop_size": 320,
+                "num_mels": 100,
+                "sampling_rate": 32000,
+                "fmin": 0,
+                "fmax": None,
+                "center": False,
+            }
+        return mel_spectrogram_torch(audio, **kwargs)
+
+    def _decode_prepared_request_vocoder_fragment(
+        self,
+        pipeline: Any,
+        prepared: GPTSoVITSDecodePreparedRequest,
+        refer_audio_spec: torch.Tensor,
+    ) -> tuple[Any, int]:
+        prompt_context = self._build_vocoder_prompt_context(
+            pipeline,
+            prepared,
+            refer_audio_spec,
+        )
+        return self._decode_vocoder_with_prompt_context(pipeline, prepared, prompt_context)
+
+    @staticmethod
+    def _tensor_identity_key(value: torch.Tensor | None) -> tuple[Any, ...] | None:
+        if value is None:
+            return None
+        return (
+            str(value.device),
+            str(value.dtype),
+            tuple(int(item) for item in value.shape),
+            int(value.data_ptr()),
+        )
+
+    def _build_vocoder_prompt_cache_key(
+        self,
+        prepared: GPTSoVITSDecodePreparedRequest,
+        refer_audio_spec: torch.Tensor,
+    ) -> tuple[Any, ...]:
+        return (
+            self._tensor_identity_key(prepared.prompt_semantic),
+            self._tensor_identity_key(prepared.prompt_phones),
+            self._tensor_identity_key(refer_audio_spec),
+            self._tensor_identity_key(prepared.raw_audio),
+            int(prepared.raw_sr),
+        )
+
+    def _build_vocoder_prompt_context(
+        self,
+        pipeline: Any,
+        prepared: GPTSoVITSDecodePreparedRequest,
+        refer_audio_spec: torch.Tensor,
+    ) -> dict[str, Any]:
+        device = torch.device(pipeline.configs.device)
+        prompt_semantic_tokens = prepared.prompt_semantic.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long)
+        prompt_phones = prepared.prompt_phones.unsqueeze(0).to(device=device, dtype=torch.long)
+        refer_audio_spec = refer_audio_spec.to(dtype=pipeline.precision, device=device)
+
+        fea_ref, ge = pipeline.vits_model.decode_encp(prompt_semantic_tokens, prompt_phones, refer_audio_spec)
+        ref_audio = prepared.raw_audio.to(device=device, dtype=torch.float32)
+        if ref_audio.ndim == 1:
+            ref_audio = ref_audio.unsqueeze(0)
+        if ref_audio.shape[0] == 2:
+            ref_audio = ref_audio.mean(0).unsqueeze(0)
+
+        target_sr = 24000 if pipeline.configs.version == "v3" else 32000
+        if int(prepared.raw_sr) != target_sr:
+            ref_audio = self._resample_audio(ref_audio, int(prepared.raw_sr), target_sr, device)
+
+        mel2 = self._compute_vocoder_mel(ref_audio, version=str(pipeline.configs.version))
+        mel2 = self._norm_vocoder_spec(mel2)
+        t_min = min(int(mel2.shape[2]), int(fea_ref.shape[2]))
+        mel2 = mel2[:, :, :t_min]
+        fea_ref = fea_ref[:, :, :t_min]
+        t_ref = int(pipeline.vocoder_configs["T_ref"])
+        t_chunk = int(pipeline.vocoder_configs["T_chunk"])
+        if t_min > t_ref:
+            mel2 = mel2[:, :, -t_ref:]
+            fea_ref = fea_ref[:, :, -t_ref:]
+            t_min = t_ref
+        chunk_len = t_chunk - t_min
+
+        return {
+            "refer_audio_spec": refer_audio_spec,
+            "fea_ref": fea_ref,
+            "ge": ge,
+            "mel2": mel2.to(dtype=pipeline.precision),
+            "t_min": int(t_min),
+            "chunk_len": int(chunk_len),
+            "output_sr": int(pipeline.vocoder_configs["sr"]),
+        }
+
+    def _decode_vocoder_with_prompt_context(
+        self,
+        pipeline: Any,
+        prepared: GPTSoVITSDecodePreparedRequest,
+        prompt_context: dict[str, Any],
+    ) -> tuple[Any, int]:
+        device = torch.device(pipeline.configs.device)
+        refer_audio_spec = prompt_context["refer_audio_spec"]
+        ge = prompt_context["ge"]
+        fea_ref_base = prompt_context["fea_ref"]
+        mel2_base = prompt_context["mel2"]
+        t_min = int(prompt_context["t_min"])
+        chunk_len = int(prompt_context["chunk_len"])
+        semantic_tokens = prepared.semantic_tokens.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long)
+        phones = prepared.phones.unsqueeze(0).to(device=device, dtype=torch.long)
+        fea_todo, ge = pipeline.vits_model.decode_encp(
+            semantic_tokens,
+            phones,
+            refer_audio_spec,
+            ge,
+            float(prepared.speed_factor),
+        )
+
+        mel2 = mel2_base.clone()
+        fea_ref = fea_ref_base.clone()
+        cfm_results: list[torch.Tensor] = []
+        idx = 0
+        while True:
+            fea_todo_chunk = fea_todo[:, :, idx : idx + chunk_len]
+            if int(fea_todo_chunk.shape[-1]) == 0:
+                break
+            idx += chunk_len
+            fea = torch.cat([fea_ref, fea_todo_chunk], dim=2).transpose(2, 1)
+            cfm_res = pipeline.vits_model.cfm.inference(
+                fea,
+                torch.LongTensor([int(fea.size(1))]).to(fea.device),
+                mel2,
+                int(prepared.sample_steps),
+                inference_cfg_rate=0,
+            )
+            cfm_res = cfm_res[:, :, mel2.shape[2] :]
+            mel2 = cfm_res[:, :, -t_min:]
+            fea_ref = fea_todo_chunk[:, :, -t_min:]
+            cfm_results.append(cfm_res)
+
+        cfm_res = torch.cat(cfm_results, dim=2)
+        cfm_res = self._denorm_vocoder_spec(cfm_res)
+        wav_gen = pipeline.vocoder(cfm_res)
+        return wav_gen[0][0], int(prompt_context["output_sr"])
+
+    @staticmethod
+    def _sola_merge_audio_fragments(
+        audio_fragments: Sequence[torch.Tensor],
+        overlap_len: int,
+        *,
+        search_len: int = 320,
+    ) -> torch.Tensor:
+        if not audio_fragments:
+            return torch.zeros((0,), dtype=torch.float32)
+        dtype = audio_fragments[0].dtype
+        if len(audio_fragments) == 1 or overlap_len <= 0:
+            return torch.cat(list(audio_fragments), dim=0).to(dtype)
+
+        merged_fragments = [fragment for fragment in audio_fragments]
+        for index in range(len(merged_fragments) - 1):
+            first = merged_fragments[index].float()
+            second = merged_fragments[index + 1].float()
+            overlap = min(int(overlap_len), int(first.shape[-1]), int(second.shape[-1]))
+            if overlap <= 0:
+                continue
+            available_search = max(int(second.shape[-1]) - overlap, 0)
+            current_search = min(int(search_len), available_search)
+            window_first = first[-overlap:]
+            window_second = second[: overlap + current_search]
+            if int(window_second.shape[-1]) < overlap:
+                continue
+
+            corr_norm = F.conv1d(window_second.view(1, 1, -1), window_first.view(1, 1, -1)).view(-1)
+            corr_den = (
+                F.conv1d(window_second.view(1, 1, -1) ** 2, torch.ones_like(window_first).view(1, 1, -1)).view(-1)
+                + 1e-8
+            )
+            offset = int((corr_norm / corr_den.sqrt()).argmax().item())
+
+            merged_fragments[index] = first[:-overlap]
+            aligned_second = second[offset:]
+            if int(aligned_second.shape[-1]) < overlap:
+                overlap = int(aligned_second.shape[-1])
+                if overlap <= 0:
+                    merged_fragments[index + 1] = aligned_second
+                    continue
+                window_first = first[-overlap:]
+            window = torch.hann_window(overlap * 2, device=first.device, dtype=first.dtype)
+            aligned_second[:overlap] = (
+                window[:overlap] * aligned_second[:overlap]
+                + window[overlap:] * window_first
+            )
+            merged_fragments[index + 1] = aligned_second
+        return torch.cat(merged_fragments, dim=0).to(dtype)
+
+    def _decode_prepared_requests_batched_vocoder(
+        self,
+        pipeline: Any,
+        prepared_requests: list[GPTSoVITSDecodePreparedRequest],
+        prompt_context: dict[str, Any],
+    ) -> list[GPTSoVITSDecodedAudio]:
+        if not prepared_requests:
+            return []
+
+        first_speed = float(prepared_requests[0].speed_factor)
+        first_sample_steps = int(prepared_requests[0].sample_steps)
+        if any(abs(float(item.speed_factor) - first_speed) > 1e-6 for item in prepared_requests):
+            raise ValueError("GPT-SoVITS batched vocoder decode requires identical speed_factor")
+        if any(int(item.sample_steps) != first_sample_steps for item in prepared_requests):
+            raise ValueError("GPT-SoVITS batched vocoder decode requires identical sample_steps")
+
+        chunk_len = int(prompt_context["chunk_len"])
+        overlapped_len = int(pipeline.vocoder_configs.get("overlapped_len", 0))
+        upsample_rate = int(pipeline.vocoder_configs.get("upsample_rate", 1))
+        if chunk_len <= 0 or overlapped_len < 0 or upsample_rate <= 0:
+            return [
+                GPTSoVITSDecodedAudio(
+                    request_id=prepared.request_id,
+                    audio_fragment=audio_fragment,
+                    output_sr=int(output_sr),
+                    speed_factor=float(prepared.speed_factor),
+                    super_sampling=bool(prepared.super_sampling),
+                )
+                for prepared, (audio_fragment, output_sr) in (
+                    (
+                        prepared,
+                        self._decode_vocoder_with_prompt_context(
+                            pipeline,
+                            prepared,
+                            prompt_context,
+                        ),
+                    )
+                    for prepared in prepared_requests
+                )
+            ]
+
+        device = torch.device(pipeline.configs.device)
+        refer_audio_spec = prompt_context["refer_audio_spec"]
+        ge = prompt_context["ge"]
+        fea_ref = prompt_context["fea_ref"]
+        mel2 = prompt_context["mel2"]
+
+        feat_chunks: list[torch.Tensor] = []
+        feat_lens: list[int] = []
+        feats: list[torch.Tensor] = []
+        for prepared in prepared_requests:
+            semantic_tokens = prepared.semantic_tokens.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long)
+            phones = prepared.phones.unsqueeze(0).to(device=device, dtype=torch.long)
+            feat, _ = pipeline.vits_model.decode_encp(
+                semantic_tokens,
+                phones,
+                refer_audio_spec,
+                ge,
+                first_speed,
+            )
+            feats.append(feat)
+            feat_lens.append(int(feat.shape[2]))
+
+        merged_feats = torch.cat(feats, dim=2)
+        padded_feats = F.pad(merged_feats, (overlapped_len, 0), "constant", 0)
+        position = 0
+        padding_len = 0
+        while True:
+            if position != 0:
+                position -= overlapped_len
+            chunk = padded_feats[:, :, position : position + chunk_len]
+            position += chunk_len
+            if int(chunk.shape[-1]) == 0:
+                break
+            padding_len = chunk_len - int(chunk.shape[2])
+            if padding_len > 0:
+                chunk = F.pad(chunk, (0, padding_len), "constant", 0)
+            feat_chunks.append(chunk)
+
+        if not feat_chunks:
+            output_sr = int(prompt_context["output_sr"])
+            return [
+                GPTSoVITSDecodedAudio(
+                    request_id=prepared.request_id,
+                    audio_fragment=torch.zeros((0,), dtype=torch.float32, device=device),
+                    output_sr=output_sr,
+                    speed_factor=float(prepared.speed_factor),
+                    super_sampling=bool(prepared.super_sampling),
+                )
+                for prepared in prepared_requests
+            ]
+
+        batched_feat_chunks = torch.cat(feat_chunks, dim=0)
+        batch_size = int(batched_feat_chunks.shape[0])
+        expanded_ref = fea_ref.repeat(batch_size, 1, 1)
+        expanded_mel2 = mel2.repeat(batch_size, 1, 1)
+        cfm_input = torch.cat([expanded_ref, batched_feat_chunks], dim=2).transpose(2, 1)
+        cfm_lengths = torch.full((batch_size,), int(cfm_input.size(1)), dtype=torch.long, device=cfm_input.device)
+        pred_spec = pipeline.vits_model.cfm.inference(
+            cfm_input,
+            cfm_lengths,
+            expanded_mel2,
+            first_sample_steps,
+            inference_cfg_rate=0,
+        )
+        pred_spec = pred_spec[:, :, -chunk_len:]
+        channel_dim = int(pred_spec.shape[1])
+        pred_spec = pred_spec.permute(1, 0, 2).contiguous().view(channel_dim, -1).unsqueeze(0)
+        pred_spec = self._denorm_vocoder_spec(pred_spec)
+
+        wav_gen = pipeline.vocoder(pred_spec)
+        audio = wav_gen[0][0]
+        audio_chunks: list[torch.Tensor] = []
+        audio_position = 0
+        audio_chunk_len = chunk_len * upsample_rate
+        while audio_position < int(audio.shape[-1]):
+            audio_chunks.append(audio[audio_position : audio_position + audio_chunk_len])
+            audio_position += audio_chunk_len
+        merged_audio = self._sola_merge_audio_fragments(audio_chunks, overlapped_len * upsample_rate)
+        trim_prefix = overlapped_len * upsample_rate
+        if trim_prefix > 0:
+            merged_audio = merged_audio[trim_prefix:]
+        trim_suffix = padding_len * upsample_rate
+        if trim_suffix > 0:
+            merged_audio = merged_audio[:-trim_suffix] if trim_suffix < int(merged_audio.shape[-1]) else merged_audio[:0]
+
+        output_sr = int(prompt_context["output_sr"])
+        decoded_items: list[GPTSoVITSDecodedAudio] = []
+        cursor = 0
+        for prepared, feat_len in zip(prepared_requests, feat_lens):
+            audio_len = feat_len * upsample_rate
+            audio_fragment = merged_audio[cursor : cursor + audio_len]
+            cursor += audio_len
+            decoded_items.append(
+                GPTSoVITSDecodedAudio(
+                    request_id=prepared.request_id,
+                    audio_fragment=audio_fragment,
+                    output_sr=output_sr,
+                    speed_factor=float(prepared.speed_factor),
+                    super_sampling=bool(prepared.super_sampling),
+                )
+            )
+        return decoded_items
+
+    def _decode_prepared_requests_grouped_vocoder(
+        self,
+        pipeline: Any,
+        prepared_requests: list[GPTSoVITSDecodePreparedRequest],
+    ) -> list[GPTSoVITSDecodedAudio]:
+        if not prepared_requests:
+            return []
+        refer_audio_spec, _ = self._build_refer_spec_from_prepared(prepared_requests[0])
+        with self._run_lock:
+            prompt_context = self._build_vocoder_prompt_context(
+                pipeline,
+                prepared_requests[0],
+                refer_audio_spec,
+            )
+            decoded: list[GPTSoVITSDecodedAudio | None] = [None] * len(prepared_requests)
+            grouped_by_target: dict[tuple[float, int], list[tuple[int, GPTSoVITSDecodePreparedRequest]]] = {}
+            for index, prepared in enumerate(prepared_requests):
+                grouped_by_target.setdefault(
+                    (float(prepared.speed_factor), int(prepared.sample_steps)),
+                    [],
+                ).append((index, prepared))
+            for grouped_items in grouped_by_target.values():
+                grouped_indices = [item[0] for item in grouped_items]
+                grouped_prepared = [item[1] for item in grouped_items]
+                if len(grouped_prepared) == 1:
+                    prepared = grouped_prepared[0]
+                    audio_fragment, output_sr = self._decode_vocoder_with_prompt_context(
+                        pipeline,
+                        prepared,
+                        prompt_context,
+                    )
+                    grouped_decoded = [
+                        GPTSoVITSDecodedAudio(
+                            request_id=prepared.request_id,
+                            audio_fragment=audio_fragment,
+                            output_sr=int(output_sr),
+                            speed_factor=float(prepared.speed_factor),
+                            super_sampling=bool(prepared.super_sampling),
+                        )
+                    ]
+                else:
+                    grouped_decoded = self._decode_prepared_requests_batched_vocoder(
+                        pipeline,
+                        grouped_prepared,
+                        prompt_context,
+                    )
+                for index, decoded_item in zip(grouped_indices, grouped_decoded):
+                    decoded[index] = decoded_item
+        return [item for item in decoded if item is not None]
+
+    def _decode_prepared_request_fragment(
+        self,
+        pipeline: Any,
+        prepared: GPTSoVITSDecodePreparedRequest,
+    ) -> tuple[Any, int]:
+        refer_spec = self._build_refer_spec_from_prepared(prepared)
+        if bool(getattr(pipeline.configs, "use_vocoder", False)):
+            return self._decode_prepared_request_vocoder_fragment(
+                pipeline,
+                prepared,
+                refer_spec[0],
+            )
+
+        refer_audio_spec_list = [refer_spec[0].to(dtype=pipeline.precision, device=pipeline.configs.device)]
+        sv_emb = None
+        if bool(getattr(pipeline, "is_v2pro", False)):
+            audio_tensor = refer_spec[1]
+            if audio_tensor is None:
+                raise ValueError("GPT-SoVITS v2Pro request-local synthesis 缺少 16k 参考音频")
+            sv_emb = [pipeline.sv_model.compute_embedding3(audio_tensor).to(pipeline.configs.device)]
+        audio_fragment = pipeline.vits_model.decode(
+            prepared.semantic_tokens.unsqueeze(0).unsqueeze(0),
+            prepared.phones.unsqueeze(0),
+            refer_audio_spec_list,
+            speed=float(prepared.speed_factor),
+            sv_emb=sv_emb,
+        ).detach()[0, 0, :]
+        return audio_fragment, int(pipeline.configs.sampling_rate)
+
+    def _decode_prepared_requests_batched_non_vocoder(
+        self,
+        pipeline: Any,
+        prepared_requests: list[GPTSoVITSDecodePreparedRequest],
+    ) -> list[GPTSoVITSDecodedAudio]:
+        if not prepared_requests:
+            return []
+        if bool(getattr(pipeline.configs, "use_vocoder", False)):
+            raise ValueError("non-vocoder batched decode helper received vocoder pipeline")
+
+        device = torch.device(pipeline.configs.device)
+        batch_size = len(prepared_requests)
+        first_speed = float(prepared_requests[0].speed_factor)
+        first_sample_steps = int(prepared_requests[0].sample_steps)
+        if any(abs(float(item.speed_factor) - first_speed) > 1e-6 for item in prepared_requests):
+            raise ValueError("GPT-SoVITS batched non-vocoder decode requires identical speed_factor")
+        if any(int(item.sample_steps) != first_sample_steps for item in prepared_requests):
+            raise ValueError("GPT-SoVITS batched non-vocoder decode requires identical sample_steps")
+
+        refer_specs = [self._build_refer_spec_from_prepared(prepared) for prepared in prepared_requests]
+        shared_single_refer = False
+        shared_refer_audio_spec = None
+        if refer_specs:
+            first_spec, first_audio = refer_specs[0]
+            first_spec_key = (
+                str(first_spec.device),
+                str(first_spec.dtype),
+                tuple(int(item) for item in first_spec.shape),
+                int(first_spec.data_ptr()),
+            )
+            first_audio_key = None
+            if first_audio is not None:
+                first_audio_key = (
+                    str(first_audio.device),
+                    str(first_audio.dtype),
+                    tuple(int(item) for item in first_audio.shape),
+                    int(first_audio.data_ptr()),
+                )
+            shared_single_refer = True
+            for refer_audio_spec, audio_tensor in refer_specs[1:]:
+                refer_spec_key = (
+                    str(refer_audio_spec.device),
+                    str(refer_audio_spec.dtype),
+                    tuple(int(item) for item in refer_audio_spec.shape),
+                    int(refer_audio_spec.data_ptr()),
+                )
+                if refer_spec_key != first_spec_key:
+                    shared_single_refer = False
+                    break
+                if first_audio_key is None:
+                    if audio_tensor is not None:
+                        shared_single_refer = False
+                        break
+                else:
+                    if audio_tensor is None:
+                        shared_single_refer = False
+                        break
+                    audio_key = (
+                        str(audio_tensor.device),
+                        str(audio_tensor.dtype),
+                        tuple(int(item) for item in audio_tensor.shape),
+                        int(audio_tensor.data_ptr()),
+                    )
+                    if audio_key != first_audio_key:
+                        shared_single_refer = False
+                        break
+            if shared_single_refer:
+                shared_refer_audio_spec = first_spec.to(dtype=pipeline.precision, device=device)
+
+        max_semantic_len = max(int(item.semantic_tokens.shape[-1]) for item in prepared_requests)
+        max_phone_len = max(int(item.phones.shape[-1]) for item in prepared_requests)
+        semantic_batch = torch.zeros((1, batch_size, max_semantic_len), dtype=torch.long, device=device)
+        phone_batch = torch.zeros((batch_size, max_phone_len), dtype=torch.long, device=device)
+        semantic_lengths: list[int] = []
+        phone_lengths: list[int] = []
+        refer_audio_specs: list[torch.Tensor] = []
+        sv_emb_batch = None
+        sv_emb_list: list[torch.Tensor] = []
+
+        for batch_index, prepared in enumerate(prepared_requests):
+            semantic_len = int(prepared.semantic_tokens.shape[-1])
+            phone_len = int(prepared.phones.shape[-1])
+            semantic_batch[0, batch_index, :semantic_len] = prepared.semantic_tokens.to(device=device, dtype=torch.long)
+            phone_batch[batch_index, :phone_len] = prepared.phones.to(device=device, dtype=torch.long)
+            semantic_lengths.append(semantic_len)
+            phone_lengths.append(phone_len)
+            if shared_single_refer:
+                continue
+            refer_audio_spec, audio_tensor = refer_specs[batch_index]
+            refer_audio_specs.append(refer_audio_spec.to(dtype=pipeline.precision, device=device))
+            if bool(getattr(pipeline, "is_v2pro", False)):
+                if audio_tensor is None:
+                    raise ValueError("GPT-SoVITS v2Pro batched non-vocoder decode 缺少 16k 参考音频")
+                sv_emb_list.append(pipeline.sv_model.compute_embedding3(audio_tensor).to(device))
+
+        if bool(getattr(pipeline, "is_v2pro", False)):
+            if shared_single_refer:
+                shared_audio_tensor = refer_specs[0][1]
+                if shared_audio_tensor is None:
+                    raise ValueError("GPT-SoVITS v2Pro batched non-vocoder decode 缺少 16k 参考音频")
+                sv_emb_batch = pipeline.sv_model.compute_embedding3(shared_audio_tensor).to(device)
+            else:
+                sv_emb_batch = torch.cat(sv_emb_list, dim=0)
+
+        precomputed_ge = None
+        if shared_single_refer:
+            if shared_refer_audio_spec is None:
+                raise ValueError("shared_single_refer detected but refer_audio_spec missing")
+            refer_audio_specs = [shared_refer_audio_spec]
+            with self._project_root_cwd():
+                from GPT_SoVITS.module import commons
+
+            refer_lengths = torch.LongTensor([int(shared_refer_audio_spec.size(2))]).to(device)
+            refer_mask = torch.unsqueeze(
+                commons.sequence_mask(refer_lengths, int(shared_refer_audio_spec.size(2))),
+                1,
+            ).to(shared_refer_audio_spec.dtype)
+            if pipeline.vits_model.version == "v1":
+                precomputed_ge = pipeline.vits_model.ref_enc(shared_refer_audio_spec * refer_mask, refer_mask)
+            else:
+                precomputed_ge = pipeline.vits_model.ref_enc(shared_refer_audio_spec[:, :704] * refer_mask, refer_mask)
+            if bool(getattr(pipeline, "is_v2pro", False)):
+                if sv_emb_batch is None:
+                    raise ValueError("GPT-SoVITS v2Pro batched non-vocoder decode 缺少 sv_emb")
+                precomputed_ge = precomputed_ge + pipeline.vits_model.sv_emb(sv_emb_batch[:1]).unsqueeze(-1)
+                precomputed_ge = pipeline.vits_model.prelu(precomputed_ge)
+
+        with self._run_lock:
+            audio_batch, audio_lengths = pipeline.vits_model.decode_batched_request_local(
+                codes=semantic_batch,
+                code_lengths=torch.LongTensor(semantic_lengths).to(device),
+                text=phone_batch,
+                text_lengths=torch.LongTensor(phone_lengths).to(device),
+                refer_list=refer_audio_specs,
+                speed=first_speed,
+                sv_emb=sv_emb_batch,
+                shared_refer=shared_single_refer,
+                precomputed_ge=precomputed_ge,
+            )
+        audio_fragments = [
+            audio_batch[batch_index, 0, : int(audio_lengths[batch_index].item())].detach()
+            for batch_index in range(batch_size)
+        ]
+        output_sr = int(pipeline.configs.sampling_rate)
+        return [
+            GPTSoVITSDecodedAudio(
+                request_id=prepared.request_id,
+                audio_fragment=audio_fragment,
+                output_sr=output_sr,
+                speed_factor=float(prepared.speed_factor),
+                super_sampling=bool(prepared.super_sampling),
+            )
+            for prepared, audio_fragment in zip(prepared_requests, audio_fragments)
+        ]
+
     def decode_prepared_request(
         self,
         prepared: GPTSoVITSDecodePreparedRequest,
@@ -1673,29 +4295,9 @@ class GPTSoVITSRuntime:
                 speed_factor=float(prepared.speed_factor),
                 super_sampling=bool(prepared.super_sampling),
             )
-
-        refer_spec = (
-            prepared.refer_audio_spec,
-            None if prepared.refer_audio_16k.numel() == 0 else prepared.refer_audio_16k,
-        )
         with self._run_lock:
             with self._project_root_cwd():
-                audio_fragment = pipeline.synthesize_audio_request_local(
-                    semantic_tokens=prepared.semantic_tokens.unsqueeze(0).unsqueeze(0),
-                    phones=prepared.phones.unsqueeze(0),
-                    prompt_semantic=prepared.prompt_semantic,
-                    prompt_phones=prepared.prompt_phones,
-                    refer_spec=[refer_spec],
-                    raw_audio=prepared.raw_audio,
-                    raw_sr=int(prepared.raw_sr),
-                    speed=float(prepared.speed_factor),
-                    sample_steps=int(prepared.sample_steps),
-                )
-                output_sr = (
-                    int(pipeline.configs.sampling_rate)
-                    if not pipeline.configs.use_vocoder
-                    else int(pipeline.vocoder_configs["sr"])
-                )
+                audio_fragment, output_sr = self._decode_prepared_request_fragment(pipeline, prepared)
         return GPTSoVITSDecodedAudio(
             request_id=prepared.request_id,
             audio_fragment=audio_fragment,
@@ -1704,23 +4306,144 @@ class GPTSoVITSRuntime:
             super_sampling=bool(prepared.super_sampling),
         )
 
+    def decode_prepared_requests(
+        self,
+        prepared_requests: list[GPTSoVITSDecodePreparedRequest],
+    ) -> list[GPTSoVITSDecodedAudio]:
+        if not prepared_requests:
+            return []
+        pipeline = self._ensure_pipeline()
+        decoded: list[GPTSoVITSDecodedAudio | None] = [None] * len(prepared_requests)
+        output_sr_default = int(getattr(pipeline.configs, "sampling_rate", 32000))
+        sequential_indices: list[int] = []
+        grouped_non_vocoder: dict[tuple[float, int], list[tuple[int, GPTSoVITSDecodePreparedRequest]]] = {}
+        grouped_vocoder: dict[tuple[Any, ...], list[tuple[int, GPTSoVITSDecodePreparedRequest]]] = {}
+
+        for index, prepared in enumerate(prepared_requests):
+            if prepared.semantic_tokens.numel() == 0:
+                decoded[index] = GPTSoVITSDecodedAudio(
+                    request_id=prepared.request_id,
+                    audio_fragment=np.zeros((0,), dtype=np.float32),
+                    output_sr=output_sr_default,
+                    speed_factor=float(prepared.speed_factor),
+                    super_sampling=bool(prepared.super_sampling),
+                )
+                continue
+            if bool(getattr(pipeline.configs, "use_vocoder", False)):
+                refer_audio_spec, _ = self._build_refer_spec_from_prepared(prepared)
+                grouped_vocoder.setdefault(
+                    self._build_vocoder_prompt_cache_key(prepared, refer_audio_spec),
+                    [],
+                ).append((index, prepared))
+                continue
+            grouped_non_vocoder.setdefault(
+                (float(prepared.speed_factor), int(prepared.sample_steps)),
+                [],
+            ).append((index, prepared))
+
+        for grouped_items in grouped_non_vocoder.values():
+            if len(grouped_items) == 1:
+                sequential_indices.append(grouped_items[0][0])
+                continue
+            grouped_indices = [item[0] for item in grouped_items]
+            grouped_prepared = [item[1] for item in grouped_items]
+            grouped_decoded = self._decode_prepared_requests_batched_non_vocoder(pipeline, grouped_prepared)
+            for index, decoded_item in zip(grouped_indices, grouped_decoded):
+                decoded[index] = decoded_item
+
+        for grouped_items in grouped_vocoder.values():
+            grouped_indices = [item[0] for item in grouped_items]
+            grouped_prepared = [item[1] for item in grouped_items]
+            if len(grouped_prepared) == 1:
+                sequential_indices.append(grouped_indices[0])
+                continue
+            grouped_decoded = self._decode_prepared_requests_grouped_vocoder(
+                pipeline,
+                grouped_prepared,
+            )
+            for index, decoded_item in zip(grouped_indices, grouped_decoded):
+                decoded[index] = decoded_item
+
+        for index in sequential_indices:
+            if decoded[index] is None:
+                decoded[index] = self.decode_prepared_request(prepared_requests[index])
+
+        return [item for item in decoded if item is not None]
+
+    @staticmethod
+    def _audio_fragment_to_tensor(audio_fragment: Any, *, device: torch.device) -> torch.Tensor:
+        if isinstance(audio_fragment, torch.Tensor):
+            return audio_fragment.detach().to(device=device, dtype=torch.float32).reshape(-1)
+        return torch.as_tensor(audio_fragment, dtype=torch.float32, device=device).reshape(-1)
+
+    def _audio_postprocess_native(
+        self,
+        pipeline: Any,
+        *,
+        audio_fragments: list[Any],
+        sr: int,
+        speed_factor: float,
+        super_sampling: bool,
+        fragment_interval: float = 0.0,
+    ) -> tuple[int, np.ndarray]:
+        del speed_factor
+        device = torch.device(pipeline.configs.device)
+        fragment_tensors: list[torch.Tensor] = []
+        zero_wav = None
+        if fragment_interval > 0:
+            zero_wav = torch.zeros(
+                int(pipeline.configs.sampling_rate * fragment_interval),
+                dtype=torch.float32,
+                device=device,
+            )
+
+        for audio_fragment in audio_fragments:
+            fragment = self._audio_fragment_to_tensor(audio_fragment, device=device)
+            max_audio = torch.abs(fragment).max() if fragment.numel() > 0 else torch.tensor(0.0, device=device)
+            if float(max_audio.item()) > 1.0:
+                fragment = fragment / max_audio
+            if zero_wav is not None:
+                fragment = torch.cat([fragment, zero_wav], dim=0)
+            fragment_tensors.append(fragment)
+
+        audio = torch.cat(fragment_tensors, dim=0) if fragment_tensors else torch.zeros((0,), dtype=torch.float32, device=device)
+
+        if super_sampling:
+            pipeline.init_sr_model()
+            if not getattr(pipeline, "sr_model_not_exist", False):
+                audio, sr = pipeline.sr_model(audio.unsqueeze(0), sr)
+                max_audio = float(torch.abs(audio).max().item()) if isinstance(audio, torch.Tensor) and audio.numel() > 0 else 0.0
+                if max_audio > 1.0:
+                    audio = audio / max_audio
+
+        if isinstance(audio, torch.Tensor):
+            audio_np = audio.detach().float().cpu().numpy()
+        else:
+            audio_np = np.asarray(audio)
+        audio_np = (audio_np.reshape(-1) * 32768).astype(np.int16)
+        return int(sr), audio_np
+
     def finalize_decoded_audio(
         self,
         decoded: GPTSoVITSDecodedAudio,
     ) -> GPTSoVITSResult:
         pipeline = self._ensure_pipeline()
         with self._run_lock:
-            with self._project_root_cwd():
-                sample_rate, audio = pipeline.audio_postprocess(
-                    audio=[[decoded.audio_fragment]],
-                    sr=int(decoded.output_sr),
-                    batch_index_list=None,
-                    speed_factor=float(decoded.speed_factor),
-                    split_bucket=False,
-                    fragment_interval=0.0,
-                    super_sampling=bool(decoded.super_sampling),
-                )
+            sample_rate, audio = self._audio_postprocess_native(
+                pipeline,
+                audio_fragments=[decoded.audio_fragment],
+                sr=int(decoded.output_sr),
+                speed_factor=float(decoded.speed_factor),
+                fragment_interval=0.0,
+                super_sampling=bool(decoded.super_sampling),
+            )
         return GPTSoVITSResult(sample_rate=int(sample_rate), audio=self._normalize_audio(np.asarray(audio)))
+
+    def finalize_decoded_audios(
+        self,
+        decoded_items: list[GPTSoVITSDecodedAudio],
+    ) -> list[GPTSoVITSResult]:
+        return [self.finalize_decoded_audio(decoded) for decoded in decoded_items]
 
     def decode_semantic_tokens_from_transport(
         self,
