@@ -52,6 +52,122 @@ _PREPARE_REF_RESAMPLE_TRANSFORMS: dict[tuple[int, int, str], Any] = {}
 _PREPARE_REF_RESAMPLE_LOCK = threading.Lock()
 
 
+def _safe_runtime_component_snapshot(component: Any) -> dict[str, Any] | None:
+    if component is None or not hasattr(component, "snapshot"):
+        return None
+    try:
+        snapshot = component.snapshot()
+    except Exception:
+        return None
+    if snapshot is None:
+        return None
+    try:
+        return dict(snapshot)
+    except Exception:
+        return None
+
+
+def _safe_runtime_executor_queue_size(executor: Any) -> int:
+    work_queue = getattr(executor, "_work_queue", None)
+    if work_queue is None or not hasattr(work_queue, "qsize"):
+        return 0
+    try:
+        return max(0, int(work_queue.qsize()))
+    except Exception:
+        return 0
+
+
+def _detect_native_g2pw_runtime_state() -> dict[str, Any] | None:
+    try:
+        from text import chinese2
+
+        g2pw_instance = getattr(chinese2, "g2pw", None)
+        g2pw_backend = None if g2pw_instance is None else getattr(g2pw_instance, "_g2pw", None)
+        if g2pw_backend is None or not hasattr(g2pw_backend, "snapshot"):
+            return None
+        snapshot = g2pw_backend.snapshot()
+    except Exception:
+        return None
+    if snapshot is None:
+        return None
+    try:
+        return dict(snapshot)
+    except Exception:
+        return None
+
+
+def _build_native_prepare_runtime_state(tts: Any) -> dict[str, Any]:
+    text_cpu_worker = getattr(tts, "prepare_text_cpu_worker", None)
+    text_cpu_executor = getattr(tts, "prepare_text_cpu_executor", None)
+    bert_worker = getattr(tts, "prepare_bert_batch_worker", None)
+    ref_semantic_worker = getattr(tts, "prepare_ref_semantic_batch_worker", None)
+    g2pw_batch_worker = getattr(tts, "prepare_g2pw_batch_worker", None)
+    text_preprocessor = getattr(tts, "text_preprocessor", None)
+    text_cpu_admission = None
+    admission_builder = getattr(tts, "_build_text_cpu_admission_state", None)
+    if callable(admission_builder):
+        try:
+            built_state = admission_builder()
+        except Exception:
+            built_state = None
+        if isinstance(built_state, dict):
+            text_cpu_admission = built_state
+    g2pw_runtime = _detect_native_g2pw_runtime_state()
+    if g2pw_runtime is None:
+        g2pw_batch_state = _safe_runtime_component_snapshot(g2pw_batch_worker)
+        if isinstance(g2pw_batch_state, dict):
+            worker_count = g2pw_batch_state.get("worker_count")
+            try:
+                if worker_count is not None:
+                    g2pw_runtime = {"worker_count": max(1, int(worker_count))}
+            except Exception:
+                g2pw_runtime = None
+    return {
+        "text_cpu": {
+            "workers": int(getattr(tts, "prepare_text_cpu_workers", 0) or 0),
+            "queue_size": _safe_runtime_executor_queue_size(text_cpu_executor),
+            "enabled": bool(text_cpu_worker is not None or text_cpu_executor is not None),
+            "worker": _safe_runtime_component_snapshot(text_cpu_worker),
+            "admission": text_cpu_admission,
+        },
+        "bert": {
+            "stage_limiter": _safe_runtime_component_snapshot(getattr(tts, "prepare_bert_stage_limiter", None)),
+            "batch_worker": _safe_runtime_component_snapshot(bert_worker),
+            "batching_enabled": bool(bert_worker is not None),
+        },
+        "ref_semantic": {
+            "stage_limiter": _safe_runtime_component_snapshot(getattr(tts, "prepare_ref_semantic_stage_limiter", None)),
+            "batch_worker": _safe_runtime_component_snapshot(ref_semantic_worker),
+            "batching_enabled": bool(ref_semantic_worker is not None),
+        },
+        "ref_spec": {
+            "stage_limiter": _safe_runtime_component_snapshot(getattr(tts, "prepare_ref_spec_stage_limiter", None)),
+        },
+        "ref_audio_limiters": {
+            "split": bool(getattr(tts, "prepare_ref_stage_limiters_split", False)),
+            "shared_legacy_limiter": bool(
+                getattr(tts, "prepare_ref_semantic_stage_limiter", None)
+                is getattr(tts, "prepare_ref_spec_stage_limiter", None)
+            ),
+        },
+        "text_preprocessor": _safe_runtime_component_snapshot(text_preprocessor),
+        "g2pw": g2pw_runtime,
+        "g2pw_batch": _safe_runtime_component_snapshot(g2pw_batch_worker),
+    }
+
+
+def _resolve_native_prepare_runtime_state(tts: Any) -> dict[str, Any]:
+    state_provider = getattr(tts, "_vllm_runtime_prepare_state_provider", None)
+    if callable(state_provider):
+        try:
+            provided_state = state_provider()
+        except Exception:
+            provided_state = None
+        if isinstance(provided_state, dict):
+            return provided_state
+    return _build_native_prepare_runtime_state(tts)
+
+
 def _get_prepare_ref_resampler(sr0: int, sr1: int, device: str) -> Any:
     key = (int(sr0), int(sr1), str(device))
     with _PREPARE_REF_RESAMPLE_LOCK:
@@ -758,15 +874,7 @@ class GPTSoVITSPrepareRuntimeCoordinator:
 
     @staticmethod
     def _detect_g2pw_runtime_workers(tts: Any) -> int | None:
-        snapshot_fn = getattr(tts, "snapshot_prepare_runtime_components", None)
-        if not callable(snapshot_fn):
-            return None
-        try:
-            runtime_state = snapshot_fn()
-        except Exception:
-            return None
-        if not isinstance(runtime_state, dict):
-            return None
+        runtime_state = _resolve_native_prepare_runtime_state(tts)
         g2pw_state = runtime_state.get("g2pw")
         if not isinstance(g2pw_state, dict):
             return None
@@ -1361,6 +1469,33 @@ class GPTSoVITSRuntime:
                 if os.getcwd() != previous_cwd:
                     os.chdir(previous_cwd)
 
+    @staticmethod
+    @contextmanager
+    def _temporary_env_override(name: str, value: str):
+        previous = os.environ.get(name)
+        os.environ[name] = value
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
+
+    @staticmethod
+    @contextmanager
+    def _temporary_attr_override(obj: Any, name: str, value: Any):
+        sentinel = object()
+        previous = getattr(obj, name, sentinel)
+        setattr(obj, name, value)
+        try:
+            yield
+        finally:
+            if previous is sentinel:
+                delattr(obj, name)
+            else:
+                setattr(obj, name, previous)
+
     def _ensure_pipeline(self):
         if self._pipeline is not None:
             return self._pipeline
@@ -1375,9 +1510,13 @@ class GPTSoVITSRuntime:
                 from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
 
                 config = TTS_Config(self.config_path)
-                pipeline = TTS(config)
+                with self._temporary_env_override("GPTSOVITS_RUNTIME_SKIP_PREPARE_COMPONENTS", "1"):
+                    with self._temporary_attr_override(TTS, "refresh_runtime_components", lambda _self: None):
+                        pipeline = TTS(config)
+                setattr(pipeline, "runtime_prepare_components_deferred", True)
             self._install_ref_audio_loader_fallback(pipeline)
             self._install_sv_half_safe_patch(pipeline)
+            self._install_runtime_prepare_components(pipeline)
             self._bind_pipeline_components(pipeline)
             self._config = config
             self._pipeline = pipeline
@@ -1387,6 +1526,200 @@ class GPTSoVITSRuntime:
                 self.config_path,
             )
         return self._pipeline
+
+    @staticmethod
+    def _runtime_prepare_batching_enabled(env_name: str, default: str = "1") -> bool:
+        return str(os.environ.get(env_name, default)).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _refresh_runtime_t2s_kv_cache_pool_state(self, pipeline: Any) -> None:
+        t2s_model = getattr(getattr(pipeline, "t2s_model", None), "model", None)
+        if t2s_model is None:
+            pipeline.t2s_kv_cache_pool_state = None
+            return
+        with self._project_root_cwd():
+            from TTS_infer_pack.t2s_kv_cache_pool import attach_t2s_kv_cache_pool
+
+        pool_state = attach_t2s_kv_cache_pool(t2s_model, getattr(getattr(pipeline, "configs", None), "device", "cpu"))
+        pool = getattr(t2s_model, "kv_cache_pool", None)
+        pipeline.t2s_kv_cache_pool_state = pool.snapshot() if pool is not None else dict(vars(pool_state))
+
+    def _build_runtime_prepare_bert_batch_worker(self, pipeline: Any) -> Any | None:
+        if not self._runtime_prepare_batching_enabled("GPTSOVITS_PREPARE_BERT_BATCHING", "1"):
+            return None
+        with self._project_root_cwd():
+            from TTS_infer_pack.prepare_bert_batch_worker import PrepareBertBatchWorker, PrepareBertBatchWorkerPool
+
+        bert_worker_kwargs = dict(
+            bert_model=getattr(pipeline, "bert_model", None),
+            tokenizer=getattr(pipeline, "bert_tokenizer", None),
+            device=getattr(getattr(pipeline, "configs", None), "device", "cpu"),
+            stage_limiter=getattr(pipeline, "prepare_bert_stage_limiter", None),
+            batch_window_ms=int(os.environ.get("GPTSOVITS_PREPARE_BERT_BATCH_WINDOW_MS", "5")),
+            max_batch_items=int(os.environ.get("GPTSOVITS_PREPARE_BERT_BATCH_MAX_ITEMS", "16")),
+            max_batch_tokens=int(os.environ.get("GPTSOVITS_PREPARE_BERT_BATCH_MAX_TOKENS", "4096")),
+            max_pending_tasks=int(os.environ.get("GPTSOVITS_PREPARE_BERT_MAX_PENDING_TASKS", "0")),
+            admission_poll_ms=int(os.environ.get("GPTSOVITS_PREPARE_BERT_ADMISSION_POLL_MS", "1")),
+            high_pressure_pending_threshold=int(
+                os.environ.get("GPTSOVITS_PREPARE_BERT_HIGH_PRESSURE_PENDING_THRESHOLD", "0")
+            ),
+            high_pressure_batch_window_ms=int(
+                os.environ.get("GPTSOVITS_PREPARE_BERT_HIGH_PRESSURE_BATCH_WINDOW_MS", "1")
+            ),
+            high_pressure_max_batch_items=int(
+                os.environ.get("GPTSOVITS_PREPARE_BERT_HIGH_PRESSURE_MAX_ITEMS", "32")
+            ),
+            high_pressure_max_batch_tokens=int(
+                os.environ.get("GPTSOVITS_PREPARE_BERT_HIGH_PRESSURE_MAX_TOKENS", "8192")
+            ),
+        )
+        bert_batch_workers = max(1, int(os.environ.get("GPTSOVITS_PREPARE_BERT_BATCH_WORKERS", "2")))
+        if bert_batch_workers > 1:
+            return PrepareBertBatchWorkerPool(worker_count=int(bert_batch_workers), **bert_worker_kwargs)
+        return PrepareBertBatchWorker(**bert_worker_kwargs)
+
+    def _build_runtime_prepare_ref_semantic_batch_worker(self, pipeline: Any) -> Any | None:
+        if not self._runtime_prepare_batching_enabled("GPTSOVITS_PREPARE_REF_BATCHING", "1"):
+            return None
+        with self._project_root_cwd():
+            from TTS_infer_pack.prepare_ref_semantic_batch_worker import PrepareRefSemanticBatchWorkerPool
+
+        ref_max_batch_samples = os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_MAX_SAMPLES")
+        if ref_max_batch_samples is None:
+            ref_max_batch_samples = os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_MAX_FRAMES", "960000")
+        ref_batch_workers = max(1, int(os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_WORKERS", "2")))
+        return PrepareRefSemanticBatchWorkerPool(
+            ssl_model=getattr(pipeline, "cnhuhbert_model", None),
+            vits_model=getattr(pipeline, "vits_model", None),
+            device=getattr(getattr(pipeline, "configs", None), "device", "cpu"),
+            is_half=bool(getattr(getattr(pipeline, "configs", None), "is_half", False)),
+            zero_wav_samples=int(getattr(getattr(pipeline, "configs", None), "sampling_rate", 32000) * 0.3),
+            stage_limiter=getattr(pipeline, "prepare_ref_semantic_stage_limiter", None),
+            batch_window_ms=int(os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_WINDOW_MS", "5")),
+            max_batch_items=int(os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_MAX_ITEMS", "8")),
+            max_batch_samples=int(ref_max_batch_samples),
+            worker_count=int(ref_batch_workers),
+        )
+
+    def _build_runtime_text_preprocessor(self, pipeline: Any, bert_batch_worker: Any | None) -> Any:
+        with self._project_root_cwd():
+            from TTS_infer_pack.TextPreprocessor import TextPreprocessor
+
+        return TextPreprocessor(
+            getattr(pipeline, "bert_model", None),
+            getattr(pipeline, "bert_tokenizer", None),
+            getattr(getattr(pipeline, "configs", None), "device", "cpu"),
+            version=str(getattr(getattr(pipeline, "configs", None), "version", "") or ""),
+            bert_stage_limiter=getattr(pipeline, "prepare_bert_stage_limiter", None),
+            bert_batch_worker=bert_batch_worker,
+        )
+
+    def _build_runtime_prepare_g2pw_batch_worker(self, pipeline: Any) -> Any | None:
+        if not self._runtime_prepare_batching_enabled("GPTSOVITS_PREPARE_G2PW_BATCHING", "0"):
+            return None
+        with self._project_root_cwd():
+            from TTS_infer_pack.prepare_g2pw_batch_worker import PrepareG2PWBatchWorker, PrepareG2PWBatchWorkerPool
+
+        text_preprocessor = getattr(pipeline, "text_preprocessor", None)
+        if text_preprocessor is None:
+            return None
+        g2pw_worker_kwargs = dict(
+            resolve_batch_fn=text_preprocessor.resolve_g2pw_segments_batch,
+            batch_window_ms=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_WINDOW_MS", "2")),
+            max_batch_tasks=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_MAX_TASKS", "64")),
+            max_batch_groups=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_MAX_GROUPS", "128")),
+            max_batch_chars=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_MAX_CHARS", "4096")),
+            max_pending_tasks=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_MAX_PENDING_TASKS", "0")),
+            admission_poll_ms=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_ADMISSION_POLL_MS", "1")),
+            high_pressure_pending_threshold=int(
+                os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_PENDING_THRESHOLD", "32")
+            ),
+            high_pressure_batch_window_ms=int(
+                os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_BATCH_WINDOW_MS", "4")
+            ),
+            high_pressure_max_batch_tasks=int(
+                os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_TASKS", "128")
+            ),
+            high_pressure_max_batch_groups=int(
+                os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_GROUPS", "256")
+            ),
+            high_pressure_max_batch_chars=int(
+                os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_CHARS", "8192")
+            ),
+        )
+        g2pw_batch_workers = max(1, int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_WORKERS", "2")))
+        if g2pw_batch_workers > 1:
+            return PrepareG2PWBatchWorkerPool(worker_count=int(g2pw_batch_workers), **g2pw_worker_kwargs)
+        return PrepareG2PWBatchWorker(**g2pw_worker_kwargs)
+
+    def _build_runtime_prepare_text_cpu_worker(self, pipeline: Any) -> Any | None:
+        if int(getattr(pipeline, "prepare_text_cpu_workers", 0) or 0) <= 0:
+            return None
+        text_preprocessor = getattr(pipeline, "text_preprocessor", None)
+        if text_preprocessor is None:
+            return None
+        with self._project_root_cwd():
+            from TTS_infer_pack.prepare_text_cpu_worker import PrepareTextCpuWorker
+
+        return PrepareTextCpuWorker(
+            process_fn=lambda text, language: text_preprocessor.preprocess_text_segments(
+                text,
+                language,
+                getattr(getattr(pipeline, "configs", None), "version", ""),
+            ),
+            batch_process_fn=lambda items: text_preprocessor.preprocess_text_segments_batch(
+                list(items),
+                getattr(getattr(pipeline, "configs", None), "version", ""),
+            ),
+            worker_count=int(getattr(pipeline, "prepare_text_cpu_workers", 0)),
+            batch_window_ms=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_BATCH_WINDOW_MS", "2")),
+            max_batch_items=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_BATCH_MAX_ITEMS", "512")),
+            high_pressure_pending_threshold=int(
+                os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_PENDING_THRESHOLD", "64")
+            ),
+            high_pressure_batch_window_ms=int(
+                os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_BATCH_WINDOW_MS", "4")
+            ),
+            high_pressure_max_batch_items=int(
+                os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_MAX_ITEMS", "512")
+            ),
+            max_pending_tasks=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_MAX_PENDING_TASKS", "0")),
+            admission_poll_ms=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_ADMISSION_POLL_MS", "1")),
+            admission_controller=getattr(pipeline, "_build_text_cpu_admission_state"),
+        )
+
+    def _install_runtime_prepare_components(self, pipeline: Any) -> None:
+        runtime_prepare_state_provider = lambda: _build_native_prepare_runtime_state(pipeline)
+        runtime_prepare_refresh = lambda: self._refresh_runtime_prepare_components(pipeline)
+        runtime_prepare_generation = int(getattr(pipeline, "_vllm_runtime_prepare_generation", 0) or 0) + 1
+        bert_batch_worker = self._build_runtime_prepare_bert_batch_worker(pipeline)
+        ref_semantic_batch_worker = self._build_runtime_prepare_ref_semantic_batch_worker(pipeline)
+        pipeline.prepare_bert_batch_worker = bert_batch_worker
+        pipeline.prepare_ref_semantic_batch_worker = ref_semantic_batch_worker
+        pipeline.text_preprocessor = self._build_runtime_text_preprocessor(pipeline, bert_batch_worker)
+        pipeline.prepare_g2pw_batch_worker = self._build_runtime_prepare_g2pw_batch_worker(pipeline)
+        pipeline.prepare_text_cpu_worker = self._build_runtime_prepare_text_cpu_worker(pipeline)
+        pipeline._vllm_runtime_prepare_generation = runtime_prepare_generation
+        pipeline._vllm_runtime_owner = self
+        pipeline._vllm_runtime_prepare_state_provider = runtime_prepare_state_provider
+        pipeline._vllm_runtime_prepare_coordinator_factory = lambda: GPTSoVITSPrepareRuntimeCoordinator.build_native(
+            pipeline
+        )
+        pipeline._vllm_runtime_refresh_prepare_components = runtime_prepare_refresh
+        pipeline.refresh_runtime_components = runtime_prepare_refresh
+        pipeline.snapshot_prepare_runtime_components = runtime_prepare_state_provider
+        pipeline._vllm_runtime_owned_prepare_components = True
+        if hasattr(pipeline, "_prewarm_g2pw_runtime"):
+            pipeline._prewarm_g2pw_runtime()
+        if hasattr(pipeline, "_prewarm_prepare_ref_runtime"):
+            pipeline._prewarm_prepare_ref_runtime()
+
+    def _refresh_runtime_prepare_components(self, pipeline: Any) -> None:
+        with self._init_lock:
+            self._refresh_runtime_t2s_kv_cache_pool_state(pipeline)
+            self._install_runtime_prepare_components(pipeline)
+            setattr(pipeline, "_scheduler_prepare_coordinator", None)
+            self._bind_pipeline_components(pipeline)
+            self._prepare_coordinator = None
 
     def _bind_pipeline_components(self, pipeline: Any) -> None:
         self._runtime_configs = getattr(pipeline, "configs", None)
@@ -1492,6 +1825,27 @@ class GPTSoVITSRuntime:
         if self._pipeline is None and self._runtime_sr_model is None:
             self._refresh_runtime_bound_components()
         return self._runtime_sr_model, bool(self._runtime_sr_model_not_exist)
+
+    def _ensure_runtime_sr_model(self) -> tuple[Any | None, bool]:
+        sr_model, sr_model_not_exist = self._get_runtime_sr_model()
+        if sr_model is not None or sr_model_not_exist:
+            return sr_model, sr_model_not_exist
+        with self._project_root_cwd():
+            from GPT_SoVITS.TTS_infer_pack.TTS import AP_BWE, DictToAttrRecursive
+
+        configs = self._get_runtime_configs()
+        try:
+            sr_model = AP_BWE(configs.device, DictToAttrRecursive)
+            sr_model_not_exist = False
+        except FileNotFoundError:
+            sr_model = None
+            sr_model_not_exist = True
+        self._runtime_sr_model = sr_model
+        self._runtime_sr_model_not_exist = bool(sr_model_not_exist)
+        if self._pipeline is not None:
+            setattr(self._pipeline, "sr_model", sr_model)
+            setattr(self._pipeline, "sr_model_not_exist", bool(sr_model_not_exist))
+        return sr_model, bool(sr_model_not_exist)
 
     def _get_runtime_prepare_bert_batch_worker(self) -> Any | None:
         worker = self._runtime_prepare_bert_batch_worker
@@ -2866,6 +3220,11 @@ class GPTSoVITSRuntime:
         pipeline = self._ensure_pipeline()
         return pipeline._load_ref_audio_raw(ref_audio_path)
 
+    def _extract_ref_spec_native(self, ref_audio_path: str) -> tuple[GPTSoVITSReferSpec, Any, int]:
+        raw_audio, raw_sr = self._load_ref_audio_raw(ref_audio_path)
+        refer_spec, _profile = self._extract_ref_spec_from_raw(raw_audio, raw_sr)
+        return refer_spec, raw_audio, int(raw_sr)
+
     def _extract_ref_spec_from_raw(self, raw_audio: Any, raw_sr: int) -> tuple[GPTSoVITSReferSpec, dict[str, float]]:
         pipeline = self._ensure_pipeline()
         with self._project_root_cwd():
@@ -4024,6 +4383,43 @@ class GPTSoVITSRuntime:
             self._release_prepare_split_stage_slot(coordinator)
             raise
 
+    async def _prepare_cpu_stage_with_shared_prompt_async(
+        self,
+        coordinator: Any,
+        spec: GPTSoVITSRequestSpec,
+        *,
+        prepare_submit_at: float,
+        prompt_text: str,
+        prompt_cpu_profiled: GPTSoVITSPrepareProfiledResult,
+    ) -> GPTSoVITSNativePreparedCpuStage:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
+        admission_start = time.perf_counter()
+        admission_stats = await coordinator.acquire_prepare_admission()
+        prepare_admission_wait_ms = max(
+            float(admission_stats.get("wait_ms", 0.0)),
+            (time.perf_counter() - admission_start) * 1000.0,
+        )
+        current_inflight, peak_inflight = coordinator.mark_prepare_enter()
+        prepare_start = time.perf_counter()
+        text = spec.text.strip("\n")
+        try:
+            target_cpu_profiled = await self._run_text_cpu_stage(coordinator, text, spec.text_lang)
+            return GPTSoVITSNativePreparedCpuStage(
+                spec=spec,
+                prepare_submit_at=float(prepare_submit_at),
+                prepare_start=float(prepare_start),
+                prompt_text=prompt_text,
+                text=text,
+                prepare_admission_wait_ms=float(prepare_admission_wait_ms),
+                current_inflight=int(current_inflight),
+                peak_inflight=int(peak_inflight),
+                prompt_cpu_profiled=prompt_cpu_profiled,
+                target_cpu_profiled=target_cpu_profiled,
+            )
+        except Exception:
+            self._release_prepare_split_stage_slot(coordinator)
+            raise
+
     def prepare_request_cpu_stage(
         self,
         request: dict[str, Any],
@@ -4131,6 +4527,248 @@ class GPTSoVITSRuntime:
                 )
             )
         return prepared_cpu_stages
+
+    @staticmethod
+    def _merge_ref_spec_profiled_result(
+        profiled: GPTSoVITSPrepareProfiledResult,
+    ) -> GPTSoVITSPrepareRefSpecResult:
+        refer_spec, profile = profiled.result
+        refer_spec_native = GPTSoVITSRuntime._coerce_refer_spec(refer_spec)
+        merged_profile = dict(profile)
+        merged_profile["ref_spec_wait_ms"] = float(profiled.queue_ms)
+        merged_profile["ref_spec_ms"] = float(profiled.run_ms)
+        return GPTSoVITSPrepareRefSpecResult(
+            refer_spec=refer_spec_native,
+            profile=merged_profile,
+        )
+
+    @staticmethod
+    def _build_shared_prepare_phase_profile(
+        *,
+        prompt_profiled: GPTSoVITSPrepareProfiledResult,
+        target_profiled: GPTSoVITSPrepareProfiledResult,
+        shared_profiled: GPTSoVITSPrepareProfiledResult,
+        shared_ref_spec_result: GPTSoVITSPrepareRefSpecResult | None,
+        phase_kind: str,
+    ) -> dict[str, float]:
+        phase_wall_ms = max(
+            float(prompt_profiled.run_ms),
+            float(target_profiled.run_ms),
+            float(shared_profiled.run_ms),
+        )
+        if phase_kind == "audio" and shared_ref_spec_result is not None:
+            phase_wall_ms = max(
+                phase_wall_ms,
+                float(shared_ref_spec_result.profile.get("ref_spec_ms", 0.0)),
+            )
+        return {
+            f"engine_prepare_{phase_kind}_phase_mode": 2.0,
+            f"engine_prepare_{phase_kind}_phase_wall_ms": float(phase_wall_ms),
+            f"engine_prepare_{phase_kind}_phase_batch_size": 1.0,
+            "engine_prepare_shared_prompt_ref_enabled": 1.0,
+        }
+
+    def _finalize_shared_prepare_results(
+        self,
+        coordinator: Any,
+        outputs: list[tuple[T2SRequestState, float, float] | Exception | None],
+        cpu_stages: list[GPTSoVITSNativePreparedCpuStage | Exception | None],
+    ) -> list[tuple[T2SRequestState, float, float] | Exception]:
+        for index, cpu_stage in enumerate(cpu_stages):
+            if not isinstance(cpu_stage, GPTSoVITSNativePreparedCpuStage):
+                continue
+            if outputs[index] is None:
+                outputs[index] = RuntimeError("shared prepare result missing")
+            self._release_prepare_split_stage_slot(coordinator)
+        return [item if item is not None else RuntimeError("shared prepare result missing") for item in outputs]
+
+    async def _prepare_direct_shared_segments_async(
+        self,
+        coordinator: Any,
+        specs: list[GPTSoVITSRequestSpec],
+    ) -> list[tuple[T2SRequestState, float, float] | Exception]:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
+        if not specs:
+            return []
+
+        shared_spec = specs[0]
+        shared_prompt_text = self._normalize_prepare_sentence(shared_spec.prompt_text, shared_spec.prompt_lang)
+        shared_prompt_cpu_profiled = await self._run_text_cpu_stage(
+            coordinator,
+            shared_prompt_text,
+            shared_spec.prompt_lang,
+        )
+        cpu_stage_results = await asyncio.gather(
+            *[
+                self._prepare_cpu_stage_with_shared_prompt_async(
+                    coordinator,
+                    spec,
+                    prepare_submit_at=time.perf_counter(),
+                    prompt_text=shared_prompt_text,
+                    prompt_cpu_profiled=shared_prompt_cpu_profiled,
+                )
+                for spec in specs
+            ],
+            return_exceptions=True,
+        )
+        outputs: list[tuple[T2SRequestState, float, float] | Exception | None] = [None] * len(specs)
+        runnable: list[tuple[int, GPTSoVITSNativePreparedCpuStage]] = []
+        for index, cpu_stage in enumerate(cpu_stage_results):
+            if isinstance(cpu_stage, Exception):
+                outputs[index] = cpu_stage
+                continue
+            runnable.append((index, cpu_stage))
+
+        if not runnable:
+            return self._finalize_shared_prepare_results(coordinator, outputs, cpu_stage_results)
+
+        try:
+            shared_prompt_g2pw_profiled = await self._run_g2pw_stage(coordinator, shared_prompt_cpu_profiled.result)
+            shared_prompt_feature_profiled = await self._run_text_feature_stage(
+                coordinator,
+                shared_prompt_g2pw_profiled.result,
+                shared_spec.prompt_lang,
+                shared_prompt_cpu_profiled.run_ms,
+                base_profile=dict(shared_prompt_g2pw_profiled.profile or {}),
+            )
+            shared_ref_audio_future = self.preload_ref_audio_asset(
+                str(shared_spec.ref_audio_path),
+                submit_at=time.perf_counter(),
+            )
+            shared_ref_audio_profiled = await self._run_ref_prompt_semantic_stage(
+                coordinator,
+                str(shared_spec.ref_audio_path),
+                prepared_asset_future=shared_ref_audio_future,
+            )
+            shared_ref_spec_profiled = await self._run_ref_spec_stage(
+                coordinator,
+                shared_ref_audio_profiled.result.raw_audio,
+                int(shared_ref_audio_profiled.result.raw_sr),
+            )
+            shared_ref_spec_result = self._merge_ref_spec_profiled_result(shared_ref_spec_profiled)
+        except Exception as exc:
+            for index, _ in runnable:
+                outputs[index] = exc
+            return self._finalize_shared_prepare_results(coordinator, outputs, cpu_stage_results)
+
+        target_g2pw_results = await asyncio.gather(
+            *[
+                self._run_g2pw_stage(coordinator, cpu_stage.target_cpu_profiled.result)
+                for _, cpu_stage in runnable
+            ],
+            return_exceptions=True,
+        )
+        target_feature_tasks: list[asyncio.Task[Any] | Exception] = []
+        for target_g2pw_profiled, (_, cpu_stage) in zip(target_g2pw_results, runnable):
+            if isinstance(target_g2pw_profiled, Exception):
+                target_feature_tasks.append(target_g2pw_profiled)
+                continue
+            target_feature_tasks.append(
+                asyncio.create_task(
+                    self._run_text_feature_stage(
+                        coordinator,
+                        target_g2pw_profiled.result,
+                        cpu_stage.spec.text_lang,
+                        cpu_stage.target_cpu_profiled.run_ms,
+                        base_profile=dict(target_g2pw_profiled.profile or {}),
+                    )
+                )
+            )
+        gathered_target_features = (
+            list(
+                await asyncio.gather(
+                    *[
+                        item
+                        for item in target_feature_tasks
+                        if not isinstance(item, Exception)
+                    ],
+                    return_exceptions=True,
+                )
+            )
+            if any(not isinstance(item, Exception) for item in target_feature_tasks)
+            else []
+        )
+        target_feature_results: list[GPTSoVITSPrepareProfiledResult | Exception] = []
+        gather_index = 0
+        for item in target_feature_tasks:
+            if isinstance(item, Exception):
+                target_feature_results.append(item)
+                continue
+            target_feature_results.append(gathered_target_features[gather_index])
+            gather_index += 1
+
+        for (index, cpu_stage), target_g2pw_profiled, target_feature_profiled in zip(
+            runnable,
+            target_g2pw_results,
+            target_feature_results,
+        ):
+            if isinstance(target_g2pw_profiled, Exception):
+                outputs[index] = target_g2pw_profiled
+                self._release_prepare_split_stage_slot(coordinator)
+                continue
+            if isinstance(target_feature_profiled, Exception):
+                outputs[index] = target_feature_profiled
+                self._release_prepare_split_stage_slot(coordinator)
+                continue
+            phase_one = GPTSoVITSPrepareAudioPhaseData(
+                prompt_g2pw_profiled=shared_prompt_g2pw_profiled,
+                target_g2pw_profiled=target_g2pw_profiled,
+                ref_audio_profiled=shared_ref_audio_profiled,
+                g2pw_pair_ms=max(
+                    float(shared_prompt_g2pw_profiled.run_ms),
+                    float(target_g2pw_profiled.run_ms),
+                ),
+                phase_wall_ms=max(
+                    float(shared_prompt_g2pw_profiled.run_ms),
+                    float(target_g2pw_profiled.run_ms),
+                    float(shared_ref_audio_profiled.run_ms),
+                    float(shared_ref_spec_result.profile.get("ref_spec_ms", 0.0)),
+                ),
+            )
+            phase_two = GPTSoVITSPrepareTextPhaseData(
+                prompt_feature_profiled=shared_prompt_feature_profiled,
+                target_feature_profiled=target_feature_profiled,
+                phase_wall_ms=max(
+                    float(shared_prompt_feature_profiled.run_ms),
+                    float(target_feature_profiled.run_ms),
+                ),
+            )
+            try:
+                state = self._build_request_state_from_prepare_phases(
+                    cpu_stage,
+                    phase_one,
+                    phase_two,
+                    ref_spec_result=shared_ref_spec_result,
+                    extra_profile={
+                        **self._build_shared_prepare_phase_profile(
+                            prompt_profiled=shared_prompt_g2pw_profiled,
+                            target_profiled=target_g2pw_profiled,
+                            shared_profiled=shared_ref_audio_profiled,
+                            shared_ref_spec_result=shared_ref_spec_result,
+                            phase_kind="audio",
+                        ),
+                        **self._build_shared_prepare_phase_profile(
+                            prompt_profiled=shared_prompt_feature_profiled,
+                            target_profiled=target_feature_profiled,
+                            shared_profiled=shared_prompt_feature_profiled,
+                            shared_ref_spec_result=None,
+                            phase_kind="text",
+                        ),
+                        "engine_prepare_audio_phase_batch_size": float(len(runnable)),
+                        "engine_prepare_text_phase_batch_size": float(len(runnable)),
+                    },
+                )
+                outputs[index] = (
+                    state,
+                    float(cpu_stage.prepare_start),
+                    float(time.perf_counter()),
+                )
+            except Exception as exc:
+                outputs[index] = exc
+            finally:
+                self._release_prepare_split_stage_slot(coordinator)
+
+        return [item if item is not None else RuntimeError("shared prepare result missing") for item in outputs]
 
     async def _run_text_feature_stage(
         self,
@@ -5597,8 +6235,8 @@ class GPTSoVITSRuntime:
                 continue
             if not os.path.exists(str(aux_ref_audio_path)):
                 continue
-            aux_spec_audio, aux_audio_16k, _, _ = pipeline.extract_ref_spec(str(aux_ref_audio_path))
-            aux_refer_specs.append((aux_spec_audio, aux_audio_16k))
+            aux_refer_spec, _aux_raw_audio, _aux_raw_sr = self._extract_ref_spec_native(str(aux_ref_audio_path))
+            aux_refer_specs.append((aux_refer_spec.spec_audio, aux_refer_spec.audio_16k))
         raw_audio = ref_audio_bundle.raw_audio
         raw_sr = int(ref_audio_bundle.raw_sr)
         prompt_semantic_ms = float(bundle_profile.get("prompt_semantic_ms", ref_audio_bundle_ms))
@@ -6286,7 +6924,9 @@ class GPTSoVITSRuntime:
         }
 
     def _resolve_vocoder_runtime_config(self, pipeline: Any) -> dict[str, int]:
-        version = str(getattr(self._get_runtime_configs(), "version", "") or "")
+        version = str(getattr(getattr(pipeline, "configs", None), "version", "") or "")
+        if not version:
+            version = str(getattr(self._get_runtime_configs(), "version", "") or "")
         config = self._default_vocoder_runtime_config(version)
         configured = dict(getattr(pipeline, "vocoder_configs", {}) or {})
         for key, default_value in config.items():
@@ -7104,9 +7744,7 @@ class GPTSoVITSRuntime:
         audio = torch.cat(fragment_tensors, dim=0) if fragment_tensors else torch.zeros((0,), dtype=torch.float32, device=device)
 
         if super_sampling:
-            pipeline.init_sr_model()
-            self._bind_pipeline_components(pipeline)
-            sr_model, sr_model_not_exist = self._get_runtime_sr_model()
+            sr_model, sr_model_not_exist = self._ensure_runtime_sr_model()
             if not sr_model_not_exist and sr_model is not None:
                 audio, sr = sr_model(audio.unsqueeze(0), sr)
                 max_audio = float(torch.abs(audio).max().item()) if isinstance(audio, torch.Tensor) and audio.numel() > 0 else 0.0

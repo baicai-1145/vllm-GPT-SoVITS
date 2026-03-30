@@ -103,9 +103,372 @@ class AsyncStageGate:
             }
 
 
+class RuntimePrepareCoordinatorAdapter:
+    def __init__(self, tts: Any, runtime_owner: Any):
+        self.tts = tts
+        self.runtime_owner = runtime_owner
+
+    def _native(self) -> Any:
+        return self.runtime_owner._ensure_prepare_coordinator()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._native(), name)
+
+    def snapshot(self) -> Dict[str, Any]:
+        coordinator = self._native()
+        runtime_state = getattr(self.tts, "snapshot_prepare_runtime_components", lambda: None)()
+        g2pw_state = runtime_state.get("g2pw") if isinstance(runtime_state, dict) else None
+        g2pw_runtime_workers = None
+        if isinstance(g2pw_state, dict):
+            worker_count = g2pw_state.get("worker_count")
+            try:
+                if worker_count is not None:
+                    g2pw_runtime_workers = max(1, int(worker_count))
+            except Exception:
+                g2pw_runtime_workers = None
+
+        def _executor_workers(executor: Any) -> int:
+            max_workers = getattr(executor, "_max_workers", 0)
+            try:
+                return max(0, int(max_workers or 0))
+            except Exception:
+                return 0
+
+        def _gate_snapshot(gate: Any) -> Dict[str, float]:
+            if hasattr(gate, "snapshot"):
+                try:
+                    return dict(gate.snapshot())
+                except Exception:
+                    return {}
+            return {}
+
+        cache = dict(getattr(coordinator, "ref_audio_asset_cache", {}) or {})
+        inflight = dict(getattr(coordinator, "ref_audio_asset_inflight", {}) or {})
+        return {
+            "inflight": int(getattr(coordinator, "inflight", 0) or 0),
+            "peak_inflight": int(getattr(coordinator, "peak_inflight", 0) or 0),
+            "max_inflight": int(getattr(getattr(coordinator, "inflight_gate", None), "max_inflight", 0) or 0),
+            "text_feature_workers": int(_executor_workers(getattr(coordinator, "text_feature_executor", None))),
+            "g2pw_workers": int(_executor_workers(getattr(coordinator, "g2pw_executor", None))),
+            "g2pw_runtime_workers": None if g2pw_runtime_workers is None else int(g2pw_runtime_workers),
+            "ref_audio_workers": int(_executor_workers(getattr(coordinator, "ref_audio_executor", None))),
+            "ref_audio_asset_cache": {
+                "ttl_sec": float(getattr(coordinator, "ref_audio_asset_cache_ttl_sec", 0.0) or 0.0),
+                "max_entries": int(getattr(coordinator, "ref_audio_asset_cache_max_entries", 0) or 0),
+                "cached_entries": int(len(cache)),
+                "inflight_entries": int(len(inflight)),
+            },
+            "prepare_runtime_state": runtime_state,
+            "prepare_stage_gates": {
+                "text_cpu": _gate_snapshot(getattr(coordinator, "text_cpu_gate", None)),
+                "g2pw": _gate_snapshot(getattr(coordinator, "g2pw_gate", None)),
+                "text_feature": _gate_snapshot(getattr(coordinator, "text_feature_gate", None)),
+                "ref_audio": _gate_snapshot(getattr(coordinator, "ref_audio_gate", None)),
+                "ref_load": _gate_snapshot(getattr(coordinator, "ref_load_gate", None)),
+                "ref_spec": _gate_snapshot(getattr(coordinator, "ref_spec_gate", None)),
+            },
+        }
+
+    @staticmethod
+    def _phase_one_to_dict(phase_one: Any) -> Dict[str, Any]:
+        if isinstance(phase_one, dict):
+            return dict(phase_one)
+        return {
+            "prompt_g2pw_profiled": getattr(phase_one, "prompt_g2pw_profiled"),
+            "target_g2pw_profiled": getattr(phase_one, "target_g2pw_profiled"),
+            "ref_audio_profiled": getattr(phase_one, "ref_audio_profiled"),
+            "ref_spec_result": None,
+            "g2pw_pair_ms": float(getattr(phase_one, "g2pw_pair_ms", 0.0) or 0.0),
+            "phase_wall_ms": float(getattr(phase_one, "phase_wall_ms", 0.0) or 0.0),
+        }
+
+    @staticmethod
+    def _phase_two_to_dict(phase_two: Any) -> Dict[str, Any]:
+        if isinstance(phase_two, dict):
+            return dict(phase_two)
+        return {
+            "prompt_feature_profiled": getattr(phase_two, "prompt_feature_profiled"),
+            "target_feature_profiled": getattr(phase_two, "target_feature_profiled"),
+            "phase_wall_ms": float(getattr(phase_two, "phase_wall_ms", 0.0) or 0.0),
+        }
+
+    def _phase_one_to_native(self, phase_one: Any) -> tuple[Any, Any]:
+        if not isinstance(phase_one, dict):
+            return phase_one, None
+        with self.runtime_owner._project_root_cwd():
+            from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSPrepareAudioPhaseData
+
+        return (
+            GPTSoVITSPrepareAudioPhaseData(
+                prompt_g2pw_profiled=phase_one["prompt_g2pw_profiled"],
+                target_g2pw_profiled=phase_one["target_g2pw_profiled"],
+                ref_audio_profiled=phase_one["ref_audio_profiled"],
+                g2pw_pair_ms=float(phase_one.get("g2pw_pair_ms", 0.0) or 0.0),
+                phase_wall_ms=float(phase_one.get("phase_wall_ms", 0.0) or 0.0),
+            ),
+            phase_one.get("ref_spec_result"),
+        )
+
+    def _phase_two_to_native(self, phase_two: Any) -> Any:
+        if not isinstance(phase_two, dict):
+            return phase_two
+        with self.runtime_owner._project_root_cwd():
+            from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSPrepareTextPhaseData
+
+        return GPTSoVITSPrepareTextPhaseData(
+            prompt_feature_profiled=phase_two["prompt_feature_profiled"],
+            target_feature_profiled=phase_two["target_feature_profiled"],
+            phase_wall_ms=float(phase_two.get("phase_wall_ms", 0.0) or 0.0),
+        )
+
+    async def prepare_cpu_stage_profiled_async(
+        self,
+        spec: SchedulerRequestSpec,
+        prepare_submit_at: float,
+    ) -> Any:
+        return await self.runtime_owner._prepare_cpu_stage_async(
+            self.runtime_owner._ensure_prepare_coordinator(),
+            spec,
+            prepare_submit_at=prepare_submit_at,
+        )
+
+    async def prepare_gpu_audio_phases_async(
+        self,
+        cpu_stages: list[Any],
+        prepared_ref_audio_futures: list[concurrent.futures.Future | None] | None = None,
+    ) -> list[Dict[str, Any] | Exception]:
+        if not cpu_stages:
+            return []
+        coordinator = self.runtime_owner._ensure_prepare_coordinator()
+        if prepared_ref_audio_futures is not None:
+            for cpu_stage, prepared_ref_audio_future in zip(cpu_stages, prepared_ref_audio_futures):
+                if prepared_ref_audio_future is not None and hasattr(cpu_stage, "ref_audio_prepare_future"):
+                    setattr(cpu_stage, "ref_audio_prepare_future", prepared_ref_audio_future)
+        if coordinator.enable_g2pw_audio_batch_merge and len(cpu_stages) > 1:
+            phase_ones = await self.runtime_owner._prepare_gpu_audio_phase_batch_async(coordinator, cpu_stages)
+            return [self._phase_one_to_dict(phase_one) if not isinstance(phase_one, Exception) else phase_one for phase_one in phase_ones]
+        phase_ones = await asyncio.gather(
+            *[
+                self.runtime_owner._prepare_gpu_audio_phase_async(coordinator, cpu_stage)
+                for cpu_stage in cpu_stages
+            ],
+            return_exceptions=True,
+        )
+        return [self._phase_one_to_dict(phase_one) if not isinstance(phase_one, Exception) else phase_one for phase_one in phase_ones]
+
+    async def prepare_gpu_text_phases_async(
+        self,
+        items: list[tuple[Any, Dict[str, Any]]],
+    ) -> list[Dict[str, Any] | Exception]:
+        if not items:
+            return []
+        coordinator = self.runtime_owner._ensure_prepare_coordinator()
+        with self.runtime_owner._project_root_cwd():
+            from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSPreparedAudioPhase
+
+        phase_twos = await asyncio.gather(
+            *[
+                self.runtime_owner._prepare_gpu_text_phase_async(
+                    coordinator,
+                    GPTSoVITSPreparedAudioPhase(
+                        request_id=str(getattr(cpu_stage, "request_id", getattr(getattr(cpu_stage, "spec", None), "request_id", ""))),
+                        prepared_cpu_stage=cpu_stage,
+                        phase_one=self._phase_one_to_native(phase_one)[0],
+                    ),
+                )
+                for cpu_stage, phase_one in items
+            ],
+            return_exceptions=True,
+        )
+        return [self._phase_two_to_dict(phase_two) if not isinstance(phase_two, Exception) else phase_two for phase_two in phase_twos]
+
+    async def prepare_ref_spec_stages_async(
+        self,
+        phase_ones: list[Dict[str, Any]],
+    ) -> list[tuple[tuple[Any, Any], Dict[str, float]] | Exception]:
+        if not phase_ones:
+            return []
+        coordinator = self.runtime_owner._ensure_prepare_coordinator()
+
+        async def _one(phase_one: Dict[str, Any]):
+            ref_audio_profiled = phase_one["ref_audio_profiled"]
+            raw_audio = ref_audio_profiled.result.raw_audio
+            raw_sr = int(ref_audio_profiled.result.raw_sr)
+            profiled = await self.runtime_owner._run_ref_spec_stage(coordinator, raw_audio, raw_sr)
+            refer_spec_raw, profile = profiled.result
+            refer_spec = self.runtime_owner._coerce_refer_spec(refer_spec_raw)
+            merged_profile = dict(profile)
+            merged_profile["ref_spec_wait_ms"] = float(profiled.queue_ms)
+            merged_profile["ref_spec_ms"] = float(profiled.run_ms)
+            return (refer_spec.spec_audio, refer_spec.audio_16k), merged_profile
+
+        return list(await asyncio.gather(*[_one(phase_one) for phase_one in phase_ones], return_exceptions=True))
+
+    def apply_ref_spec_result_to_state(
+        self,
+        state: T2SRequestState,
+        ref_spec_result: tuple[tuple[Any, Any], Dict[str, float]],
+    ) -> None:
+        refer_spec, profile = ref_spec_result
+        state.refer_spec = refer_spec
+        state.prepare_profile["ref_spec_wait_ms"] = float(profile.get("ref_spec_wait_ms", 0.0))
+        state.prepare_profile["ref_spec_ms"] = float(profile.get("ref_spec_ms", 0.0))
+        state.prepare_profile["ref_spec_to_device_ms"] = float(profile.get("ref_spec_to_device_ms", 0.0))
+        state.prepare_profile["ref_spec_main_resample_ms"] = float(profile.get("ref_spec_main_resample_ms", 0.0))
+        state.prepare_profile["ref_spec_norm_ms"] = float(profile.get("ref_spec_norm_ms", 0.0))
+        state.prepare_profile["ref_spec_spectrogram_ms"] = float(profile.get("ref_spec_spectrogram_ms", 0.0))
+        state.prepare_profile["ref_spec_post_resample_ms"] = float(profile.get("ref_spec_post_resample_ms", 0.0))
+
+    def build_gpu_prepare_result_from_phases(
+        self,
+        cpu_stage: Any,
+        phase_one: Dict[str, Any],
+        phase_two: Dict[str, Any],
+        extra_profile: Dict[str, float] | None = None,
+    ) -> tuple[T2SRequestState, float, float]:
+        coordinator = self.runtime_owner._ensure_prepare_coordinator()
+        native_phase_one, ref_spec_result = self._phase_one_to_native(phase_one)
+        native_phase_two = self._phase_two_to_native(phase_two)
+        try:
+            state = self.runtime_owner._build_request_state_from_prepare_phases(
+                cpu_stage,
+                native_phase_one,
+                native_phase_two,
+                ref_spec_result=ref_spec_result,
+                extra_profile=extra_profile,
+            )
+        finally:
+            self.runtime_owner._release_prepare_split_stage_slot(coordinator)
+        prepare_exec_finished_at = time.perf_counter()
+        return state, float(cpu_stage.prepare_start), float(prepare_exec_finished_at)
+
+    async def prepare_gpu_stage_profiled_async(
+        self,
+        cpu_stage: Any,
+    ) -> tuple[T2SRequestState, float, float]:
+        try:
+            phase_one = (await self.prepare_gpu_audio_phases_async([cpu_stage]))[0]
+            if isinstance(phase_one, Exception):
+                raise phase_one
+            phase_two = (await self.prepare_gpu_text_phases_async([(cpu_stage, phase_one)]))[0]
+            if isinstance(phase_two, Exception):
+                raise phase_two
+            return self.build_gpu_prepare_result_from_phases(
+                cpu_stage,
+                phase_one,
+                phase_two,
+                extra_profile={
+                    "engine_prepare_audio_phase_mode": 0.0,
+                    "engine_prepare_audio_phase_wall_ms": float(phase_one.get("phase_wall_ms", 0.0)),
+                    "engine_prepare_audio_phase_batch_size": 1.0,
+                    "engine_prepare_text_phase_wall_ms": float(phase_two.get("phase_wall_ms", 0.0)),
+                    "engine_prepare_text_phase_batch_size": 1.0,
+                },
+            )
+        except Exception:
+            self.runtime_owner._release_prepare_split_stage_slot(self.runtime_owner._ensure_prepare_coordinator())
+            raise
+
+    async def prepare_gpu_stages_profiled_async(
+        self,
+        cpu_stages: list[Any],
+    ) -> list[tuple[T2SRequestState, float, float] | Exception]:
+        if not cpu_stages:
+            return []
+        phase_ones = await self.prepare_gpu_audio_phases_async(cpu_stages)
+        items: list[tuple[Any, Dict[str, Any]]] = []
+        outputs: list[tuple[T2SRequestState, float, float] | Exception | None] = [None] * len(cpu_stages)
+        for index, (cpu_stage, phase_one) in enumerate(zip(cpu_stages, phase_ones)):
+            if isinstance(phase_one, Exception):
+                outputs[index] = phase_one
+                self.runtime_owner._release_prepare_split_stage_slot(self.runtime_owner._ensure_prepare_coordinator())
+                continue
+            items.append((cpu_stage, phase_one))
+        phase_twos = await self.prepare_gpu_text_phases_async(items)
+        item_iter = iter(items)
+        for index, phase_one in enumerate(phase_ones):
+            if isinstance(phase_one, Exception):
+                continue
+            cpu_stage, phase_one_dict = next(item_iter)
+            phase_two = phase_twos.pop(0)
+            if isinstance(phase_two, Exception):
+                outputs[index] = phase_two
+                self.runtime_owner._release_prepare_split_stage_slot(self.runtime_owner._ensure_prepare_coordinator())
+                continue
+            try:
+                outputs[index] = self.build_gpu_prepare_result_from_phases(
+                    cpu_stage,
+                    phase_one_dict,
+                    phase_two,
+                    extra_profile={
+                        "engine_prepare_audio_phase_mode": 1.0,
+                        "engine_prepare_audio_phase_wall_ms": float(phase_one_dict.get("phase_wall_ms", 0.0)),
+                        "engine_prepare_audio_phase_batch_size": float(len(cpu_stages)),
+                        "engine_prepare_text_phase_wall_ms": float(phase_two.get("phase_wall_ms", 0.0)),
+                        "engine_prepare_text_phase_batch_size": float(len(items)),
+                    },
+                )
+            except Exception as exc:  # noqa: PERF203
+                outputs[index] = exc
+        return [item if item is not None else RuntimeError("prepare batch result missing") for item in outputs]
+
+    async def prepare_state_profiled_async(
+        self,
+        spec: SchedulerRequestSpec,
+        prepare_submit_at: float,
+    ) -> tuple[T2SRequestState, float, float]:
+        cpu_stage = await self.prepare_cpu_stage_profiled_async(spec, prepare_submit_at)
+        return await self.prepare_gpu_stage_profiled_async(cpu_stage)
+
+    async def prepare_direct_shared_segments_profiled_async(
+        self,
+        specs: list[SchedulerRequestSpec],
+    ) -> list[tuple[T2SRequestState, float, float] | Exception]:
+        if not specs:
+            return []
+        native_shared_prepare = getattr(self.runtime_owner, "_prepare_direct_shared_segments_async", None)
+        if callable(native_shared_prepare):
+            return await native_shared_prepare(
+                self.runtime_owner._ensure_prepare_coordinator(),
+                specs,
+            )
+        return list(
+            await asyncio.gather(
+                *[
+                    self.prepare_state_profiled_async(spec, time.perf_counter())
+                    for spec in specs
+                ],
+                return_exceptions=True,
+            )
+        )
+
+    def submit_prepare_ref_audio_asset(
+        self,
+        ref_audio_path: str,
+        *,
+        submit_at: float | None = None,
+    ) -> concurrent.futures.Future:
+        return self.runtime_owner.preload_ref_audio_asset(ref_audio_path, submit_at=submit_at)
+
+
+def build_prepare_coordinator(tts: Any) -> Any:
+    runtime_owner = getattr(tts, "_vllm_runtime_owner", None)
+    if runtime_owner is not None and callable(getattr(tts, "_vllm_runtime_prepare_coordinator_factory", None)):
+        return RuntimePrepareCoordinatorAdapter(tts, runtime_owner)
+    return PrepareCoordinator(tts)
+
+
 class PrepareCoordinator:
     @staticmethod
-    def _detect_g2pw_runtime_workers(tts: Any) -> int | None:
+    def _resolve_prepare_runtime_state(tts: Any) -> dict | None:
+        state_provider = getattr(tts, "_vllm_runtime_prepare_state_provider", None)
+        if callable(state_provider):
+            try:
+                runtime_state = state_provider()
+            except Exception:
+                runtime_state = None
+            if isinstance(runtime_state, dict):
+                return runtime_state
         snapshot_fn = getattr(tts, "snapshot_prepare_runtime_components", None)
         if not callable(snapshot_fn):
             return None
@@ -113,7 +476,12 @@ class PrepareCoordinator:
             runtime_state = snapshot_fn()
         except Exception:
             return None
-        if not isinstance(runtime_state, dict):
+        return runtime_state if isinstance(runtime_state, dict) else None
+
+    @staticmethod
+    def _detect_g2pw_runtime_workers(tts: Any) -> int | None:
+        runtime_state = PrepareCoordinator._resolve_prepare_runtime_state(tts)
+        if runtime_state is None:
             return None
         g2pw_state = runtime_state.get("g2pw")
         if not isinstance(g2pw_state, dict):
@@ -259,12 +627,7 @@ class PrepareCoordinator:
                 "cached_entries": int(len(self.ref_audio_asset_cache)),
                 "inflight_entries": int(len(self.ref_audio_asset_inflight)),
             }
-        runtime_snapshot_fn = getattr(self.tts, "snapshot_prepare_runtime_components", None)
-        if callable(runtime_snapshot_fn):
-            try:
-                snapshot["prepare_runtime_state"] = runtime_snapshot_fn()
-            except Exception:
-                snapshot["prepare_runtime_state"] = None
+        snapshot["prepare_runtime_state"] = self._resolve_prepare_runtime_state(self.tts)
         snapshot["prepare_stage_gates"] = {
             "text_cpu": self.text_cpu_gate.snapshot(),
             "g2pw": self.g2pw_gate.snapshot(),

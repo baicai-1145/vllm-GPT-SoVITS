@@ -36,5 +36,6 @@ Removed from the native runtime copy:
 - training scripts
 - dataset preparation scripts
 - ONNX / TorchScript export scripts
+- legacy `unified_engine*.py` scheduler stack that is not part of the current vLLM-native runtime path
 - duplicated vendored root under `/root/vllm-omni/third_party/GPT-SoVITS`
 - obvious non-runtime BigVGAN files such as `train.py`, `tests/`, `README.md`

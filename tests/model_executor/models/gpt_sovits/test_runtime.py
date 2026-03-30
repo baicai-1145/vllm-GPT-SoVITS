@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import importlib
 import json
@@ -53,7 +54,26 @@ _GPT_SOVITS_S1_V3 = _GPT_SOVITS_PROJECT_ROOT / "GPT_SoVITS" / "pretrained_models
 _GPT_SOVITS_V2PROPLUS = (
     _GPT_SOVITS_PROJECT_ROOT / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2ProPlus.pth"
 )
-_G2PW_CU_RUNTIME_CONFIG = _REPO_ROOT / ".artifacts" / "tts_infer_v2proplus_cpu_longprompt.yaml"
+_G2PW_CU_RUNTIME_CONFIG = (
+    _REPO_ROOT
+    / "tests"
+    / "model_executor"
+    / "models"
+    / "gpt_sovits"
+    / "fixtures"
+    / "tts_infer_v2proplus_cpu_longprompt.yaml"
+)
+_VENDORED_GPT_SOVITS_RUNTIME_ROOT = (
+    _REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "gpt_sovits" / "runtime_lib"
+)
+
+
+def _ensure_vendored_gpt_sovits_import_path() -> None:
+    runtime_root = str(_VENDORED_GPT_SOVITS_RUNTIME_ROOT)
+    package_root = str(_VENDORED_GPT_SOVITS_RUNTIME_ROOT / "GPT_SoVITS")
+    for candidate in (runtime_root, package_root):
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
 
 
 def _has_g2pw_cuda_runtime_test_assets() -> bool:
@@ -215,6 +235,42 @@ def test_bind_pipeline_components_exposes_runtime_owned_refs(tmp_path):
     assert runtime._is_runtime_v2pro() is True
 
 
+def test_install_runtime_prepare_components_rebinds_pipeline_ownership(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    pipeline = SimpleNamespace(
+        _prewarm_g2pw_runtime=Mock(),
+        _prewarm_prepare_ref_runtime=Mock(),
+    )
+    runtime._build_runtime_prepare_bert_batch_worker = Mock(return_value="bert-worker")  # type: ignore[method-assign]
+    runtime._build_runtime_prepare_ref_semantic_batch_worker = Mock(return_value="ref-worker")  # type: ignore[method-assign]
+    runtime._build_runtime_text_preprocessor = Mock(return_value="text-preprocessor")  # type: ignore[method-assign]
+    runtime._build_runtime_prepare_g2pw_batch_worker = Mock(return_value="g2pw-worker")  # type: ignore[method-assign]
+    runtime._build_runtime_prepare_text_cpu_worker = Mock(return_value="text-cpu-worker")  # type: ignore[method-assign]
+
+    runtime._install_runtime_prepare_components(pipeline)
+
+    runtime._build_runtime_prepare_bert_batch_worker.assert_called_once_with(pipeline)
+    runtime._build_runtime_prepare_ref_semantic_batch_worker.assert_called_once_with(pipeline)
+    runtime._build_runtime_text_preprocessor.assert_called_once_with(pipeline, "bert-worker")
+    runtime._build_runtime_prepare_g2pw_batch_worker.assert_called_once_with(pipeline)
+    runtime._build_runtime_prepare_text_cpu_worker.assert_called_once_with(pipeline)
+    assert pipeline.prepare_bert_batch_worker == "bert-worker"
+    assert pipeline.prepare_ref_semantic_batch_worker == "ref-worker"
+    assert pipeline.text_preprocessor == "text-preprocessor"
+    assert pipeline.prepare_g2pw_batch_worker == "g2pw-worker"
+    assert pipeline.prepare_text_cpu_worker == "text-cpu-worker"
+    assert callable(pipeline._vllm_runtime_prepare_state_provider)
+    assert callable(pipeline._vllm_runtime_prepare_coordinator_factory)
+    assert callable(pipeline._vllm_runtime_refresh_prepare_components)
+    assert callable(pipeline.refresh_runtime_components)
+    assert callable(pipeline.snapshot_prepare_runtime_components)
+    assert pipeline.snapshot_prepare_runtime_components() == pipeline._vllm_runtime_prepare_state_provider()
+    assert pipeline._vllm_runtime_prepare_generation == 1
+    assert pipeline._vllm_runtime_owned_prepare_components is True
+    pipeline._prewarm_g2pw_runtime.assert_called_once_with()
+    pipeline._prewarm_prepare_ref_runtime.assert_called_once_with()
+
+
 def test_ensure_native_runtime_deps_skips_global_preload_by_default(tmp_path, monkeypatch):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     preload = Mock()
@@ -225,6 +281,334 @@ def test_ensure_native_runtime_deps_skips_global_preload_by_default(tmp_path, mo
 
     preload.assert_not_called()
     assert runtime._native_runtime_ready is True
+
+
+def test_temporary_env_override_restores_previous_value(tmp_path, monkeypatch):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    monkeypatch.setenv("GPTSOVITS_RUNTIME_SKIP_PREPARE_COMPONENTS", "old")
+
+    with runtime._temporary_env_override("GPTSOVITS_RUNTIME_SKIP_PREPARE_COMPONENTS", "1"):
+        assert os.environ["GPTSOVITS_RUNTIME_SKIP_PREPARE_COMPONENTS"] == "1"
+
+    assert os.environ["GPTSOVITS_RUNTIME_SKIP_PREPARE_COMPONENTS"] == "old"
+
+
+def test_ensure_pipeline_skips_legacy_tts_refresh_during_runtime_owned_bootstrap(tmp_path, monkeypatch):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    refresh_calls: list[str] = []
+
+    gpt_pkg = ModuleType("GPT_SoVITS")
+    infer_pkg = ModuleType("GPT_SoVITS.TTS_infer_pack")
+    tts_module = ModuleType("GPT_SoVITS.TTS_infer_pack.TTS")
+
+    class DummyConfig:
+        def __init__(self, config_path):
+            self.config_path = config_path
+
+    class DummyTTS:
+        def __init__(self, configs):
+            self.received_configs = configs
+            self.configs = SimpleNamespace(device="cpu", version="v2", is_half=False)
+            self.precision = torch.float16
+            self.is_v2pro = True
+            self.t2s_model = SimpleNamespace(model=None)
+            self.vits_model = None
+            self.bert_tokenizer = None
+            self.bert_model = None
+            self.cnhuhbert_model = None
+            self.vocoder = None
+            self.sv_model = None
+            self.sr_model = None
+            self.sr_model_not_exist = False
+            self.prepare_text_cpu_workers = 1
+            self.prepare_bert_stage_limiter = None
+            self.prepare_ref_semantic_stage_limiter = None
+            self.refresh_runtime_components()
+
+        def refresh_runtime_components(self):
+            refresh_calls.append("refresh")
+
+    tts_module.TTS = DummyTTS
+    tts_module.TTS_Config = DummyConfig
+    monkeypatch.setitem(sys.modules, "GPT_SoVITS", gpt_pkg)
+    monkeypatch.setitem(sys.modules, "GPT_SoVITS.TTS_infer_pack", infer_pkg)
+    monkeypatch.setitem(sys.modules, "GPT_SoVITS.TTS_infer_pack.TTS", tts_module)
+    monkeypatch.setattr(runtime, "_ensure_import_path", lambda: None)
+    monkeypatch.setattr(runtime, "_ensure_native_runtime_deps", lambda: None)
+    install_ref_audio_loader = Mock()
+    install_sv_half_safe_patch = Mock()
+    install_runtime_prepare_components = Mock()
+    bind_pipeline_components = Mock()
+    monkeypatch.setattr(runtime, "_install_ref_audio_loader_fallback", install_ref_audio_loader)
+    monkeypatch.setattr(runtime, "_install_sv_half_safe_patch", install_sv_half_safe_patch)
+    monkeypatch.setattr(runtime, "_install_runtime_prepare_components", install_runtime_prepare_components)
+    monkeypatch.setattr(runtime, "_bind_pipeline_components", bind_pipeline_components)
+
+    pipeline = runtime._ensure_pipeline()
+
+    assert isinstance(pipeline, DummyTTS)
+    assert refresh_calls == []
+    assert getattr(pipeline, "runtime_prepare_components_deferred", False) is True
+    install_ref_audio_loader.assert_called_once_with(pipeline)
+    install_sv_half_safe_patch.assert_called_once_with(pipeline)
+    install_runtime_prepare_components.assert_called_once_with(pipeline)
+    bind_pipeline_components.assert_called_once_with(pipeline)
+
+
+def test_refresh_runtime_prepare_components_reinstalls_runtime_owned_components_and_resets_coordinator(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    pipeline = SimpleNamespace()
+    runtime._prepare_coordinator = object()
+    refresh_kv = Mock()
+    install_prepare = Mock()
+    bind_components = Mock()
+    runtime._refresh_runtime_t2s_kv_cache_pool_state = refresh_kv  # type: ignore[method-assign]
+    runtime._install_runtime_prepare_components = install_prepare  # type: ignore[method-assign]
+    runtime._bind_pipeline_components = bind_components  # type: ignore[method-assign]
+
+    runtime._refresh_runtime_prepare_components(pipeline)
+
+    refresh_kv.assert_called_once_with(pipeline)
+    install_prepare.assert_called_once_with(pipeline)
+    bind_components.assert_called_once_with(pipeline)
+    assert runtime._prepare_coordinator is None
+
+
+def test_build_prepare_coordinator_prefers_runtime_native_factory(tmp_path):
+    _ensure_vendored_gpt_sovits_import_path()
+    from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.TTS_infer_pack.prepare_coordinator import (
+        RuntimePrepareCoordinatorAdapter,
+        build_prepare_coordinator,
+    )
+
+    native = SimpleNamespace(
+        inflight=1,
+        peak_inflight=2,
+        inflight_gate=SimpleNamespace(max_inflight=3),
+        text_feature_executor=None,
+        g2pw_executor=None,
+        ref_audio_executor=None,
+        ref_audio_asset_cache={},
+        ref_audio_asset_inflight={},
+    )
+    runtime_owner = SimpleNamespace(
+        _ensure_prepare_coordinator=Mock(return_value=native),
+    )
+    tts = SimpleNamespace(
+        _vllm_runtime_owner=runtime_owner,
+        _vllm_runtime_prepare_coordinator_factory=Mock(return_value=object()),
+        snapshot_prepare_runtime_components=Mock(return_value={"g2pw": {"worker_count": 2}}),
+    )
+
+    coordinator = build_prepare_coordinator(tts)
+
+    assert isinstance(coordinator, RuntimePrepareCoordinatorAdapter)
+    assert coordinator.runtime_owner is runtime_owner
+    assert coordinator.snapshot()["max_inflight"] == 3
+    runtime_owner._ensure_prepare_coordinator.assert_called_once_with()
+    tts._vllm_runtime_prepare_coordinator_factory.assert_not_called()
+
+
+def test_build_prepare_coordinator_falls_back_to_legacy_prepare_coordinator(tmp_path):
+    _ensure_vendored_gpt_sovits_import_path()
+    from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.TTS_infer_pack.prepare_coordinator import (
+        PrepareCoordinator,
+        build_prepare_coordinator,
+    )
+
+    tts = SimpleNamespace(
+        prepare_bert_batch_worker=None,
+        prepare_text_cpu_workers=1,
+    )
+
+    coordinator = build_prepare_coordinator(tts)
+
+    try:
+        assert isinstance(coordinator, PrepareCoordinator)
+    finally:
+        if coordinator.text_feature_executor is not None:
+            coordinator.text_feature_executor.shutdown(wait=True, cancel_futures=True)
+        if coordinator.g2pw_executor is not None:
+            coordinator.g2pw_executor.shutdown(wait=True, cancel_futures=True)
+        if coordinator.ref_audio_executor is not None:
+            coordinator.ref_audio_executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_install_runtime_prepare_components_rebinds_pipeline_refresh_method_to_runtime_callback(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    refresh_prepare = Mock()
+    runtime._refresh_runtime_prepare_components = refresh_prepare  # type: ignore[method-assign]
+    pipeline = SimpleNamespace(
+        _prewarm_g2pw_runtime=Mock(),
+        _prewarm_prepare_ref_runtime=Mock(),
+    )
+    runtime._build_runtime_prepare_bert_batch_worker = Mock(return_value=None)  # type: ignore[method-assign]
+    runtime._build_runtime_prepare_ref_semantic_batch_worker = Mock(return_value=None)  # type: ignore[method-assign]
+    runtime._build_runtime_text_preprocessor = Mock(return_value=None)  # type: ignore[method-assign]
+    runtime._build_runtime_prepare_g2pw_batch_worker = Mock(return_value=None)  # type: ignore[method-assign]
+    runtime._build_runtime_prepare_text_cpu_worker = Mock(return_value=None)  # type: ignore[method-assign]
+
+    runtime._install_runtime_prepare_components(pipeline)
+    pipeline.refresh_runtime_components()
+
+    refresh_prepare.assert_called_once_with(pipeline)
+
+
+def test_scheduler_prepare_coordinator_prefers_runtime_native_factory_and_rebuilds_on_generation_change(tmp_path):
+    _ensure_vendored_gpt_sovits_import_path()
+    from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import RuntimePrepareCoordinatorAdapter
+    from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.TTS_infer_pack.t2s_scheduler import (
+        _get_scheduler_prepare_coordinator,
+    )
+
+    runtime_owner = SimpleNamespace(_ensure_prepare_coordinator=Mock())
+    tts = SimpleNamespace(
+        _vllm_runtime_owner=runtime_owner,
+        _vllm_runtime_prepare_generation=1,
+        _vllm_runtime_prepare_coordinator_factory=Mock(return_value=object()),
+    )
+
+    coordinator_v1 = _get_scheduler_prepare_coordinator(tts)
+    assert isinstance(coordinator_v1, RuntimePrepareCoordinatorAdapter)
+    assert _get_scheduler_prepare_coordinator(tts) is coordinator_v1
+    tts._vllm_runtime_prepare_generation = 2
+    coordinator_v2 = _get_scheduler_prepare_coordinator(tts)
+    assert isinstance(coordinator_v2, RuntimePrepareCoordinatorAdapter)
+    assert coordinator_v2 is not coordinator_v1
+    runtime_owner._ensure_prepare_coordinator.assert_not_called()
+    tts._vllm_runtime_prepare_coordinator_factory.assert_not_called()
+
+
+def test_scheduler_prepare_request_state_uses_coordinator_automatically_for_runtime_owned_tts(tmp_path, monkeypatch):
+    _ensure_vendored_gpt_sovits_import_path()
+    from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.TTS_infer_pack import (
+        t2s_scheduler as scheduler,
+    )
+
+    expected_state = object()
+    coordinator = SimpleNamespace(
+        prepare_state_profiled_async=Mock(return_value="coro"),
+    )
+    monkeypatch.setattr(scheduler, "_prepare_request_state_legacy", Mock(side_effect=AssertionError("legacy path")))
+    monkeypatch.setattr(scheduler, "_get_scheduler_prepare_coordinator", Mock(return_value=coordinator))
+    monkeypatch.setattr(scheduler, "_run_coro_sync", Mock(return_value=(expected_state, 0.0, 0.0)))
+    monkeypatch.delenv("GPTSOVITS_PREPARE_SCHEDULER_USE_COORDINATOR", raising=False)
+    tts = SimpleNamespace(
+        _vllm_runtime_prepare_coordinator_factory=Mock(return_value=object()),
+    )
+    spec = SimpleNamespace()
+
+    state = scheduler.prepare_request_state(tts, spec)
+
+    assert state is expected_state
+    scheduler._get_scheduler_prepare_coordinator.assert_called_once_with(tts)
+    coordinator.prepare_state_profiled_async.assert_called_once()
+
+
+def test_runtime_prepare_coordinator_adapter_prepare_state_profiled_async_uses_runtime_native_path(tmp_path):
+    _ensure_vendored_gpt_sovits_import_path()
+    from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import RuntimePrepareCoordinatorAdapter
+
+    @contextmanager
+    def _noop_project_root_cwd():
+        yield
+
+    native_coordinator = SimpleNamespace(enable_g2pw_audio_batch_merge=False)
+    runtime_owner = SimpleNamespace(
+        _ensure_prepare_coordinator=Mock(return_value=native_coordinator),
+        _project_root_cwd=_noop_project_root_cwd,
+        _prepare_cpu_stage_async=AsyncMock(),
+        _prepare_gpu_audio_phase_async=AsyncMock(),
+        _prepare_gpu_text_phase_async=AsyncMock(),
+        _build_request_state_from_prepare_phases=Mock(return_value=SimpleNamespace(state="ok")),
+        _release_prepare_split_stage_slot=Mock(),
+    )
+    tts = SimpleNamespace(
+        _vllm_runtime_owner=runtime_owner,
+        _vllm_runtime_prepare_coordinator_factory=Mock(return_value=object()),
+    )
+    coordinator = RuntimePrepareCoordinatorAdapter(tts, runtime_owner)
+    spec = SimpleNamespace(request_id="req-1", prompt_text="prompt", prompt_lang="zh", text="text", text_lang="zh")
+    prepared_cpu = GPTSoVITSNativePreparedCpuStage(
+        spec=spec,
+        prepare_submit_at=1.0,
+        prepare_start=2.0,
+        prompt_text="prompt",
+        text="text",
+        prepare_admission_wait_ms=0.0,
+        current_inflight=1,
+        peak_inflight=1,
+        prompt_cpu_profiled=SimpleNamespace(),
+        target_cpu_profiled=SimpleNamespace(),
+    )
+    audio_phase = GPTSoVITSPrepareAudioPhaseData(
+        prompt_g2pw_profiled="prompt-g2pw",
+        target_g2pw_profiled="target-g2pw",
+        ref_audio_profiled=SimpleNamespace(result=SimpleNamespace(raw_audio="raw", raw_sr=16000)),
+        g2pw_pair_ms=1.0,
+        phase_wall_ms=2.0,
+    )
+    text_phase = GPTSoVITSPrepareTextPhaseData(
+        prompt_feature_profiled="prompt-feature",
+        target_feature_profiled="target-feature",
+        phase_wall_ms=3.0,
+    )
+    runtime_owner._prepare_cpu_stage_async.return_value = prepared_cpu
+    runtime_owner._prepare_gpu_audio_phase_async.return_value = audio_phase
+    runtime_owner._prepare_gpu_text_phase_async.return_value = text_phase
+
+    state, prepare_start, prepare_finished_at = asyncio.run(
+        coordinator.prepare_state_profiled_async(spec, prepare_submit_at=1.0)
+    )
+
+    runtime_owner._prepare_cpu_stage_async.assert_awaited_once_with(
+        native_coordinator,
+        spec,
+        prepare_submit_at=1.0,
+    )
+    runtime_owner._prepare_gpu_audio_phase_async.assert_awaited_once_with(native_coordinator, prepared_cpu)
+    runtime_owner._prepare_gpu_text_phase_async.assert_awaited_once()
+    runtime_owner._build_request_state_from_prepare_phases.assert_called_once_with(
+        prepared_cpu,
+        audio_phase,
+        text_phase,
+        ref_spec_result=None,
+        extra_profile={
+            "engine_prepare_audio_phase_mode": 0.0,
+            "engine_prepare_audio_phase_wall_ms": 2.0,
+            "engine_prepare_audio_phase_batch_size": 1.0,
+            "engine_prepare_text_phase_wall_ms": 3.0,
+            "engine_prepare_text_phase_batch_size": 1.0,
+        },
+    )
+    runtime_owner._release_prepare_split_stage_slot.assert_called_once_with(native_coordinator)
+    assert state.state == "ok"
+    assert prepare_start == 2.0
+    assert prepare_finished_at >= prepare_start
+
+
+def test_runtime_prepare_coordinator_adapter_prepare_direct_shared_segments_uses_runtime_native_path(tmp_path):
+    _ensure_vendored_gpt_sovits_import_path()
+    from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import RuntimePrepareCoordinatorAdapter
+
+    native_coordinator = SimpleNamespace()
+    runtime_owner = SimpleNamespace(
+        _ensure_prepare_coordinator=Mock(return_value=native_coordinator),
+        _prepare_direct_shared_segments_async=AsyncMock(return_value=["shared-ok"]),
+    )
+    coordinator = RuntimePrepareCoordinatorAdapter(
+        SimpleNamespace(
+            _vllm_runtime_owner=runtime_owner,
+            _vllm_runtime_prepare_coordinator_factory=Mock(return_value=object()),
+        ),
+        runtime_owner,
+    )
+    specs = [SimpleNamespace(request_id="req-1"), SimpleNamespace(request_id="req-2")]
+
+    results = asyncio.run(coordinator.prepare_direct_shared_segments_profiled_async(specs))
+
+    assert results == ["shared-ok"]
+    runtime_owner._prepare_direct_shared_segments_async.assert_awaited_once_with(native_coordinator, specs)
 
 
 def test_ensure_native_runtime_deps_supports_opt_in_preload(tmp_path, monkeypatch):
@@ -1295,6 +1679,29 @@ def test_finalize_decoded_audio_normalizes_output(tmp_path):
     np.testing.assert_allclose(result.audio, np.array([32767 / 32768.0, -1.0], dtype=np.float32))
 
 
+def test_audio_postprocess_native_super_sampling_uses_runtime_sr_loader(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    sr_model = Mock(return_value=(torch.tensor([[0.25, -0.5]], dtype=torch.float32), 48000))
+    runtime._ensure_runtime_sr_model = Mock(return_value=(sr_model, False))  # type: ignore[method-assign]
+    pipeline = SimpleNamespace(
+        configs=SimpleNamespace(device="cpu", sampling_rate=32000),
+        init_sr_model=Mock(side_effect=AssertionError("legacy sr init should not be used")),
+    )
+
+    sample_rate, audio = runtime._audio_postprocess_native(
+        pipeline,
+        audio_fragments=[torch.tensor([0.1, 0.2], dtype=torch.float32)],
+        sr=32000,
+        speed_factor=1.0,
+        super_sampling=True,
+    )
+
+    runtime._ensure_runtime_sr_model.assert_called_once_with()
+    sr_model.assert_called_once()
+    assert sample_rate == 48000
+    assert audio.tolist() == [8192, -16384]
+
+
 def test_decode_prepared_requests_batched_non_vocoder_uses_native_vits_batch(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     runtime._get_text_frontend_symbol = Mock(  # type: ignore[method-assign]
@@ -1941,7 +2348,8 @@ def test_ensure_prepare_coordinator_builds_runtime_native_coordinator(tmp_path):
     pipeline = SimpleNamespace(
         prepare_bert_batch_worker=None,
         prepare_text_cpu_workers=3,
-        snapshot_prepare_runtime_components=Mock(return_value={"g2pw": {"worker_count": 2}}),
+        _vllm_runtime_prepare_state_provider=Mock(return_value={"g2pw": {"worker_count": 2}}),
+        snapshot_prepare_runtime_components=Mock(side_effect=AssertionError("legacy snapshot should not be used")),
     )
     runtime._ensure_pipeline = Mock(return_value=pipeline)  # type: ignore[method-assign]
 
@@ -1953,6 +2361,9 @@ def test_ensure_prepare_coordinator_builds_runtime_native_coordinator(tmp_path):
     assert coordinator.ref_audio_executor is not None
     assert coordinator.text_cpu_gate is not None
     assert coordinator.inflight_gate is not None
+    assert coordinator.g2pw_gate.snapshot()["max_inflight"] == pytest.approx(2.0)
+    pipeline._vllm_runtime_prepare_state_provider.assert_called_once_with()
+    pipeline.snapshot_prepare_runtime_components.assert_not_called()
     if coordinator.text_feature_executor is not None:
         coordinator.text_feature_executor.shutdown(wait=True, cancel_futures=True)
     coordinator.g2pw_executor.shutdown(wait=True, cancel_futures=True)
@@ -2007,7 +2418,8 @@ def test_native_prepare_coordinator_ref_audio_preload_uses_cache(tmp_path):
         prepare_text_cpu_workers=2,
         configs=SimpleNamespace(sampling_rate=32000),
         prepare_ref_audio_cpu_limiter=None,
-        snapshot_prepare_runtime_components=Mock(return_value={"g2pw": {"worker_count": 1}}),
+        _vllm_runtime_prepare_state_provider=Mock(return_value={"g2pw": {"worker_count": 1}}),
+        snapshot_prepare_runtime_components=Mock(side_effect=AssertionError("legacy snapshot should not be used")),
         _load_ref_audio_raw=_load_ref_audio_raw,
         _prepare_prompt_semantic_wav16k_profile=Mock(
             side_effect=AssertionError("should not call tts preload wav16k helper")
@@ -2027,6 +2439,8 @@ def test_native_prepare_coordinator_ref_audio_preload_uses_cache(tmp_path):
             coordinator.ref_audio_executor.shutdown(wait=True, cancel_futures=True)
 
     assert len(load_calls) == 1
+    pipeline._vllm_runtime_prepare_state_provider.assert_called_once_with()
+    pipeline.snapshot_prepare_runtime_components.assert_not_called()
     pipeline._prepare_prompt_semantic_wav16k_profile.assert_not_called()
     assert isinstance(first, GPTSoVITSPrepareProfiledResult)
     assert isinstance(first.result, GPTSoVITSPreparedRefAudioAsset)
@@ -2141,13 +2555,149 @@ def test_prepare_request_split_phase_helpers_build_state_from_explicit_phases(tm
     assert prepared_request.transport_info == {"transport": "ok"}
 
 
+def test_prepare_direct_shared_segments_async_uses_runtime_native_shared_prompt_and_ref(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    coordinator = SimpleNamespace()
+    spec_a = SimpleNamespace(
+        request_id="req-a",
+        prompt_text="shared prompt",
+        prompt_lang="zh",
+        text="text-a",
+        text_lang="zh",
+        ref_audio_path="/tmp/ref.wav",
+    )
+    spec_b = SimpleNamespace(
+        request_id="req-b",
+        prompt_text="shared prompt",
+        prompt_lang="zh",
+        text="text-b",
+        text_lang="zh",
+        ref_audio_path="/tmp/ref.wav",
+    )
+    shared_prompt_cpu = GPTSoVITSPrepareProfiledResult(
+        result=["prompt-cpu"],
+        submit_at=1.0,
+        started_at=1.0,
+        finished_at=2.0,
+        profile={},
+    )
+    target_cpu_a = GPTSoVITSPrepareProfiledResult(
+        result=["target-a"],
+        submit_at=2.0,
+        started_at=2.0,
+        finished_at=3.0,
+        profile={},
+    )
+    target_cpu_b = GPTSoVITSPrepareProfiledResult(
+        result=["target-b"],
+        submit_at=3.0,
+        started_at=3.0,
+        finished_at=4.0,
+        profile={},
+    )
+    shared_prompt_g2pw = GPTSoVITSPrepareProfiledResult(
+        result=["prompt-g2pw"],
+        submit_at=4.0,
+        started_at=4.0,
+        finished_at=5.0,
+        profile={"prompt_g2pw_ms": 1.0},
+    )
+    target_g2pw_a = GPTSoVITSPrepareProfiledResult(
+        result=["target-g2pw-a"],
+        submit_at=5.0,
+        started_at=5.0,
+        finished_at=6.0,
+        profile={"target_g2pw_ms": 1.0},
+    )
+    target_g2pw_b = GPTSoVITSPrepareProfiledResult(
+        result=["target-g2pw-b"],
+        submit_at=6.0,
+        started_at=6.0,
+        finished_at=7.0,
+        profile={"target_g2pw_ms": 1.0},
+    )
+    shared_prompt_feature = GPTSoVITSPrepareProfiledResult(
+        result="prompt-feature",
+        submit_at=7.0,
+        started_at=7.0,
+        finished_at=8.0,
+        profile={"bert_total_ms": 1.0},
+    )
+    target_feature_a = GPTSoVITSPrepareProfiledResult(
+        result="target-feature-a",
+        submit_at=8.0,
+        started_at=8.0,
+        finished_at=9.0,
+        profile={"bert_total_ms": 1.0},
+    )
+    target_feature_b = GPTSoVITSPrepareProfiledResult(
+        result="target-feature-b",
+        submit_at=9.0,
+        started_at=9.0,
+        finished_at=10.0,
+        profile={"bert_total_ms": 1.0},
+    )
+    shared_ref_audio = GPTSoVITSPrepareProfiledResult(
+        result=GPTSoVITSRefAudioBundle(
+            prompt_semantic="prompt-semantic",
+            raw_audio="raw-audio",
+            raw_sr=16000,
+            profile={"bundle_total_ms": 1.0},
+        ),
+        submit_at=10.0,
+        started_at=10.0,
+        finished_at=11.0,
+        profile={},
+    )
+    shared_ref_spec = GPTSoVITSPrepareProfiledResult(
+        result=(GPTSoVITSReferSpec("spec-audio", "audio-16k"), {"ref_spec_to_device_ms": 1.0}),
+        submit_at=11.0,
+        started_at=11.0,
+        finished_at=12.0,
+        profile={},
+    )
+    runtime._normalize_prepare_sentence = Mock(return_value="shared prompt")  # type: ignore[method-assign]
+    runtime._run_text_cpu_stage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[shared_prompt_cpu, target_cpu_a, target_cpu_b]
+    )
+    runtime._run_g2pw_stage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[shared_prompt_g2pw, target_g2pw_a, target_g2pw_b]
+    )
+    runtime._run_text_feature_stage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[shared_prompt_feature, target_feature_a, target_feature_b]
+    )
+    runtime.preload_ref_audio_asset = Mock(return_value="shared-future")  # type: ignore[method-assign]
+    runtime._run_ref_prompt_semantic_stage = AsyncMock(return_value=shared_ref_audio)  # type: ignore[method-assign]
+    runtime._run_ref_spec_stage = AsyncMock(return_value=shared_ref_spec)  # type: ignore[method-assign]
+    runtime._build_request_state_from_prepare_phases = Mock(  # type: ignore[method-assign]
+        side_effect=[SimpleNamespace(state="state-a"), SimpleNamespace(state="state-b")]
+    )
+    runtime._release_prepare_split_stage_slot = Mock()  # type: ignore[method-assign]
+
+    outputs = runtime._run_awaitable_sync(
+        runtime._prepare_direct_shared_segments_async(coordinator, [spec_a, spec_b])
+    )
+
+    runtime._normalize_prepare_sentence.assert_called_once_with("shared prompt", "zh")
+    assert runtime._run_text_cpu_stage.await_count == 3
+    runtime.preload_ref_audio_asset.assert_called_once_with("/tmp/ref.wav", submit_at=ANY)
+    runtime._run_ref_prompt_semantic_stage.assert_awaited_once_with(
+        ANY,
+        "/tmp/ref.wav",
+        prepared_asset_future="shared-future",
+    )
+    runtime._run_ref_spec_stage.assert_awaited_once_with(ANY, "raw-audio", 16000)
+    assert runtime._build_request_state_from_prepare_phases.call_count == 2
+    assert runtime._release_prepare_split_stage_slot.call_count == 2
+    assert [result[0].state for result in outputs] == ["state-a", "state-b"]
+
+
 def test_build_request_state_from_prepare_phases_uses_runtime_native_state_assembly(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     pipeline = SimpleNamespace(
         configs=SimpleNamespace(device="cpu"),
         precision=torch.float16,
         prepare_text_cpu_workers=3,
-        extract_ref_spec=Mock(return_value=("aux-spec", "aux-16k", None, None)),
     )
     runtime._ensure_pipeline = Mock(return_value=pipeline)  # type: ignore[method-assign]
     runtime._build_prepare_profile_overrides = Mock(return_value={"custom_metric": 7.0})  # type: ignore[method-assign]
@@ -2167,6 +2717,9 @@ def test_build_request_state_from_prepare_phases_uses_runtime_native_state_assem
                 "audio_load_ms": 0.5,
             },
         )
+    )
+    runtime._extract_ref_spec_native = Mock(  # type: ignore[method-assign]
+        return_value=(GPTSoVITSReferSpec("aux-spec", "aux-16k"), torch.ones((1, 8), dtype=torch.float32), 16000)
     )
 
     prompt_result = SimpleNamespace(
@@ -2242,7 +2795,7 @@ def test_build_request_state_from_prepare_phases_uses_runtime_native_state_assem
     assert "executor_run_wall_ms" in state.prepare_profile
     assert state.all_bert_features.dtype == torch.float16
     assert len(state.aux_refer_specs) == 1
-    pipeline.extract_ref_spec.assert_called_once()
+    runtime._extract_ref_spec_native.assert_called_once_with(str(tmp_path / "aux.wav"))
 
 
 def test_prepare_gpu_audio_phase_async_uses_runtime_native_prepare_kernels(tmp_path):

@@ -437,6 +437,11 @@ _SCHEDULER_PROMPT_EXECUTOR_LOCK_ATTR = "_scheduler_prompt_text_executor_lock"
 
 def _get_scheduler_prepare_coordinator(tts: Any):
     coordinator = getattr(tts, _SCHEDULER_PREPARE_COORDINATOR_ATTR, None)
+    generation = int(getattr(tts, "_vllm_runtime_prepare_generation", 0) or 0)
+    cached_generation = int(getattr(tts, "_scheduler_prepare_coordinator_generation", -1) or -1)
+    if coordinator is not None and cached_generation == generation:
+        return coordinator
+    coordinator = None
     if coordinator is not None:
         return coordinator
     lock = getattr(tts, _SCHEDULER_PREPARE_COORDINATOR_LOCK_ATTR, None)
@@ -445,12 +450,20 @@ def _get_scheduler_prepare_coordinator(tts: Any):
         setattr(tts, _SCHEDULER_PREPARE_COORDINATOR_LOCK_ATTR, lock)
     with lock:
         coordinator = getattr(tts, _SCHEDULER_PREPARE_COORDINATOR_ATTR, None)
-        if coordinator is None:
-            from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import PrepareCoordinator
+        cached_generation = int(getattr(tts, "_scheduler_prepare_coordinator_generation", -1) or -1)
+        if coordinator is None or cached_generation != generation:
+            from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import build_prepare_coordinator
 
-            coordinator = PrepareCoordinator(tts)
+            coordinator = build_prepare_coordinator(tts)
             setattr(tts, _SCHEDULER_PREPARE_COORDINATOR_ATTR, coordinator)
+            setattr(tts, "_scheduler_prepare_coordinator_generation", generation)
         return coordinator
+
+
+def _should_use_scheduler_prepare_coordinator(tts: Any) -> bool:
+    if callable(getattr(tts, "_vllm_runtime_prepare_coordinator_factory", None)):
+        return True
+    return os.environ.get("GPTSOVITS_PREPARE_SCHEDULER_USE_COORDINATOR", "0") != "0"
 
 
 def _run_coro_sync(coro):
@@ -587,7 +600,7 @@ def prepare_request_state(
     tts: Any,
     spec: SchedulerRequestSpec,
 ) -> T2SRequestState:
-    if os.environ.get("GPTSOVITS_PREPARE_SCHEDULER_USE_COORDINATOR", "0") == "0":
+    if not _should_use_scheduler_prepare_coordinator(tts):
         return _prepare_request_state_legacy(tts, spec)
     coordinator = _get_scheduler_prepare_coordinator(tts)
     state, _, _ = _run_coro_sync(coordinator.prepare_state_profiled_async(spec, time.perf_counter()))

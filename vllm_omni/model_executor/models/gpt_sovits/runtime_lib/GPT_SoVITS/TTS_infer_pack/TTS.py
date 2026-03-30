@@ -547,7 +547,12 @@ class TTS:
         self.prepare_text_cpu_executor = None
 
         self._init_models()
-        self.refresh_runtime_components()
+        self.runtime_prepare_components_deferred = (
+            str(os.environ.get("GPTSOVITS_RUNTIME_SKIP_PREPARE_COMPONENTS", "0")).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if not self.runtime_prepare_components_deferred:
+            self.refresh_runtime_components()
 
         self.prompt_cache: dict = {
             "ref_audio_path": None,
@@ -565,6 +570,10 @@ class TTS:
         self.precision: torch.dtype = torch.float16 if self.configs.is_half else torch.float32
 
     def refresh_runtime_components(self):
+        runtime_refresh = getattr(self, "_vllm_runtime_refresh_prepare_components", None)
+        if bool(getattr(self, "_vllm_runtime_owned_prepare_components", False)) and callable(runtime_refresh):
+            runtime_refresh()
+            return
         self.prepare_bert_batch_worker = None
         self.prepare_ref_semantic_batch_worker = None
         self.prepare_g2pw_batch_worker = None
@@ -875,6 +884,14 @@ class TTS:
             return None
 
     def snapshot_prepare_runtime_components(self) -> dict:
+        state_provider = getattr(self, "_vllm_runtime_prepare_state_provider", None)
+        if callable(state_provider):
+            try:
+                runtime_state = state_provider()
+            except Exception:
+                runtime_state = None
+            if isinstance(runtime_state, dict):
+                return runtime_state
         g2pw_runtime = None
         try:
             from text import chinese2
