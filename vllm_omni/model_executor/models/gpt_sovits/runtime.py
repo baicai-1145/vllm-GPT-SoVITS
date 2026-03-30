@@ -1281,6 +1281,25 @@ class GPTSoVITSRuntime:
         self._config: Any | None = None
         self._prepare_coordinator: Any | None = None
         self._native_runtime_ready = False
+        self._runtime_configs: Any | None = None
+        self._runtime_precision: torch.dtype | None = None
+        self._runtime_is_v2pro = False
+        self._runtime_t2s_model: Any | None = None
+        self._runtime_vits_model: Any | None = None
+        self._runtime_bert_tokenizer: Any | None = None
+        self._runtime_bert_model: Any | None = None
+        self._runtime_cnhuhbert_model: Any | None = None
+        self._runtime_vocoder: Any | None = None
+        self._runtime_sv_model: Any | None = None
+        self._runtime_sr_model: Any | None = None
+        self._runtime_sr_model_not_exist = False
+        self._runtime_prepare_bert_batch_worker: Any | None = None
+        self._runtime_prepare_ref_semantic_batch_worker: Any | None = None
+        self._runtime_prepare_g2pw_batch_worker: Any | None = None
+        self._runtime_prepare_text_cpu_worker: Any | None = None
+        self._runtime_prepare_text_cpu_executor: Any | None = None
+        self._runtime_prepare_bert_stage_limiter: Any | None = None
+        self._runtime_prepare_ref_semantic_stage_limiter: Any | None = None
 
     def _resolve_path(self, maybe_relative_path: str) -> str:
         if os.path.isabs(maybe_relative_path):
@@ -1359,6 +1378,7 @@ class GPTSoVITSRuntime:
                 pipeline = TTS(config)
             self._install_ref_audio_loader_fallback(pipeline)
             self._install_sv_half_safe_patch(pipeline)
+            self._bind_pipeline_components(pipeline)
             self._config = config
             self._pipeline = pipeline
             logger.info(
@@ -1368,9 +1388,162 @@ class GPTSoVITSRuntime:
             )
         return self._pipeline
 
-    def get_t2s_model(self) -> Any:
+    def _bind_pipeline_components(self, pipeline: Any) -> None:
+        self._runtime_configs = getattr(pipeline, "configs", None)
+        self._runtime_precision = getattr(pipeline, "precision", None)
+        self._runtime_is_v2pro = bool(getattr(pipeline, "is_v2pro", False))
+        runtime_t2s = getattr(pipeline, "t2s_model", None)
+        self._runtime_t2s_model = getattr(runtime_t2s, "model", None) if runtime_t2s is not None else None
+        self._runtime_vits_model = getattr(pipeline, "vits_model", None)
+        self._runtime_bert_tokenizer = getattr(pipeline, "bert_tokenizer", None)
+        self._runtime_bert_model = getattr(pipeline, "bert_model", None)
+        self._runtime_cnhuhbert_model = getattr(pipeline, "cnhuhbert_model", None)
+        self._runtime_vocoder = getattr(pipeline, "vocoder", None)
+        self._runtime_sv_model = getattr(pipeline, "sv_model", None)
+        self._runtime_sr_model = getattr(pipeline, "sr_model", None)
+        self._runtime_sr_model_not_exist = bool(getattr(pipeline, "sr_model_not_exist", False))
+        self._runtime_prepare_bert_batch_worker = getattr(pipeline, "prepare_bert_batch_worker", None)
+        self._runtime_prepare_ref_semantic_batch_worker = getattr(pipeline, "prepare_ref_semantic_batch_worker", None)
+        self._runtime_prepare_g2pw_batch_worker = getattr(pipeline, "prepare_g2pw_batch_worker", None)
+        self._runtime_prepare_text_cpu_worker = getattr(pipeline, "prepare_text_cpu_worker", None)
+        self._runtime_prepare_text_cpu_executor = getattr(pipeline, "prepare_text_cpu_executor", None)
+        self._runtime_prepare_bert_stage_limiter = getattr(pipeline, "prepare_bert_stage_limiter", None)
+        self._runtime_prepare_ref_semantic_stage_limiter = getattr(pipeline, "prepare_ref_semantic_stage_limiter", None)
+
+    def _refresh_runtime_bound_components(self) -> None:
         pipeline = self._ensure_pipeline()
-        return pipeline.t2s_model.model
+        self._bind_pipeline_components(pipeline)
+
+    def _get_runtime_configs(self) -> Any:
+        if self._runtime_configs is None:
+            self._refresh_runtime_bound_components()
+        return self._runtime_configs
+
+    def _get_runtime_precision(self) -> torch.dtype:
+        if self._runtime_precision is None:
+            self._refresh_runtime_bound_components()
+        precision = self._runtime_precision
+        if precision is None:
+            raise RuntimeError("GPT-SoVITS runtime precision 未初始化")
+        return precision
+
+    def _is_runtime_v2pro(self) -> bool:
+        if self._runtime_vits_model is None and self._pipeline is None:
+            self._refresh_runtime_bound_components()
+        return bool(self._runtime_is_v2pro)
+
+    def _get_runtime_t2s_model(self) -> Any:
+        if self._runtime_t2s_model is None:
+            self._refresh_runtime_bound_components()
+        model = self._runtime_t2s_model
+        if model is None:
+            raise RuntimeError("GPT-SoVITS T2S model 未初始化")
+        return model
+
+    def _get_runtime_vits_model(self) -> Any:
+        if self._runtime_vits_model is None:
+            self._refresh_runtime_bound_components()
+        model = self._runtime_vits_model
+        if model is None:
+            raise RuntimeError("GPT-SoVITS VITS model 未初始化")
+        return model
+
+    def _get_runtime_bert_tokenizer(self) -> Any:
+        if self._runtime_bert_tokenizer is None:
+            self._refresh_runtime_bound_components()
+        tokenizer = self._runtime_bert_tokenizer
+        if tokenizer is None:
+            raise RuntimeError("GPT-SoVITS BERT tokenizer 未初始化")
+        return tokenizer
+
+    def _get_runtime_bert_model(self) -> Any:
+        if self._runtime_bert_model is None:
+            self._refresh_runtime_bound_components()
+        model = self._runtime_bert_model
+        if model is None:
+            raise RuntimeError("GPT-SoVITS BERT model 未初始化")
+        return model
+
+    def _get_runtime_cnhuhbert_model(self) -> Any:
+        if self._runtime_cnhuhbert_model is None:
+            self._refresh_runtime_bound_components()
+        model = self._runtime_cnhuhbert_model
+        if model is None:
+            raise RuntimeError("GPT-SoVITS CNHubert model 未初始化")
+        return model
+
+    def _get_runtime_vocoder(self) -> Any:
+        if self._runtime_vocoder is None:
+            self._refresh_runtime_bound_components()
+        vocoder = self._runtime_vocoder
+        if vocoder is None:
+            raise RuntimeError("GPT-SoVITS vocoder 未初始化")
+        return vocoder
+
+    def _get_runtime_sv_model(self) -> Any:
+        if self._runtime_sv_model is None:
+            self._refresh_runtime_bound_components()
+        model = self._runtime_sv_model
+        if model is None:
+            raise RuntimeError("GPT-SoVITS SV model 未初始化")
+        return model
+
+    def _get_runtime_sr_model(self) -> tuple[Any | None, bool]:
+        if self._pipeline is None and self._runtime_sr_model is None:
+            self._refresh_runtime_bound_components()
+        return self._runtime_sr_model, bool(self._runtime_sr_model_not_exist)
+
+    def _get_runtime_prepare_bert_batch_worker(self) -> Any | None:
+        worker = self._runtime_prepare_bert_batch_worker
+        if worker is None and self._pipeline is not None:
+            worker = getattr(self._pipeline, "prepare_bert_batch_worker", None)
+            self._runtime_prepare_bert_batch_worker = worker
+        return worker
+
+    def _get_runtime_prepare_ref_semantic_batch_worker(self) -> Any | None:
+        worker = self._runtime_prepare_ref_semantic_batch_worker
+        if worker is None and self._pipeline is not None:
+            worker = getattr(self._pipeline, "prepare_ref_semantic_batch_worker", None)
+            self._runtime_prepare_ref_semantic_batch_worker = worker
+        return worker
+
+    def _get_runtime_prepare_g2pw_batch_worker(self) -> Any | None:
+        worker = self._runtime_prepare_g2pw_batch_worker
+        if worker is None and self._pipeline is not None:
+            worker = getattr(self._pipeline, "prepare_g2pw_batch_worker", None)
+            self._runtime_prepare_g2pw_batch_worker = worker
+        return worker
+
+    def _get_runtime_prepare_text_cpu_worker(self) -> Any | None:
+        worker = self._runtime_prepare_text_cpu_worker
+        if worker is None and self._pipeline is not None:
+            worker = getattr(self._pipeline, "prepare_text_cpu_worker", None)
+            self._runtime_prepare_text_cpu_worker = worker
+        return worker
+
+    def _get_runtime_prepare_text_cpu_executor(self) -> Any | None:
+        executor = self._runtime_prepare_text_cpu_executor
+        if executor is None and self._pipeline is not None:
+            executor = getattr(self._pipeline, "prepare_text_cpu_executor", None)
+            self._runtime_prepare_text_cpu_executor = executor
+        return executor
+
+    def _get_runtime_prepare_bert_stage_limiter(self) -> Any | None:
+        limiter = self._runtime_prepare_bert_stage_limiter
+        if limiter is None and self._pipeline is not None:
+            limiter = getattr(self._pipeline, "prepare_bert_stage_limiter", None)
+            self._runtime_prepare_bert_stage_limiter = limiter
+        return limiter
+
+    def _get_runtime_prepare_ref_semantic_stage_limiter(self) -> Any | None:
+        limiter = self._runtime_prepare_ref_semantic_stage_limiter
+        if limiter is None and self._pipeline is not None:
+            limiter = getattr(self._pipeline, "prepare_ref_semantic_stage_limiter", None)
+            self._runtime_prepare_ref_semantic_stage_limiter = limiter
+        return limiter
+
+    def get_t2s_model(self) -> Any:
+        return self._get_runtime_t2s_model()
 
     def get_semantic_eos_id(self) -> int:
         model = self.get_t2s_model()
@@ -2800,9 +2973,9 @@ class GPTSoVITSRuntime:
         raw_audio: torch.Tensor,
         raw_sr: int,
     ) -> tuple[torch.Tensor | None, dict[str, float]]:
-        pipeline = self._ensure_pipeline()
+        self._ensure_pipeline()
         if (
-            getattr(pipeline, "prepare_ref_semantic_batch_worker", None) is None
+            self._get_runtime_prepare_ref_semantic_batch_worker() is None
             or str(os.environ.get("GPTSOVITS_PREPARE_REF_SUBMIT_PREPARED_WAV16K", "1")).strip().lower()
             in {"0", "false", "no", "off"}
         ):
@@ -3265,18 +3438,18 @@ class GPTSoVITSRuntime:
         word2ph: list[int],
         profile: dict[str, float] | None = None,
     ) -> torch.Tensor:
-        pipeline = self._ensure_pipeline()
-        worker = getattr(pipeline, "prepare_bert_batch_worker", None)
+        self._ensure_pipeline()
+        worker = self._get_runtime_prepare_bert_batch_worker()
         self._mark_bert_submit_offsets(profile)
         if worker is not None:
             feature, worker_profile = worker.submit(text, list(word2ph))
             self._merge_bert_worker_profile(profile, dict(worker_profile))
-            return feature.to(getattr(getattr(pipeline, "configs", None), "device", "cpu"))
+            return feature.to(getattr(self._get_runtime_configs(), "device", "cpu"))
 
-        tokenizer = getattr(pipeline, "bert_tokenizer")
-        bert_model = getattr(pipeline, "bert_model")
-        device = getattr(getattr(pipeline, "configs", None), "device", "cpu")
-        limiter = getattr(pipeline, "prepare_bert_stage_limiter", None)
+        tokenizer = self._get_runtime_bert_tokenizer()
+        bert_model = self._get_runtime_bert_model()
+        device = getattr(self._get_runtime_configs(), "device", "cpu")
+        limiter = self._get_runtime_prepare_bert_stage_limiter()
         limiter_stats = {"wait_ms": 0.0, "inflight": 1, "peak_inflight": 1, "slots": 0}
 
         def _run_bert_forward() -> torch.Tensor:
@@ -3315,8 +3488,7 @@ class GPTSoVITSRuntime:
         segment: Any,
         profile: dict[str, float] | None = None,
     ) -> torch.Tensor:
-        pipeline = self._ensure_pipeline()
-        device = getattr(getattr(pipeline, "configs", None), "device", "cpu")
+        device = getattr(self._get_runtime_configs(), "device", "cpu")
         phones = [int(item) for item in list(getattr(segment, "phones", []) or [])]
         segment_language = str(getattr(segment, "language", "") or "").replace("all_", "")
         if segment_language != "zh":
@@ -3332,11 +3504,11 @@ class GPTSoVITSRuntime:
         prepared_segments: Any,
         profile: dict[str, float] | None,
     ) -> dict[str, Any]:
-        pipeline = self._ensure_pipeline()
-        worker = getattr(pipeline, "prepare_bert_batch_worker", None)
+        self._ensure_pipeline()
+        worker = self._get_runtime_prepare_bert_batch_worker()
         if worker is None:
             raise RuntimeError("GPT-SoVITS BERT batch worker 未初始化")
-        device = getattr(getattr(pipeline, "configs", None), "device", "cpu")
+        device = getattr(self._get_runtime_configs(), "device", "cpu")
         phones_list: list[list[int]] = []
         bert_list: list[torch.Tensor | None] = []
         norm_text_list: list[str] = []
@@ -3441,22 +3613,24 @@ class GPTSoVITSRuntime:
         self,
         wav16k: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        pipeline = self._ensure_pipeline()
+        configs = self._get_runtime_configs()
+        cnhuhbert_model = self._get_runtime_cnhuhbert_model()
+        vits_model = self._get_runtime_vits_model()
         with torch.no_grad():
             h2d_start = time.perf_counter()
-            wav16k = wav16k.to(pipeline.configs.device)
-            if bool(getattr(pipeline.configs, "is_half", False)):
+            wav16k = wav16k.to(configs.device)
+            if bool(getattr(configs, "is_half", False)):
                 wav16k = wav16k.half()
             h2d_ms = (time.perf_counter() - h2d_start) * 1000.0
 
             ssl_start = time.perf_counter()
-            hubert_feature = pipeline.cnhuhbert_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
+            hubert_feature = cnhuhbert_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
             ssl_forward_ms = (time.perf_counter() - ssl_start) * 1000.0
 
             latent_start = time.perf_counter()
-            codes = pipeline.vits_model.extract_latent(hubert_feature)
+            codes = vits_model.extract_latent(hubert_feature)
             extract_latent_ms = (time.perf_counter() - latent_start) * 1000.0
-            prompt_semantic = codes[0, 0].to(pipeline.configs.device)
+            prompt_semantic = codes[0, 0].to(configs.device)
         profile = {
             "prompt_semantic_h2d_ms": float(h2d_ms),
             "prompt_semantic_ssl_forward_ms": float(ssl_forward_ms),
@@ -3469,25 +3643,26 @@ class GPTSoVITSRuntime:
     def _build_ref_prompt_semantic_from_raw(self, raw_audio: Any, raw_sr: int) -> GPTSoVITSRefAudioBundle:
         pipeline = self._ensure_pipeline()
         load_profile = {"audio_load_ms": 0.0}
-        if getattr(pipeline, "prepare_ref_semantic_batch_worker", None) is not None:
+        ref_worker = self._get_runtime_prepare_ref_semantic_batch_worker()
+        if ref_worker is not None:
             wav16k, local_cpu_prepare_profile = self._prepare_ref_prompt_wav16k_for_worker(raw_audio, raw_sr)
             coordinator = self._ensure_prepare_coordinator()
             runtime_exact_prewarm_profile = self._build_ref_prompt_semantic_runtime_exact_prewarm_profile(
                 coordinator,
-                pipeline.prepare_ref_semantic_batch_worker,
+                ref_worker,
                 raw_audio,
                 raw_sr,
                 wav16k=wav16k,
             )
             route = self._build_ref_prompt_semantic_worker_routing(
                 coordinator,
-                pipeline.prepare_ref_semantic_batch_worker,
+                ref_worker,
                 raw_audio,
                 raw_sr,
                 wav16k=wav16k,
             )
             try:
-                prompt_semantic, worker_profile = pipeline.prepare_ref_semantic_batch_worker.submit(
+                prompt_semantic, worker_profile = ref_worker.submit(
                     raw_audio,
                     raw_sr,
                     wav16k=wav16k,
@@ -3547,8 +3722,13 @@ class GPTSoVITSRuntime:
             )
 
         wav16k, cpu_prepare_ms, limiter_stats = self._prepare_prompt_semantic_wav16k_profile(raw_audio, raw_sr)
-        with pipeline.prepare_ref_semantic_stage_limiter.enter() as stage_stats:
+        ref_stage_limiter = self._get_runtime_prepare_ref_semantic_stage_limiter()
+        if ref_stage_limiter is None:
+            stage_stats = {"wait_ms": 0.0, "slots": 0.0, "peak_inflight": 0.0}
             prompt_semantic, runtime_profile = self._extract_prompt_semantic_profile_from_prepared_wav16k(wav16k)
+        else:
+            with ref_stage_limiter.enter() as stage_stats:
+                prompt_semantic, runtime_profile = self._extract_prompt_semantic_profile_from_prepared_wav16k(wav16k)
         return GPTSoVITSRefAudioBundle(
             prompt_semantic=prompt_semantic,
             raw_audio=raw_audio,
@@ -3737,9 +3917,9 @@ class GPTSoVITSRuntime:
             finally:
                 coordinator.text_cpu_gate.release()
 
-        pipeline = self._ensure_pipeline()
-        text_cpu_worker = getattr(pipeline, "prepare_text_cpu_worker", None)
-        executor = getattr(pipeline, "prepare_text_cpu_executor", None)
+        self._ensure_pipeline()
+        text_cpu_worker = self._get_runtime_prepare_text_cpu_worker()
+        executor = self._get_runtime_prepare_text_cpu_executor()
         try:
             if text_cpu_worker is not None:
                 submit_at = time.perf_counter()
@@ -3761,8 +3941,8 @@ class GPTSoVITSRuntime:
         text_lang: str,
     ) -> tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult]:
         coordinator = self._coerce_prepare_coordinator(coordinator)
-        pipeline = self._ensure_pipeline()
-        text_cpu_worker = getattr(pipeline, "prepare_text_cpu_worker", None)
+        self._ensure_pipeline()
+        text_cpu_worker = self._get_runtime_prepare_text_cpu_worker()
         if (
             text_cpu_worker is None
             or not hasattr(text_cpu_worker, "submit_many_async")
@@ -3975,8 +4155,8 @@ class GPTSoVITSRuntime:
             finally:
                 coordinator.text_feature_gate.release()
 
-        pipeline = self._ensure_pipeline()
-        prepare_bert_batch_worker = getattr(pipeline, "prepare_bert_batch_worker", None)
+        self._ensure_pipeline()
+        prepare_bert_batch_worker = self._get_runtime_prepare_bert_batch_worker()
         await coordinator.text_feature_gate.acquire()
         profile: dict[str, float] = dict(base_profile or {})
         profile["cpu_preprocess_ms"] = float(cpu_run_ms)
@@ -4080,8 +4260,8 @@ class GPTSoVITSRuntime:
         prompt_is_empty = len(prompt_segments or []) == 0
         prompt_has_pending = self._prepare_result_has_pending_g2pw(prompt_segments)
         target_has_pending = self._prepare_result_has_pending_g2pw(target_segments)
-        pipeline = self._ensure_pipeline()
-        g2pw_batch_worker = getattr(pipeline, "prepare_g2pw_batch_worker", None)
+        self._ensure_pipeline()
+        g2pw_batch_worker = self._get_runtime_prepare_g2pw_batch_worker()
         if g2pw_batch_worker is not None and (prompt_has_pending or target_has_pending):
             resolved_batches, batch_profiles, worker_profile, submit_at, started_at, finished_at = (
                 await g2pw_batch_worker.submit_async([prompt_segments or [], target_segments or []])
@@ -4398,7 +4578,7 @@ class GPTSoVITSRuntime:
             )
             return prompt_profiled, target_profiled
 
-        prepare_bert_batch_worker = getattr(pipeline, "prepare_bert_batch_worker", None)
+        prepare_bert_batch_worker = self._get_runtime_prepare_bert_batch_worker()
         await coordinator.text_feature_gate.acquire()
         submit_at = time.perf_counter()
         started_at = float(submit_at)
@@ -4561,8 +4741,10 @@ class GPTSoVITSRuntime:
         prepared_asset: Any | None = None,
     ) -> GPTSoVITSPrepareProfiledResult:
         coordinator = self._coerce_prepare_coordinator(coordinator)
-        pipeline = self._ensure_pipeline()
-        if getattr(pipeline, "prepare_ref_semantic_batch_worker", None) is not None:
+        self._ensure_pipeline()
+        ref_worker = self._get_runtime_prepare_ref_semantic_batch_worker()
+        ref_stage_limiter = self._get_runtime_prepare_ref_semantic_stage_limiter()
+        if ref_worker is not None:
             submit_at = time.perf_counter()
             started_at = float(submit_at)
             preload_profiled: Any | None = None
@@ -4617,19 +4799,19 @@ class GPTSoVITSRuntime:
 
             route = self._build_ref_prompt_semantic_worker_routing(
                 coordinator,
-                pipeline.prepare_ref_semantic_batch_worker,
+                ref_worker,
                 raw_audio,
                 raw_sr,
                 wav16k=wav16k,
             )
             prompt_semantic_task = asyncio.create_task(
-                pipeline.prepare_ref_semantic_batch_worker.submit_async(
+                ref_worker.submit_async(
                     raw_audio,
                     raw_sr,
                     wav16k=wav16k,
                     runtime_exact_prewarm_profile=self._build_ref_prompt_semantic_runtime_exact_prewarm_profile(
                         coordinator,
-                        pipeline.prepare_ref_semantic_batch_worker,
+                        ref_worker,
                         raw_audio,
                         raw_sr,
                         wav16k=wav16k,
@@ -4644,8 +4826,8 @@ class GPTSoVITSRuntime:
             finally:
                 self._mark_ref_prompt_semantic_worker_routing_completed(coordinator, route)
             limiter_snapshot = (
-                pipeline.prepare_ref_semantic_stage_limiter.snapshot()
-                if getattr(pipeline, "prepare_ref_semantic_stage_limiter", None) is not None
+                ref_stage_limiter.snapshot()
+                if ref_stage_limiter is not None
                 else {}
             )
             finished_at = time.perf_counter()
@@ -4714,11 +4896,18 @@ class GPTSoVITSRuntime:
             if wav16k is None:
                 result = await asyncio.to_thread(self._build_ref_prompt_semantic_from_raw, raw_audio, raw_sr)
             else:
-                with pipeline.prepare_ref_semantic_stage_limiter.enter() as stage_stats:
+                if ref_stage_limiter is None:
+                    stage_stats = {"wait_ms": 0.0, "slots": 0.0, "peak_inflight": 0.0}
                     prompt_semantic, runtime_profile = await asyncio.to_thread(
                         self._extract_prompt_semantic_profile_from_prepared_wav16k,
                         wav16k,
                     )
+                else:
+                    with ref_stage_limiter.enter() as stage_stats:
+                        prompt_semantic, runtime_profile = await asyncio.to_thread(
+                            self._extract_prompt_semantic_profile_from_prepared_wav16k,
+                            wav16k,
+                        )
                 result = GPTSoVITSRefAudioBundle(
                     prompt_semantic=prompt_semantic,
                     raw_audio=raw_audio,
@@ -4785,8 +4974,9 @@ class GPTSoVITSRuntime:
         coordinator = self._coerce_prepare_coordinator(coordinator)
         if not items:
             return []
-        pipeline = self._ensure_pipeline()
-        worker = getattr(pipeline, "prepare_ref_semantic_batch_worker", None)
+        self._ensure_pipeline()
+        worker = self._get_runtime_prepare_ref_semantic_batch_worker()
+        ref_stage_limiter = self._get_runtime_prepare_ref_semantic_stage_limiter()
         if worker is None:
             return await asyncio.gather(
                 *[
@@ -4900,8 +5090,8 @@ class GPTSoVITSRuntime:
             if worker_tasks:
                 worker_outputs = await asyncio.gather(*worker_tasks, return_exceptions=True)
                 limiter_snapshot = (
-                    pipeline.prepare_ref_semantic_stage_limiter.snapshot()
-                    if getattr(pipeline, "prepare_ref_semantic_stage_limiter", None) is not None
+                    ref_stage_limiter.snapshot()
+                    if ref_stage_limiter is not None
                     else {}
                 )
                 batch_finished_at = time.perf_counter()
@@ -6096,7 +6286,7 @@ class GPTSoVITSRuntime:
         }
 
     def _resolve_vocoder_runtime_config(self, pipeline: Any) -> dict[str, int]:
-        version = str(getattr(getattr(pipeline, "configs", None), "version", "") or "")
+        version = str(getattr(self._get_runtime_configs(), "version", "") or "")
         config = self._default_vocoder_runtime_config(version)
         configured = dict(getattr(pipeline, "vocoder_configs", {}) or {})
         for key, default_value in config.items():
@@ -6116,11 +6306,14 @@ class GPTSoVITSRuntime:
         prepared: GPTSoVITSDecodePreparedRequest,
         refer_audio_spec: torch.Tensor,
     ) -> dict[str, Any]:
+        self._bind_pipeline_components(pipeline)
         vocoder_config = self._resolve_vocoder_runtime_config(pipeline)
-        device = torch.device(pipeline.configs.device)
+        configs = self._get_runtime_configs()
+        precision = self._get_runtime_precision()
+        device = torch.device(configs.device)
         prompt_semantic_tokens = prepared.prompt_semantic.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long)
         prompt_phones = prepared.prompt_phones.unsqueeze(0).to(device=device, dtype=torch.long)
-        refer_audio_spec = refer_audio_spec.to(dtype=pipeline.precision, device=device)
+        refer_audio_spec = refer_audio_spec.to(dtype=precision, device=device)
 
         fea_ref, ge = self._run_vits_vocoder_feature_decode(
             pipeline.vits_model,
@@ -6134,11 +6327,11 @@ class GPTSoVITSRuntime:
         if ref_audio.shape[0] == 2:
             ref_audio = ref_audio.mean(0).unsqueeze(0)
 
-        target_sr = 24000 if pipeline.configs.version == "v3" else 32000
+        target_sr = 24000 if configs.version == "v3" else 32000
         if int(prepared.raw_sr) != target_sr:
             ref_audio = self._resample_audio(ref_audio, int(prepared.raw_sr), target_sr, device)
 
-        mel2 = self._compute_vocoder_mel(ref_audio, version=str(pipeline.configs.version))
+        mel2 = self._compute_vocoder_mel(ref_audio, version=str(configs.version))
         mel2 = self._norm_vocoder_spec(mel2)
         t_min = min(int(mel2.shape[2]), int(fea_ref.shape[2]))
         mel2 = mel2[:, :, :t_min]
@@ -6155,7 +6348,7 @@ class GPTSoVITSRuntime:
             "refer_audio_spec": refer_audio_spec,
             "fea_ref": fea_ref,
             "ge": ge,
-            "mel2": mel2.to(dtype=pipeline.precision),
+            "mel2": mel2.to(dtype=precision),
             "t_min": int(t_min),
             "chunk_len": int(chunk_len),
             "output_sr": int(vocoder_config["sr"]),
@@ -6168,7 +6361,8 @@ class GPTSoVITSRuntime:
         prepared: GPTSoVITSDecodePreparedRequest,
         prompt_context: dict[str, Any],
     ) -> tuple[Any, int]:
-        device = torch.device(pipeline.configs.device)
+        self._bind_pipeline_components(pipeline)
+        device = torch.device(self._get_runtime_configs().device)
         refer_audio_spec = prompt_context["refer_audio_spec"]
         ge = prompt_context["ge"]
         fea_ref_base = prompt_context["fea_ref"]
@@ -6178,7 +6372,7 @@ class GPTSoVITSRuntime:
         semantic_tokens = prepared.semantic_tokens.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long)
         phones = prepared.phones.unsqueeze(0).to(device=device, dtype=torch.long)
         fea_todo, ge = self._run_vits_vocoder_feature_decode(
-            pipeline.vits_model,
+            self._get_runtime_vits_model(),
             codes=semantic_tokens,
             text=phones,
             refer_audio_spec=refer_audio_spec,
@@ -6196,7 +6390,7 @@ class GPTSoVITSRuntime:
                 break
             idx += chunk_len
             fea = torch.cat([fea_ref, fea_todo_chunk], dim=2).transpose(2, 1)
-            cfm_res = pipeline.vits_model.cfm.inference(
+            cfm_res = self._get_runtime_vits_model().cfm.inference(
                 fea,
                 torch.LongTensor([int(fea.size(1))]).to(fea.device),
                 mel2,
@@ -6210,7 +6404,7 @@ class GPTSoVITSRuntime:
 
         cfm_res = torch.cat(cfm_results, dim=2)
         cfm_res = self._denorm_vocoder_spec(cfm_res)
-        wav_gen = self._run_vocoder_module(pipeline.vocoder, cfm_res)
+        wav_gen = self._run_vocoder_module(self._get_runtime_vocoder(), cfm_res)
         return wav_gen[0][0], int(prompt_context["output_sr"])
 
     @staticmethod
@@ -6269,6 +6463,7 @@ class GPTSoVITSRuntime:
         prepared_requests: list[GPTSoVITSDecodePreparedRequest],
         prompt_context: dict[str, Any],
     ) -> list[GPTSoVITSDecodedAudio]:
+        self._bind_pipeline_components(pipeline)
         if not prepared_requests:
             return []
 
@@ -6305,7 +6500,7 @@ class GPTSoVITSRuntime:
                 )
             ]
 
-        device = torch.device(pipeline.configs.device)
+        device = torch.device(self._get_runtime_configs().device)
         refer_audio_spec = prompt_context["refer_audio_spec"]
         ge = prompt_context["ge"]
         fea_ref = prompt_context["fea_ref"]
@@ -6318,7 +6513,7 @@ class GPTSoVITSRuntime:
             semantic_tokens = prepared.semantic_tokens.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long)
             phones = prepared.phones.unsqueeze(0).to(device=device, dtype=torch.long)
             feat, _ = self._run_vits_vocoder_feature_decode(
-                pipeline.vits_model,
+                self._get_runtime_vits_model(),
                 codes=semantic_tokens,
                 text=phones,
                 refer_audio_spec=refer_audio_spec,
@@ -6363,7 +6558,7 @@ class GPTSoVITSRuntime:
         expanded_mel2 = mel2.repeat(batch_size, 1, 1)
         cfm_input = torch.cat([expanded_ref, batched_feat_chunks], dim=2).transpose(2, 1)
         cfm_lengths = torch.full((batch_size,), int(cfm_input.size(1)), dtype=torch.long, device=cfm_input.device)
-        pred_spec = pipeline.vits_model.cfm.inference(
+        pred_spec = self._get_runtime_vits_model().cfm.inference(
             cfm_input,
             cfm_lengths,
             expanded_mel2,
@@ -6375,7 +6570,7 @@ class GPTSoVITSRuntime:
         pred_spec = pred_spec.permute(1, 0, 2).contiguous().view(channel_dim, -1).unsqueeze(0)
         pred_spec = self._denorm_vocoder_spec(pred_spec)
 
-        wav_gen = self._run_vocoder_module(pipeline.vocoder, pred_spec)
+        wav_gen = self._run_vocoder_module(self._get_runtime_vocoder(), pred_spec)
         audio = wav_gen[0][0]
         audio_chunks: list[torch.Tensor] = []
         audio_position = 0
@@ -6582,6 +6777,7 @@ class GPTSoVITSRuntime:
         pipeline: Any,
         prepared: GPTSoVITSDecodePreparedRequest,
     ) -> tuple[Any, int]:
+        self._bind_pipeline_components(pipeline)
         refer_spec = self._build_refer_spec_from_prepared(prepared)
         if bool(getattr(pipeline.configs, "use_vocoder", False)):
             return self._decode_prepared_request_vocoder_fragment(
@@ -6590,21 +6786,22 @@ class GPTSoVITSRuntime:
                 refer_spec.spec_audio,
             )
 
-        device = torch.device(pipeline.configs.device)
-        refer_audio_spec = refer_spec.spec_audio.to(dtype=pipeline.precision, device=device)
+        device = torch.device(self._get_runtime_configs().device)
+        vits_model = self._get_runtime_vits_model()
+        refer_audio_spec = refer_spec.spec_audio.to(dtype=self._get_runtime_precision(), device=device)
         sv_emb = None
-        if bool(getattr(pipeline, "is_v2pro", False)):
+        if self._is_runtime_v2pro():
             audio_tensor = refer_spec.audio_16k
             if audio_tensor is None:
                 raise ValueError("GPT-SoVITS v2Pro request-local synthesis 缺少 16k 参考音频")
-            sv_emb = pipeline.sv_model.compute_embedding3(audio_tensor).to(device)
+            sv_emb = self._get_runtime_sv_model().compute_embedding3(audio_tensor).to(device)
         ge = self._compute_vits_reference_ge(
-            pipeline.vits_model,
+            vits_model,
             refer_audio_spec,
             sv_emb=sv_emb,
         )
         audio_batch, y_mask = self._run_vits_non_vocoder_decode(
-            pipeline.vits_model,
+            vits_model,
             codes=prepared.semantic_tokens.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long),
             code_lengths=torch.LongTensor([int(prepared.semantic_tokens.shape[-1])]).to(device),
             text=prepared.phones.unsqueeze(0).to(device=device, dtype=torch.long),
@@ -6612,21 +6809,23 @@ class GPTSoVITSRuntime:
             ge=ge,
             speed=float(prepared.speed_factor),
         )
-        audio_lengths = self._measure_vits_audio_lengths(pipeline.vits_model, y_mask)
+        audio_lengths = self._measure_vits_audio_lengths(vits_model, y_mask)
         audio_fragment = audio_batch[0, 0, : int(audio_lengths[0].item())].detach()
-        return audio_fragment, int(pipeline.configs.sampling_rate)
+        return audio_fragment, int(self._get_runtime_configs().sampling_rate)
 
     def _decode_prepared_requests_batched_non_vocoder(
         self,
         pipeline: Any,
         prepared_requests: list[GPTSoVITSDecodePreparedRequest],
     ) -> list[GPTSoVITSDecodedAudio]:
+        self._bind_pipeline_components(pipeline)
         if not prepared_requests:
             return []
         if bool(getattr(pipeline.configs, "use_vocoder", False)):
             raise ValueError("non-vocoder batched decode helper received vocoder pipeline")
 
-        device = torch.device(pipeline.configs.device)
+        device = torch.device(self._get_runtime_configs().device)
+        vits_model = self._get_runtime_vits_model()
         batch_size = len(prepared_requests)
         first_speed = float(prepared_requests[0].speed_factor)
         first_sample_steps = int(prepared_requests[0].sample_steps)
@@ -6686,7 +6885,7 @@ class GPTSoVITSRuntime:
                         shared_single_refer = False
                         break
             if shared_single_refer:
-                shared_refer_audio_spec = first_spec.to(dtype=pipeline.precision, device=device)
+                shared_refer_audio_spec = first_spec.to(dtype=self._get_runtime_precision(), device=device)
 
         max_semantic_len = max(int(item.semantic_tokens.shape[-1]) for item in prepared_requests)
         max_phone_len = max(int(item.phones.shape[-1]) for item in prepared_requests)
@@ -6708,18 +6907,18 @@ class GPTSoVITSRuntime:
             if shared_single_refer:
                 continue
             refer_spec = refer_specs[batch_index]
-            refer_audio_specs.append(refer_spec.spec_audio.to(dtype=pipeline.precision, device=device))
-            if bool(getattr(pipeline, "is_v2pro", False)):
+            refer_audio_specs.append(refer_spec.spec_audio.to(dtype=self._get_runtime_precision(), device=device))
+            if self._is_runtime_v2pro():
                 if refer_spec.audio_16k is None:
                     raise ValueError("GPT-SoVITS v2Pro batched non-vocoder decode 缺少 16k 参考音频")
-                sv_emb_list.append(pipeline.sv_model.compute_embedding3(refer_spec.audio_16k).to(device))
+                sv_emb_list.append(self._get_runtime_sv_model().compute_embedding3(refer_spec.audio_16k).to(device))
 
-        if bool(getattr(pipeline, "is_v2pro", False)):
+        if self._is_runtime_v2pro():
             if shared_single_refer:
                 shared_audio_tensor = refer_specs[0].audio_16k
                 if shared_audio_tensor is None:
                     raise ValueError("GPT-SoVITS v2Pro batched non-vocoder decode 缺少 16k 参考音频")
-                sv_emb_batch = pipeline.sv_model.compute_embedding3(shared_audio_tensor).to(device)
+                sv_emb_batch = self._get_runtime_sv_model().compute_embedding3(shared_audio_tensor).to(device)
             else:
                 sv_emb_batch = torch.cat(sv_emb_list, dim=0)
 
@@ -6729,7 +6928,7 @@ class GPTSoVITSRuntime:
                 raise ValueError("shared_single_refer detected but refer_audio_spec missing")
             refer_audio_specs = [shared_refer_audio_spec]
             ge_batch = self._compute_vits_reference_ge(
-                pipeline.vits_model,
+                vits_model,
                 shared_refer_audio_spec,
                 sv_emb=(sv_emb_batch[:1] if sv_emb_batch is not None else None),
             )
@@ -6745,7 +6944,7 @@ class GPTSoVITSRuntime:
             for batch_index, refer in enumerate(refer_audio_specs):
                 refer_batch[batch_index, :, : int(refer.size(2))] = refer.squeeze(0)
             ge_batch = self._compute_vits_reference_ge(
-                pipeline.vits_model,
+                vits_model,
                 refer_batch,
                 refer_lengths=refer_lengths,
                 sv_emb=sv_emb_batch,
@@ -6753,7 +6952,7 @@ class GPTSoVITSRuntime:
 
         with self._run_lock:
             audio_batch, y_mask = self._run_vits_non_vocoder_decode(
-                pipeline.vits_model,
+                vits_model,
                 codes=semantic_batch,
                 code_lengths=torch.LongTensor(semantic_lengths).to(device),
                 text=phone_batch,
@@ -6761,12 +6960,12 @@ class GPTSoVITSRuntime:
                 ge=ge_batch,
                 speed=first_speed,
             )
-        audio_lengths = self._measure_vits_audio_lengths(pipeline.vits_model, y_mask)
+        audio_lengths = self._measure_vits_audio_lengths(vits_model, y_mask)
         audio_fragments = [
             audio_batch[batch_index, 0, : int(audio_lengths[batch_index].item())].detach()
             for batch_index in range(batch_size)
         ]
-        output_sr = int(pipeline.configs.sampling_rate)
+        output_sr = int(self._get_runtime_configs().sampling_rate)
         return [
             GPTSoVITSDecodedAudio(
                 request_id=prepared.request_id,
@@ -6906,8 +7105,10 @@ class GPTSoVITSRuntime:
 
         if super_sampling:
             pipeline.init_sr_model()
-            if not getattr(pipeline, "sr_model_not_exist", False):
-                audio, sr = pipeline.sr_model(audio.unsqueeze(0), sr)
+            self._bind_pipeline_components(pipeline)
+            sr_model, sr_model_not_exist = self._get_runtime_sr_model()
+            if not sr_model_not_exist and sr_model is not None:
+                audio, sr = sr_model(audio.unsqueeze(0), sr)
                 max_audio = float(torch.abs(audio).max().item()) if isinstance(audio, torch.Tensor) and audio.numel() > 0 else 0.0
                 if max_audio > 1.0:
                     audio = audio / max_audio

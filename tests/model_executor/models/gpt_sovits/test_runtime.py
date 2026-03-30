@@ -163,6 +163,58 @@ def test_build_tts_inputs_defaults_to_upstream_cut1(tmp_path):
     assert inputs["text_split_method"] == "cut1"
 
 
+def test_bind_pipeline_components_exposes_runtime_owned_refs(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    bert_worker = object()
+    ref_worker = object()
+    g2pw_worker = object()
+    text_cpu_worker = object()
+    text_cpu_executor = object()
+    bert_stage_limiter = object()
+    ref_stage_limiter = object()
+    pipeline = SimpleNamespace(
+        configs=SimpleNamespace(device="cpu", version="v3"),
+        precision=torch.float16,
+        is_v2pro=True,
+        t2s_model=SimpleNamespace(model="t2s-model"),
+        vits_model="vits-model",
+        bert_tokenizer="bert-tokenizer",
+        bert_model="bert-model",
+        cnhuhbert_model="cnhubert-model",
+        vocoder="vocoder-model",
+        sv_model="sv-model",
+        sr_model="sr-model",
+        sr_model_not_exist=False,
+        prepare_bert_batch_worker=bert_worker,
+        prepare_ref_semantic_batch_worker=ref_worker,
+        prepare_g2pw_batch_worker=g2pw_worker,
+        prepare_text_cpu_worker=text_cpu_worker,
+        prepare_text_cpu_executor=text_cpu_executor,
+        prepare_bert_stage_limiter=bert_stage_limiter,
+        prepare_ref_semantic_stage_limiter=ref_stage_limiter,
+    )
+
+    runtime._bind_pipeline_components(pipeline)
+
+    assert runtime.get_t2s_model() == "t2s-model"
+    assert runtime._get_runtime_vits_model() == "vits-model"
+    assert runtime._get_runtime_bert_tokenizer() == "bert-tokenizer"
+    assert runtime._get_runtime_bert_model() == "bert-model"
+    assert runtime._get_runtime_cnhuhbert_model() == "cnhubert-model"
+    assert runtime._get_runtime_vocoder() == "vocoder-model"
+    assert runtime._get_runtime_sv_model() == "sv-model"
+    assert runtime._get_runtime_sr_model() == ("sr-model", False)
+    assert runtime._get_runtime_prepare_bert_batch_worker() is bert_worker
+    assert runtime._get_runtime_prepare_ref_semantic_batch_worker() is ref_worker
+    assert runtime._get_runtime_prepare_g2pw_batch_worker() is g2pw_worker
+    assert runtime._get_runtime_prepare_text_cpu_worker() is text_cpu_worker
+    assert runtime._get_runtime_prepare_text_cpu_executor() is text_cpu_executor
+    assert runtime._get_runtime_prepare_bert_stage_limiter() is bert_stage_limiter
+    assert runtime._get_runtime_prepare_ref_semantic_stage_limiter() is ref_stage_limiter
+    assert runtime._get_runtime_precision() == torch.float16
+    assert runtime._is_runtime_v2pro() is True
+
+
 def test_ensure_native_runtime_deps_skips_global_preload_by_default(tmp_path, monkeypatch):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     preload = Mock()
@@ -562,6 +614,80 @@ def test_build_ref_prompt_semantic_from_raw_uses_runtime_native_wav16k_helper_fo
     assert result.profile["prompt_semantic_cpu_prepare_ms"] == 14.0
     assert result.profile["prompt_semantic_cpu_prepare_wait_ms"] == 7.0
     assert result.profile["prompt_semantic_cpu_prepare_slots"] == 8.0
+
+
+def test_build_ref_prompt_semantic_from_raw_prefers_runtime_owned_worker_ref(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    worker = SimpleNamespace(
+        bucket_index_for_inputs=Mock(return_value=4),
+        pick_runtime_first_hit_shard_index=Mock(return_value=3),
+        estimate_runtime_exact_prewarm_target_samples=Mock(return_value=3200),
+        run_runtime_exact_prewarm=Mock(
+            return_value={
+                "prompt_semantic_runtime_exact_prewarm_applied": 1.0,
+                "prompt_semantic_runtime_exact_prewarm_ms": 1.5,
+            }
+        ),
+        submit=Mock(
+            return_value=(
+                torch.tensor([9, 10], dtype=torch.long),
+                {
+                    "prompt_semantic_wait_ms": 1.0,
+                    "prompt_semantic_stage_slots": 2.0,
+                    "prompt_semantic_stage_inflight_peak": 3.0,
+                    "prompt_semantic_cpu_prepare_ms": 4.0,
+                    "prompt_semantic_forward_ms": 5.0,
+                    "prompt_semantic_scatter_ms": 6.0,
+                },
+            )
+        ),
+    )
+    broken_worker = SimpleNamespace(
+        submit=Mock(side_effect=AssertionError("should not use pipeline ref worker directly"))
+    )
+    runtime._runtime_prepare_ref_semantic_batch_worker = worker
+    runtime._pipeline = SimpleNamespace(
+        prepare_ref_semantic_batch_worker=broken_worker,
+        prepare_ref_semantic_stage_limiter=SimpleNamespace(
+            enter=Mock(side_effect=AssertionError("should not enter fallback limiter path"))
+        ),
+    )
+    runtime._prepare_coordinator = runtime._coerce_prepare_coordinator(
+        SimpleNamespace(
+            ref_prompt_semantic_runtime_exact_prewarm_enabled=True,
+            ref_prompt_semantic_runtime_exact_prewarm_max_unique=4,
+            ref_prompt_semantic_runtime_exact_prewarm_batch_sizes=(1, 4),
+            ref_prompt_semantic_runtime_exact_prewarm_lock=threading.Lock(),
+            ref_prompt_semantic_runtime_exact_prewarmed_samples=set(),
+            ref_prompt_semantic_runtime_exact_prewarm_inflight_samples=set(),
+            ref_prompt_semantic_runtime_exact_prewarm_total=0,
+            ref_prompt_semantic_runtime_exact_prewarm_total_ms=0.0,
+            ref_prompt_semantic_runtime_exact_prewarm_peak_ms=0.0,
+            ref_prompt_semantic_bucket_first_hit_serialization_enabled=True,
+            ref_prompt_semantic_bucket_first_hit_required_hits=1,
+            ref_prompt_semantic_bucket_first_hit_bucket_indices=(4,),
+            ref_prompt_semantic_bucket_first_hit_lock=threading.Lock(),
+            ref_prompt_semantic_bucket_first_hit_states={},
+        )
+    )
+    runtime._prepare_ref_prompt_wav16k_for_worker = Mock(  # type: ignore[method-assign]
+        return_value=(
+            torch.ones((3200,), dtype=torch.float32),
+            {
+                "prompt_semantic_cpu_prepare_wait_ms": 7.0,
+                "prompt_semantic_cpu_prepare_slots": 8.0,
+                "prompt_semantic_cpu_prepare_inflight_peak": 9.0,
+                "prompt_semantic_cpu_prepare_ms": 10.0,
+            },
+        )
+    )
+
+    result = runtime._build_ref_prompt_semantic_from_raw(torch.ones((1, 3200), dtype=torch.float32), 16000)
+
+    worker.submit.assert_called_once()
+    broken_worker.submit.assert_not_called()
+    assert torch.equal(result.prompt_semantic, torch.tensor([9, 10], dtype=torch.long))
+    assert result.profile["prompt_semantic_cpu_prepare_ms"] == 14.0
 
 
 def test_run_ref_prompt_semantic_stage_prepares_wav16k_before_worker_submit_without_preload(tmp_path):
@@ -2514,6 +2640,33 @@ def test_run_text_cpu_stage_pair_uses_worker_batch_submission(tmp_path):
     assert prompt_profiled.queue_ms == pytest.approx(3.0, abs=5.0)
     assert target_profiled.result == ["target-seg"]
     assert target_profiled.run_ms == pytest.approx(6.0, abs=1e-6)
+
+
+def test_run_text_cpu_stage_pair_prefers_runtime_owned_worker_over_pipeline_attr(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    worker = SimpleNamespace(
+        submit_many_async=AsyncMock(
+            return_value=[
+                (["prompt-seg"], {"text_cpu_admission_wait_ms": 1.0, "text_cpu_queue_wait_ms": 2.0, "text_cpu_run_ms": 3.0}),
+                (["target-seg"], {"text_cpu_admission_wait_ms": 4.0, "text_cpu_queue_wait_ms": 5.0, "text_cpu_run_ms": 6.0}),
+            ]
+        )
+    )
+    broken_worker = SimpleNamespace(
+        submit_many_async=AsyncMock(side_effect=AssertionError("should not use pipeline worker directly"))
+    )
+    runtime._runtime_prepare_text_cpu_worker = worker
+    runtime._pipeline = SimpleNamespace(prepare_text_cpu_worker=broken_worker)
+    coordinator = SimpleNamespace(text_cpu_gate=SimpleNamespace(max_inflight=0))
+
+    prompt_profiled, target_profiled = runtime._run_awaitable_sync(
+        runtime._run_text_cpu_stage_pair(coordinator, "prompt", "zh", "target", "zh")
+    )
+
+    worker.submit_many_async.assert_awaited_once_with([("prompt", "zh"), ("target", "zh")])
+    broken_worker.submit_many_async.assert_not_awaited()
+    assert prompt_profiled.result == ["prompt-seg"]
+    assert target_profiled.result == ["target-seg"]
 
 
 def test_prepare_text_cpu_uses_runtime_native_payload_conversion(tmp_path):

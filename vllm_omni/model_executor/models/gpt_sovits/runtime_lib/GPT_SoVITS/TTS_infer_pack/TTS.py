@@ -251,7 +251,7 @@ def set_seed(seed: int):
 class TTS_Config:
     default_configs = {
         "v1": {
-            "device": "cpu",
+            "device": "cuda",
             "is_half": False,
             "version": "v1",
             "t2s_weights_path": "GPT_SoVITS/pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt",
@@ -262,7 +262,7 @@ class TTS_Config:
             "cnhuhbert_backend_preset": "",
         },
         "v2": {
-            "device": "cpu",
+            "device": "cuda",
             "is_half": False,
             "version": "v2",
             "t2s_weights_path": "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt",
@@ -273,7 +273,7 @@ class TTS_Config:
             "cnhuhbert_backend_preset": "",
         },
         "v3": {
-            "device": "cpu",
+            "device": "cuda",
             "is_half": False,
             "version": "v3",
             "t2s_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
@@ -284,7 +284,7 @@ class TTS_Config:
             "cnhuhbert_backend_preset": "",
         },
         "v4": {
-            "device": "cpu",
+            "device": "cuda",
             "is_half": False,
             "version": "v4",
             "t2s_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
@@ -295,7 +295,7 @@ class TTS_Config:
             "cnhuhbert_backend_preset": "",
         },
         "v2Pro": {
-            "device": "cpu",
+            "device": "cuda",
             "is_half": False,
             "version": "v2Pro",
             "t2s_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
@@ -306,7 +306,7 @@ class TTS_Config:
             "cnhuhbert_backend_preset": "",
         },
         "v2ProPlus": {
-            "device": "cpu",
+            "device": "cuda",
             "is_half": False,
             "version": "v2ProPlus",
             "t2s_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
