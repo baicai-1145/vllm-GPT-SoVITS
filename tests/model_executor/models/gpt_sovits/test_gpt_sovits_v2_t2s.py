@@ -45,7 +45,8 @@ def _session() -> SimpleNamespace:
 def test_preprocess_starts_ar_session_on_first_step():
     model = _minimal_model()
     session = _session()
-    model.runtime.start_ar_session.return_value = session
+    model.runtime.build_request_spec.return_value = "spec"
+    model.runtime.start_ar_session_from_spec.return_value = session
 
     input_ids, embeds, update = model.preprocess(
         input_ids=torch.tensor([1], dtype=torch.long),
@@ -54,7 +55,12 @@ def test_preprocess_starts_ar_session_on_first_step():
         engine_request_id="req-1",
     )
 
-    model.runtime.start_ar_session.assert_called_once()
+    model.runtime.build_request_spec.assert_called_once_with(
+        {"text": "hello", "ref_audio_path": "/tmp/ref.wav", "prompt_text": "ref", "engine_request_id": "req-1"},
+        request_id="req-1",
+    )
+    model.runtime.start_ar_session_from_spec.assert_called_once_with("spec")
+    model.runtime.start_ar_session.assert_not_called()
     model.runtime.advance_ar_session.assert_not_called()
     assert input_ids.tolist() == [1]
     assert embeds.shape == (1, 1)

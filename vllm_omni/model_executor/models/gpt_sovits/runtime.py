@@ -9,7 +9,7 @@ import ctypes
 import types
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import numpy as np
@@ -138,12 +138,12 @@ class GPTSoVITSStageTransport:
         )
 
     @classmethod
-    def from_state(cls, state: Any, request: dict[str, Any]) -> "GPTSoVITSStageTransport":
+    def from_state(cls, state: Any, spec: "GPTSoVITSRequestSpec") -> "GPTSoVITSStageTransport":
         refer_spec = getattr(state, "refer_spec", None)
         refer_audio_spec = refer_spec.spec_audio if refer_spec is not None else None
         refer_audio_16k = refer_spec.audio_16k if refer_spec is not None else None
         return cls(
-            request_id=str(getattr(state, "request_id", "")),
+            request_id=str(getattr(state, "request_id", spec.request_id)),
             semantic_tokens=torch.empty((0,), dtype=torch.long),
             phones=_clone_transport_tensor(getattr(state, "phones", None), dtype=torch.long),
             prompt_phones=_clone_transport_tensor(getattr(state, "prompt_phones", None), dtype=torch.long),
@@ -152,9 +152,9 @@ class GPTSoVITSStageTransport:
             refer_audio_16k=_clone_transport_tensor(refer_audio_16k, dtype=torch.float32),
             raw_audio=_clone_transport_tensor(getattr(state, "raw_audio", None), dtype=torch.float32),
             raw_sr=int(getattr(state, "raw_sr", 0)),
-            speed_factor=float(request.get("speed_factor", request.get("speed", 1.0) or 1.0)),
-            sample_steps=int(request.get("sample_steps", 32)),
-            super_sampling=bool(request.get("super_sampling", False)),
+            speed_factor=float(spec.speed_factor),
+            sample_steps=int(spec.sample_steps),
+            super_sampling=bool(spec.super_sampling),
         )
 
     @classmethod
@@ -287,13 +287,15 @@ class GPTSoVITSRequestSpec:
     repetition_penalty: float
     early_stop_num: int
     aux_ref_audio_paths: list[str]
+    speed_factor: float = 1.0
+    sample_steps: int = 32
+    super_sampling: bool = False
     ready_step: int = 0
 
 
 @dataclass(slots=True)
 class GPTSoVITSPreparedCpuStage:
     request_id: str
-    request: dict[str, Any]
     spec: GPTSoVITSRequestSpec
     prepare_submit_at: float
     prepare_start: float
@@ -398,6 +400,52 @@ class _GPTSoVITSNoopPrepareGate:
 _GPTSOVITS_NOOP_PREPARE_GATE = _GPTSoVITSNoopPrepareGate()
 
 
+class _GPTSoVITSAsyncStageGate:
+    def __init__(self, max_inflight: int, poll_ms: int = 1):
+        self.max_inflight = max(0, int(max_inflight))
+        self.lock = threading.Lock()
+        self.poll_s = max(0.0005, float(max(1, int(poll_ms))) / 1000.0)
+        self.inflight = 0
+        self.peak_inflight = 0
+        self.total_entered = 0
+        self.total_wait_ms = 0.0
+        self.wait_peak_ms = 0.0
+
+    async def acquire(self) -> dict[str, float]:
+        wait_start = time.perf_counter()
+        while True:
+            with self.lock:
+                if self.max_inflight <= 0 or self.inflight < self.max_inflight:
+                    self.inflight += 1
+                    self.total_entered += 1
+                    wait_ms = max(0.0, (time.perf_counter() - wait_start) * 1000.0)
+                    self.total_wait_ms += float(wait_ms)
+                    self.wait_peak_ms = max(self.wait_peak_ms, float(wait_ms))
+                    self.peak_inflight = max(self.peak_inflight, self.inflight)
+                    return {
+                        "wait_ms": float(wait_ms),
+                        "inflight": float(self.inflight),
+                        "peak_inflight": float(self.peak_inflight),
+                        "max_inflight": float(self.max_inflight),
+                    }
+            await asyncio.sleep(self.poll_s)
+
+    def release(self) -> None:
+        with self.lock:
+            self.inflight = max(0, self.inflight - 1)
+
+    def snapshot(self) -> dict[str, float]:
+        with self.lock:
+            return {
+                "max_inflight": float(self.max_inflight),
+                "inflight": float(self.inflight),
+                "peak_inflight": float(self.peak_inflight),
+                "total_entered": float(self.total_entered),
+                "total_wait_ms": float(self.total_wait_ms),
+                "wait_peak_ms": float(self.wait_peak_ms),
+            }
+
+
 @dataclass(slots=True)
 class GPTSoVITSPrepareRuntimeCoordinator:
     text_cpu_gate: Any = _GPTSOVITS_NOOP_PREPARE_GATE
@@ -416,6 +464,15 @@ class GPTSoVITSPrepareRuntimeCoordinator:
     submit_prepare_ref_audio_asset_fn: Any | None = None
     mark_enter_fn: Any | None = None
     release_split_stage_slot_fn: Any | None = None
+    tts: Any | None = None
+    lock: Any | None = None
+    inflight: int = 0
+    peak_inflight: int = 0
+    ref_audio_asset_cache_ttl_sec: float = 0.0
+    ref_audio_asset_cache_max_entries: int = 0
+    ref_audio_asset_lock: Any | None = None
+    ref_audio_asset_inflight: dict[str, concurrent.futures.Future] = field(default_factory=dict)
+    ref_audio_asset_cache: dict[str, tuple[GPTSoVITSPreparedRefAudioAsset, float]] = field(default_factory=dict)
 
     @classmethod
     def from_runtime_coordinator(cls, coordinator: Any) -> "GPTSoVITSPrepareRuntimeCoordinator":
@@ -441,6 +498,133 @@ class GPTSoVITSPrepareRuntimeCoordinator:
             submit_prepare_ref_audio_asset_fn=getattr(coordinator, "submit_prepare_ref_audio_asset", None),
             mark_enter_fn=getattr(coordinator, "_mark_enter", None),
             release_split_stage_slot_fn=getattr(coordinator, "_release_split_stage_slot", None),
+            tts=getattr(coordinator, "tts", None),
+            lock=getattr(coordinator, "lock", None),
+            inflight=int(getattr(coordinator, "inflight", 0) or 0),
+            peak_inflight=int(getattr(coordinator, "peak_inflight", 0) or 0),
+            ref_audio_asset_cache_ttl_sec=float(getattr(coordinator, "ref_audio_asset_cache_ttl_sec", 0.0) or 0.0),
+            ref_audio_asset_cache_max_entries=int(getattr(coordinator, "ref_audio_asset_cache_max_entries", 0) or 0),
+            ref_audio_asset_lock=getattr(coordinator, "ref_audio_asset_lock", None),
+            ref_audio_asset_inflight=dict(getattr(coordinator, "ref_audio_asset_inflight", {}) or {}),
+            ref_audio_asset_cache=dict(getattr(coordinator, "ref_audio_asset_cache", {}) or {}),
+        )
+
+    @staticmethod
+    def _detect_g2pw_runtime_workers(tts: Any) -> int | None:
+        snapshot_fn = getattr(tts, "snapshot_prepare_runtime_components", None)
+        if not callable(snapshot_fn):
+            return None
+        try:
+            runtime_state = snapshot_fn()
+        except Exception:
+            return None
+        if not isinstance(runtime_state, dict):
+            return None
+        g2pw_state = runtime_state.get("g2pw")
+        if not isinstance(g2pw_state, dict):
+            return None
+        worker_count = g2pw_state.get("worker_count")
+        try:
+            worker_count = int(worker_count)
+        except Exception:
+            return None
+        return max(1, worker_count)
+
+    @classmethod
+    def build_native(cls, tts: Any) -> "GPTSoVITSPrepareRuntimeCoordinator":
+        gate_poll_ms = int(os.environ.get("GPTSOVITS_PREPARE_GATE_POLL_MS", "1"))
+        use_async_text_feature_path = bool(
+            getattr(tts, "prepare_bert_batch_worker", None) is not None
+            and os.environ.get("GPTSOVITS_PREPARE_TEXT_FEATURE_DIRECT", "0") != "0"
+        )
+        text_feature_workers = 0
+        text_feature_executor = None
+        if not use_async_text_feature_path:
+            text_feature_default_workers = 16
+            text_feature_workers = max(
+                1,
+                int(os.environ.get("GPTSOVITS_PREPARE_TEXT_FEATURE_WORKERS", str(text_feature_default_workers))),
+            )
+            text_feature_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=text_feature_workers,
+                thread_name_prefix="prepare-text-feature",
+            )
+        g2pw_runtime_workers = cls._detect_g2pw_runtime_workers(tts)
+        g2pw_default_workers = (
+            int(g2pw_runtime_workers)
+            if g2pw_runtime_workers is not None
+            else max(8, int(getattr(tts, "prepare_text_cpu_workers", 8) or 8))
+        )
+        g2pw_workers = max(
+            1,
+            int(os.environ.get("GPTSOVITS_PREPARE_G2PW_WORKERS", str(g2pw_default_workers))),
+        )
+        ref_audio_default_workers = max(1, int(os.environ.get("GPTSOVITS_PREPARE_REF_SLOTS", "4")))
+        ref_audio_workers = max(
+            1,
+            int(os.environ.get("GPTSOVITS_PREPARE_REF_ASYNC_WORKERS", str(ref_audio_default_workers))),
+        )
+        text_cpu_gate_default = 0
+        g2pw_gate_default = (
+            int(g2pw_runtime_workers) if g2pw_runtime_workers is not None else max(0, int(g2pw_workers))
+        )
+        text_feature_gate_default = max(0, int(text_feature_workers))
+        ref_audio_gate_default = max(0, int(ref_audio_workers))
+        return cls(
+            text_cpu_gate=_GPTSoVITSAsyncStageGate(
+                int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_MAX_INFLIGHT", str(text_cpu_gate_default))),
+                poll_ms=gate_poll_ms,
+            ),
+            inflight_gate=_GPTSoVITSAsyncStageGate(
+                int(os.environ.get("GPTSOVITS_PREPARE_MAX_INFLIGHT", "0")),
+                poll_ms=gate_poll_ms,
+            ),
+            text_feature_gate=_GPTSoVITSAsyncStageGate(
+                int(os.environ.get("GPTSOVITS_PREPARE_TEXT_FEATURE_MAX_INFLIGHT", str(text_feature_gate_default))),
+                poll_ms=gate_poll_ms,
+            ),
+            g2pw_gate=_GPTSoVITSAsyncStageGate(
+                int(os.environ.get("GPTSOVITS_PREPARE_G2PW_MAX_INFLIGHT", str(g2pw_gate_default))),
+                poll_ms=gate_poll_ms,
+            ),
+            ref_audio_gate=_GPTSoVITSAsyncStageGate(
+                int(os.environ.get("GPTSOVITS_PREPARE_REF_MAX_INFLIGHT", str(ref_audio_gate_default))),
+                poll_ms=gate_poll_ms,
+            ),
+            ref_load_gate=_GPTSoVITSAsyncStageGate(
+                int(os.environ.get("GPTSOVITS_PREPARE_REF_LOAD_MAX_INFLIGHT", str(ref_audio_gate_default))),
+                poll_ms=gate_poll_ms,
+            ),
+            ref_spec_gate=_GPTSoVITSAsyncStageGate(
+                int(os.environ.get("GPTSOVITS_PREPARE_REF_SPEC_MAX_INFLIGHT", str(ref_audio_gate_default))),
+                poll_ms=gate_poll_ms,
+            ),
+            text_feature_executor=text_feature_executor,
+            g2pw_executor=concurrent.futures.ThreadPoolExecutor(
+                max_workers=g2pw_workers,
+                thread_name_prefix="prepare-g2pw",
+            ),
+            ref_audio_executor=concurrent.futures.ThreadPoolExecutor(
+                max_workers=ref_audio_workers,
+                thread_name_prefix="prepare-ref-audio",
+            ),
+            enable_g2pw_pair_batch=os.environ.get("GPTSOVITS_PREPARE_G2PW_PAIR_BATCH", "1") != "0",
+            enable_g2pw_audio_batch_merge=os.environ.get("GPTSOVITS_PREPARE_G2PW_AUDIO_BATCH_MERGE", "0") != "0",
+            g2pw_audio_batch_merge_group_size=max(
+                1,
+                int(os.environ.get("GPTSOVITS_PREPARE_G2PW_AUDIO_BATCH_GROUP_SIZE", "8")),
+            ),
+            tts=tts,
+            lock=threading.Lock(),
+            ref_audio_asset_cache_ttl_sec=max(
+                0.0,
+                float(os.environ.get("GPTSOVITS_PREPARE_REF_AUDIO_ASSET_CACHE_TTL_SEC", "15")),
+            ),
+            ref_audio_asset_cache_max_entries=max(
+                0,
+                int(os.environ.get("GPTSOVITS_PREPARE_REF_AUDIO_ASSET_CACHE_MAX_ENTRIES", "4")),
+            ),
+            ref_audio_asset_lock=threading.Lock(),
         )
 
     @staticmethod
@@ -494,11 +678,152 @@ class GPTSoVITSPrepareRuntimeCoordinator:
         value.add_done_callback(_forward)
         return wrapped
 
+    @staticmethod
+    def _normalize_ref_audio_cache_key(ref_audio_path: str) -> str:
+        return os.path.abspath(str(ref_audio_path))
+
+    @staticmethod
+    def _clone_prepared_ref_audio_asset(
+        asset: GPTSoVITSPreparedRefAudioAsset,
+        *,
+        extra_profile: dict[str, float] | None = None,
+    ) -> GPTSoVITSPreparedRefAudioAsset:
+        profile = dict(asset.profile or {})
+        if extra_profile:
+            profile.update({key: float(value) for key, value in extra_profile.items()})
+        return GPTSoVITSPreparedRefAudioAsset(
+            raw_audio=asset.raw_audio,
+            raw_sr=int(asset.raw_sr),
+            wav16k=asset.wav16k,
+            profile=profile,
+        )
+
+    def _prune_ref_audio_asset_cache_locked(self, now: float | None = None) -> None:
+        now_ts = time.perf_counter() if now is None else float(now)
+        ttl_sec = float(self.ref_audio_asset_cache_ttl_sec)
+        if ttl_sec <= 0.0 or self.ref_audio_asset_cache_max_entries <= 0:
+            self.ref_audio_asset_cache.clear()
+            return
+        expired_keys = [
+            key
+            for key, (_, cached_at) in self.ref_audio_asset_cache.items()
+            if (now_ts - float(cached_at)) > ttl_sec
+        ]
+        for key in expired_keys:
+            self.ref_audio_asset_cache.pop(key, None)
+        overflow = len(self.ref_audio_asset_cache) - int(self.ref_audio_asset_cache_max_entries)
+        if overflow > 0:
+            oldest_keys = sorted(
+                self.ref_audio_asset_cache.items(),
+                key=lambda item: float(item[1][1]),
+            )[:overflow]
+            for key, _ in oldest_keys:
+                self.ref_audio_asset_cache.pop(key, None)
+
+    def _build_ref_audio_asset_cache_hit_future(
+        self,
+        asset: GPTSoVITSPreparedRefAudioAsset,
+        *,
+        submit_ts: float,
+        cache_age_ms: float,
+    ) -> concurrent.futures.Future:
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        future.set_result(
+            GPTSoVITSPrepareProfiledResult(
+                result=self._clone_prepared_ref_audio_asset(
+                    asset,
+                    extra_profile={
+                        "prepared_ref_audio_cache_hit": 1.0,
+                        "prepared_ref_audio_cache_age_ms": float(cache_age_ms),
+                    },
+                ),
+                submit_at=float(submit_ts),
+                started_at=float(submit_ts),
+                finished_at=float(submit_ts),
+            )
+        )
+        return future
+
+    def _prepare_ref_audio_asset_native(
+        self,
+        ref_audio_path: str,
+        *,
+        submit_at: float,
+    ) -> GPTSoVITSPrepareProfiledResult:
+        if self.tts is None:
+            raise RuntimeError("GPT-SoVITS prepare coordinator missing native TTS runtime")
+        started_at = time.perf_counter()
+        load_start = time.perf_counter()
+        raw_audio, raw_sr = self.tts._load_ref_audio_raw(ref_audio_path)
+        load_ms = (time.perf_counter() - load_start) * 1000.0
+        wav16k, cpu_prepare_ms, limiter_stats = self.tts._prepare_prompt_semantic_wav16k_profile(raw_audio, raw_sr)
+        finished_at = time.perf_counter()
+        return GPTSoVITSPrepareProfiledResult(
+            result=GPTSoVITSPreparedRefAudioAsset(
+                raw_audio=raw_audio,
+                raw_sr=int(raw_sr),
+                wav16k=wav16k,
+                profile={
+                    "audio_load_ms": float(load_ms),
+                    "prompt_semantic_cpu_prepare_ms": float(cpu_prepare_ms),
+                    "prompt_semantic_cpu_prepare_wait_ms": float(limiter_stats.get("wait_ms", 0.0)),
+                    "prompt_semantic_cpu_prepare_slots": float(limiter_stats.get("slots", 0.0)),
+                    "prompt_semantic_cpu_prepare_inflight_peak": float(limiter_stats.get("peak_inflight", 0.0)),
+                    "prepared_ref_audio_cache_hit": 0.0,
+                    "prepared_ref_audio_cache_age_ms": 0.0,
+                },
+            ),
+            submit_at=float(submit_at),
+            started_at=float(started_at),
+            finished_at=float(finished_at),
+        )
+
     def submit_prepare_ref_audio_asset(self, ref_audio_path: str, *, submit_at: float | None = None) -> Any:
         submit_fn = self.submit_prepare_ref_audio_asset_fn
-        if not callable(submit_fn):
-            raise RuntimeError("GPT-SoVITS prepare coordinator does not provide ref-audio preload submission")
-        return self._wrap_prepare_future(submit_fn(ref_audio_path, submit_at=submit_at))
+        if callable(submit_fn):
+            return self._wrap_prepare_future(submit_fn(ref_audio_path, submit_at=submit_at))
+
+        submit_ts = time.perf_counter() if submit_at is None else float(submit_at)
+        ref_audio_path = self._normalize_ref_audio_cache_key(ref_audio_path)
+        cache_lock = self.ref_audio_asset_lock
+        executor = self.ref_audio_executor
+        if cache_lock is None or executor is None:
+            raise RuntimeError("GPT-SoVITS prepare coordinator does not provide native ref-audio preload support")
+
+        with cache_lock:
+            now = time.perf_counter()
+            self._prune_ref_audio_asset_cache_locked(now)
+            cached_entry = self.ref_audio_asset_cache.get(ref_audio_path)
+            if cached_entry is not None:
+                cached_asset, cached_at = cached_entry
+                return self._build_ref_audio_asset_cache_hit_future(
+                    cached_asset,
+                    submit_ts=submit_ts,
+                    cache_age_ms=max(0.0, (now - float(cached_at)) * 1000.0),
+                )
+            inflight_future = self.ref_audio_asset_inflight.get(ref_audio_path)
+            if inflight_future is not None:
+                return inflight_future
+            future = executor.submit(self._prepare_ref_audio_asset_native, ref_audio_path, submit_at=submit_ts)
+            self.ref_audio_asset_inflight[ref_audio_path] = future
+
+        def _finalize(done_future: concurrent.futures.Future) -> None:
+            with cache_lock:
+                self.ref_audio_asset_inflight.pop(ref_audio_path, None)
+                try:
+                    profiled = done_future.result()
+                except Exception:
+                    return
+                asset = self._coerce_prepared_ref_audio_asset(profiled.result)
+                if isinstance(asset, GPTSoVITSPreparedRefAudioAsset):
+                    self.ref_audio_asset_cache[ref_audio_path] = (
+                        self._clone_prepared_ref_audio_asset(asset),
+                        time.perf_counter(),
+                    )
+                    self._prune_ref_audio_asset_cache_locked()
+
+        future.add_done_callback(_finalize)
+        return future
 
     async def acquire_prepare_admission(self) -> dict[str, float]:
         return await self.inflight_gate.acquire()
@@ -508,12 +833,23 @@ class GPTSoVITSPrepareRuntimeCoordinator:
         if callable(mark_enter):
             current_inflight, peak_inflight = mark_enter()
             return int(current_inflight), int(peak_inflight)
-        return 0, 0
+        if self.lock is None:
+            return 0, 0
+        with self.lock:
+            self.inflight += 1
+            current_inflight = int(self.inflight)
+            self.peak_inflight = max(int(self.peak_inflight), current_inflight)
+            return current_inflight, int(self.peak_inflight)
 
     def release_split_stage_slot(self) -> None:
         release_slot = self.release_split_stage_slot_fn
         if callable(release_slot):
             release_slot()
+            return
+        if self.lock is not None:
+            with self.lock:
+                self.inflight = max(0, int(self.inflight) - 1)
+        self.inflight_gate.release()
 
 
 @dataclass(slots=True)
@@ -765,12 +1101,7 @@ class GPTSoVITSRuntime:
             if self._prepare_coordinator is not None:
                 return self._prepare_coordinator
             pipeline = self._ensure_pipeline()
-            with self._project_root_cwd():
-                from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import PrepareCoordinator
-
-                self._prepare_coordinator = self._coerce_prepare_coordinator(
-                    PrepareCoordinator(pipeline)
-                )
+            self._prepare_coordinator = GPTSoVITSPrepareRuntimeCoordinator.build_native(pipeline)
         return self._prepare_coordinator
 
     @staticmethod
@@ -1723,11 +2054,22 @@ class GPTSoVITSRuntime:
             repetition_penalty=float(inputs["repetition_penalty"]),
             early_stop_num=int(getattr(pipeline.configs, "hz", 50) * getattr(pipeline.configs, "max_sec", 30)),
             aux_ref_audio_paths=[str(item) for item in list(inputs.get("aux_ref_audio_paths") or [])],
+            speed_factor=float(inputs.get("speed_factor", 1.0)),
+            sample_steps=int(inputs.get("sample_steps", 32)),
+            super_sampling=bool(inputs.get("super_sampling", False)),
             ready_step=int(request.get("ready_step", 0)),
         )
 
-    def _state_to_transport_info(self, state: Any, request: dict[str, Any]) -> GPTSoVITSStageTransport:
-        return GPTSoVITSStageTransport.from_state(state, request)
+    def build_request_spec(
+        self,
+        request: dict[str, Any],
+        *,
+        request_id: str | None = None,
+    ) -> GPTSoVITSRequestSpec:
+        return self._build_scheduler_request_spec(request, request_id=request_id)
+
+    def _state_to_transport_info(self, state: Any, spec: GPTSoVITSRequestSpec) -> GPTSoVITSStageTransport:
+        return GPTSoVITSStageTransport.from_state(state, spec)
 
     @staticmethod
     def _estimate_scheduler_max_steps(states: list[Any]) -> int:
@@ -1847,6 +2189,120 @@ class GPTSoVITSRuntime:
         )
 
     @staticmethod
+    def _accumulate_profile_metric(
+        profile: dict[str, float] | None,
+        key: str,
+        amount: float,
+    ) -> None:
+        if profile is None:
+            return
+        profile[key] = float(profile.get(key, 0.0)) + float(amount)
+
+    @staticmethod
+    def _update_profile_metric_peak(
+        profile: dict[str, float] | None,
+        key: str,
+        value: float,
+    ) -> None:
+        if profile is None:
+            return
+        profile[key] = max(float(profile.get(key, 0.0)), float(value))
+
+    @classmethod
+    def _merge_bert_worker_profile(
+        cls,
+        profile: dict[str, float] | None,
+        worker_profile: dict[str, float],
+    ) -> None:
+        cls._accumulate_profile_metric(profile, "bert_wait_ms", worker_profile.get("bert_wait_ms", 0.0))
+        cls._accumulate_profile_metric(
+            profile,
+            "bert_admission_wait_ms",
+            worker_profile.get("bert_admission_wait_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(
+            profile,
+            "bert_queue_wait_ms",
+            worker_profile.get("bert_queue_wait_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(
+            profile,
+            "bert_worker_queue_wait_ms",
+            worker_profile.get("bert_worker_queue_wait_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(
+            profile,
+            "bert_batch_collect_wait_ms",
+            worker_profile.get("bert_batch_collect_wait_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(
+            profile,
+            "bert_batch_dispatch_delay_ms",
+            worker_profile.get("bert_batch_dispatch_delay_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(
+            profile,
+            "bert_forward_ms",
+            worker_profile.get("bert_forward_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(
+            profile,
+            "bert_tokenize_ms",
+            worker_profile.get("bert_tokenize_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(
+            profile,
+            "bert_scatter_ms",
+            worker_profile.get("bert_scatter_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(profile, "bert_calls", worker_profile.get("bert_calls", 1.0))
+        cls._update_profile_metric_peak(
+            profile,
+            "bert_stage_inflight_peak",
+            worker_profile.get("bert_stage_inflight_peak", 0.0),
+        )
+        cls._update_profile_metric_peak(
+            profile,
+            "bert_batch_size_peak",
+            worker_profile.get("bert_batch_size", 0.0),
+        )
+        cls._update_profile_metric_peak(
+            profile,
+            "bert_batch_tokens_peak",
+            worker_profile.get("bert_batch_tokens", 0.0),
+        )
+        cls._update_profile_metric_peak(
+            profile,
+            "bert_pending_depth_on_enqueue_peak",
+            worker_profile.get("bert_pending_depth_on_enqueue", 0.0),
+        )
+        cls._update_profile_metric_peak(
+            profile,
+            "bert_pending_depth_on_collect_peak",
+            worker_profile.get("bert_pending_depth_on_collect", 0.0),
+        )
+        cls._update_profile_metric_peak(
+            profile,
+            "bert_high_pressure_mode_peak",
+            worker_profile.get("bert_high_pressure_mode", 0.0),
+        )
+        if profile is not None:
+            profile["bert_stage_slots"] = float(worker_profile.get("bert_stage_slots", 0.0))
+            profile["bert_batch_window_ms"] = float(worker_profile.get("bert_batch_window_ms", 0.0))
+
+    @staticmethod
+    def _mark_bert_submit_offsets(profile: dict[str, float] | None) -> None:
+        if profile is None:
+            return
+        branch_start_ts = float(profile.get("_branch_start_ts", 0.0) or 0.0)
+        if branch_start_ts <= 0.0:
+            return
+        offset_ms = max(0.0, (time.perf_counter() - branch_start_ts) * 1000.0)
+        if "bert_submit_offset_first_ms" not in profile:
+            profile["bert_submit_offset_first_ms"] = float(offset_ms)
+        profile["bert_submit_offset_last_ms"] = float(offset_ms)
+
+    @staticmethod
     def _make_text_features(
         phones: Any,
         bert_features: torch.Tensor,
@@ -1885,6 +2341,81 @@ class GPTSoVITSRuntime:
             total_ms=0.0,
             cpu_preprocess_ms=0.0,
         )
+
+    @staticmethod
+    def _empty_bert_feature(phone_count: int, device: Any) -> torch.Tensor:
+        return torch.zeros((1024, max(0, int(phone_count))), dtype=torch.float32, device=device)
+
+    def _prepare_text_feature_segment_jobs(
+        self,
+        prepared_segments: Any,
+        profile: dict[str, float] | None,
+    ) -> dict[str, Any]:
+        pipeline = self._ensure_pipeline()
+        worker = getattr(pipeline, "prepare_bert_batch_worker", None)
+        if worker is None:
+            raise RuntimeError("GPT-SoVITS BERT batch worker 未初始化")
+        device = getattr(getattr(pipeline, "configs", None), "device", "cpu")
+        phones_list: list[list[int]] = []
+        bert_list: list[torch.Tensor | None] = []
+        norm_text_list: list[str] = []
+        pending_items: list[tuple[list[torch.Tensor | None], int, dict[str, float] | None, Any, Any]] = []
+
+        for segment in prepared_segments or []:
+            phones = [int(item) for item in list(getattr(segment, "phones", []) or [])]
+            norm_text = str(getattr(segment, "norm_text", "") or "")
+            phones_list.append(phones)
+            norm_text_list.append(norm_text)
+            segment_language = str(getattr(segment, "language", "") or "").replace("all_", "")
+            if segment_language != "zh":
+                bert_list.append(self._empty_bert_feature(len(phones), device))
+                continue
+
+            word2ph = getattr(segment, "word2ph", None)
+            if word2ph is None:
+                raise ValueError("中文文本缺少 word2ph，无法提取 BERT 特征")
+            self._mark_bert_submit_offsets(profile)
+            bert_list.append(None)
+            pending_items.append(
+                (
+                    bert_list,
+                    len(bert_list) - 1,
+                    profile,
+                    device,
+                    worker.submit_async(norm_text, list(word2ph)),
+                )
+            )
+
+        return {
+            "device": device,
+            "phones_list": phones_list,
+            "bert_list": bert_list,
+            "norm_text_list": norm_text_list,
+            "pending_items": pending_items,
+        }
+
+    async def _finalize_text_feature_segment_jobs(
+        self,
+        segment_jobs: dict[str, Any],
+    ) -> tuple[list[int], torch.Tensor, str]:
+        pending_items = list(segment_jobs.get("pending_items", []) or [])
+        if pending_items:
+            pending_results = await asyncio.gather(*[future for _, _, _, _, future in pending_items])
+            for (bert_list, bert_index, profile, device, _), (feature, worker_profile) in zip(
+                pending_items,
+                pending_results,
+            ):
+                self._merge_bert_worker_profile(profile, dict(worker_profile))
+                bert_list[bert_index] = feature.to(device)
+
+        bert_features = [feature for feature in segment_jobs.get("bert_list", []) if feature is not None]
+        if bert_features:
+            bert = torch.cat(bert_features, dim=1)
+        else:
+            bert = self._empty_bert_feature(0, segment_jobs.get("device", "cpu"))
+        phones = sum(segment_jobs.get("phones_list", []), [])
+        norm_text = "".join(segment_jobs.get("norm_text_list", []))
+        return phones, bert, norm_text
 
     def _build_text_features(
         self,
@@ -2150,8 +2681,16 @@ class GPTSoVITSRuntime:
         request_id: str | None = None,
         preload_ref_audio: bool = True,
     ) -> GPTSoVITSPreparedCpuStage:
-        coordinator = self._ensure_prepare_coordinator()
         spec = self._build_scheduler_request_spec(request, request_id=request_id)
+        return self.prepare_request_spec_cpu_stage(spec, preload_ref_audio=preload_ref_audio)
+
+    def prepare_request_spec_cpu_stage(
+        self,
+        spec: GPTSoVITSRequestSpec,
+        *,
+        preload_ref_audio: bool = True,
+    ) -> GPTSoVITSPreparedCpuStage:
+        coordinator = self._ensure_prepare_coordinator()
         ref_audio_prepare_future = None
         submit_at = time.perf_counter()
         if preload_ref_audio:
@@ -2161,7 +2700,6 @@ class GPTSoVITSRuntime:
         )
         return GPTSoVITSPreparedCpuStage(
             request_id=str(spec.request_id),
-            request=dict(request),
             spec=spec,
             prepare_submit_at=float(cpu_stage.prepare_submit_at),
             prepare_start=float(cpu_stage.prepare_start),
@@ -2181,14 +2719,25 @@ class GPTSoVITSRuntime:
     ) -> list[GPTSoVITSPreparedCpuStage]:
         if not requests:
             return []
+        specs = [
+            self._build_scheduler_request_spec(
+                request,
+                request_id=str(request.get("engine_request_id") or f"gpt_sovits_{index}"),
+            )
+            for index, request in enumerate(requests)
+        ]
+        return self.prepare_request_spec_cpu_stages(specs)
+
+    def prepare_request_spec_cpu_stages(
+        self,
+        specs: list[GPTSoVITSRequestSpec],
+    ) -> list[GPTSoVITSPreparedCpuStage]:
+        if not specs:
+            return []
         coordinator = self._ensure_prepare_coordinator()
-        specs: list[Any] = []
         submit_ats: list[float] = []
         ref_audio_prepare_futures: list[Any | None] = []
-        for index, request in enumerate(requests):
-            request_id = str(request.get("engine_request_id") or f"gpt_sovits_{index}")
-            spec = self._build_scheduler_request_spec(request, request_id=request_id)
-            specs.append(spec)
+        for spec in specs:
             submit_at = time.perf_counter()
             submit_ats.append(submit_at)
             ref_audio_prepare_futures.append(
@@ -2205,11 +2754,10 @@ class GPTSoVITSRuntime:
             )
 
         cpu_stage_results = self._run_awaitable_sync(_gather_cpu_stages())
-        if len(cpu_stage_results) != len(requests):
+        if len(cpu_stage_results) != len(specs):
             raise ValueError("GPT-SoVITS batch prepare CPU stage count mismatch")
         prepared_cpu_stages: list[GPTSoVITSPreparedCpuStage] = []
-        for request, spec, cpu_stage, ref_audio_prepare_future in zip(
-            requests,
+        for spec, cpu_stage, ref_audio_prepare_future in zip(
             specs,
             cpu_stage_results,
             ref_audio_prepare_futures,
@@ -2219,7 +2767,6 @@ class GPTSoVITSRuntime:
             prepared_cpu_stages.append(
                 GPTSoVITSPreparedCpuStage(
                     request_id=str(spec.request_id),
-                    request=dict(request),
                     spec=spec,
                     prepare_submit_at=float(cpu_stage.prepare_submit_at),
                     prepare_start=float(cpu_stage.prepare_start),
@@ -2259,16 +2806,29 @@ class GPTSoVITSRuntime:
                 coordinator.text_feature_gate.release()
 
         pipeline = self._ensure_pipeline()
+        prepare_bert_batch_worker = getattr(pipeline, "prepare_bert_batch_worker", None)
         await coordinator.text_feature_gate.acquire()
         profile: dict[str, float] = dict(base_profile or {})
         profile["cpu_preprocess_ms"] = float(cpu_run_ms)
         submit_at = time.perf_counter()
         started_at = float(submit_at)
         try:
-            result_raw = await pipeline.build_text_features_from_segments_async(
-                prepared_segments,
-                profile=profile,
-            )
+            if prepare_bert_batch_worker is None:
+                result = self._build_text_features(
+                    prepared_segments,
+                    language,
+                    cpu_run_ms,
+                    base_profile,
+                )
+                finished_at = time.perf_counter()
+                return GPTSoVITSPrepareProfiledResult(
+                    result=result,
+                    submit_at=float(submit_at),
+                    started_at=started_at,
+                    finished_at=float(finished_at),
+                )
+            segment_jobs = self._prepare_text_feature_segment_jobs(prepared_segments, profile)
+            result_raw = await self._finalize_text_feature_segment_jobs(segment_jobs)
             finished_at = time.perf_counter()
             result = self._make_text_features(
                 result_raw[0],
@@ -2668,17 +3228,60 @@ class GPTSoVITSRuntime:
             )
             return prompt_profiled, target_profiled
 
+        prepare_bert_batch_worker = getattr(pipeline, "prepare_bert_batch_worker", None)
         await coordinator.text_feature_gate.acquire()
-        target_profile: dict[str, float] = dict(target_base_profile or {})
-        target_profile["cpu_preprocess_ms"] = float(target_cpu_run_ms)
         submit_at = time.perf_counter()
         started_at = float(submit_at)
         try:
-            if prompt_is_empty:
-                target_result_raw = await pipeline.build_text_features_from_segments_async(
+            if prepare_bert_batch_worker is None:
+                target_result = self._build_text_features(
                     target_segments,
-                    profile=target_profile,
+                    None,
+                    target_cpu_run_ms,
+                    target_base_profile,
                 )
+                if prompt_is_empty:
+                    finished_at = time.perf_counter()
+                    prompt_profiled = GPTSoVITSPrepareProfiledResult(
+                        result=self._build_empty_text_features_like(target_result),
+                        submit_at=float(submit_at),
+                        started_at=float(submit_at),
+                        finished_at=float(submit_at),
+                    )
+                    target_profiled = GPTSoVITSPrepareProfiledResult(
+                        result=target_result,
+                        submit_at=float(submit_at),
+                        started_at=started_at,
+                        finished_at=float(finished_at),
+                    )
+                    return prompt_profiled, target_profiled
+
+                prompt_result = self._build_text_features(
+                    prompt_segments,
+                    None,
+                    prompt_cpu_run_ms,
+                    prompt_base_profile,
+                )
+                finished_at = time.perf_counter()
+                prompt_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=prompt_result,
+                    submit_at=float(submit_at),
+                    started_at=started_at,
+                    finished_at=float(finished_at),
+                )
+                target_profiled = GPTSoVITSPrepareProfiledResult(
+                    result=target_result,
+                    submit_at=float(submit_at),
+                    started_at=started_at,
+                    finished_at=float(finished_at),
+                )
+                return prompt_profiled, target_profiled
+
+            target_profile: dict[str, float] = dict(target_base_profile or {})
+            target_profile["cpu_preprocess_ms"] = float(target_cpu_run_ms)
+            if prompt_is_empty:
+                target_jobs = self._prepare_text_feature_segment_jobs(target_segments, target_profile)
+                target_result_raw = await self._finalize_text_feature_segment_jobs(target_jobs)
                 prompt_result = self._build_empty_text_features_like(
                     self._make_text_features(
                         target_result_raw[0],
@@ -2721,12 +3324,19 @@ class GPTSoVITSRuntime:
 
             prompt_profile: dict[str, float] = dict(prompt_base_profile or {})
             prompt_profile["cpu_preprocess_ms"] = float(prompt_cpu_run_ms)
-            prompt_result_raw, target_result_raw = await pipeline.build_text_feature_pair_from_segments_async(
-                prompt_segments,
-                target_segments,
-                prompt_profile=prompt_profile,
-                target_profile=target_profile,
-            )
+            prompt_jobs = self._prepare_text_feature_segment_jobs(prompt_segments, prompt_profile)
+            target_jobs = self._prepare_text_feature_segment_jobs(target_segments, target_profile)
+            pending_jobs = list(prompt_jobs["pending_items"]) + list(target_jobs["pending_items"])
+            if pending_jobs:
+                pending_results = await asyncio.gather(*[future for _, _, _, _, future in pending_jobs])
+                for (bert_list, bert_index, profile, device, _), (feature, worker_profile) in zip(
+                    pending_jobs,
+                    pending_results,
+                ):
+                    self._merge_bert_worker_profile(profile, dict(worker_profile))
+                    bert_list[bert_index] = feature.to(device)
+            prompt_result_raw = await self._finalize_text_feature_segment_jobs({**prompt_jobs, "pending_items": []})
+            target_result_raw = await self._finalize_text_feature_segment_jobs({**target_jobs, "pending_items": []})
             finished_at = time.perf_counter()
 
             prompt_result = self._make_text_features(
@@ -3827,11 +4437,15 @@ class GPTSoVITSRuntime:
         return GPTSoVITSPreparedRequest(
             request_id=prepared_text_phase.request_id,
             state=state,
-            transport_info=self._state_to_transport_info(state, prepared_cpu_stage.request),
+            transport_info=self._state_to_transport_info(state, prepared_cpu_stage.spec),
         )
 
     def prepare_request(self, request: dict[str, Any], *, request_id: str | None = None) -> GPTSoVITSPreparedRequest:
-        prepared_cpu_stage = self.prepare_request_cpu_stage(request, request_id=request_id)
+        spec = self._build_scheduler_request_spec(request, request_id=request_id)
+        return self.prepare_request_spec(spec)
+
+    def prepare_request_spec(self, spec: GPTSoVITSRequestSpec) -> GPTSoVITSPreparedRequest:
+        prepared_cpu_stage = self.prepare_request_spec_cpu_stage(spec)
         prepared_audio_phase = self.prepare_request_gpu_audio_phase(prepared_cpu_stage)
         prepared_ref_spec_phase = self.prepare_request_ref_spec_phase(prepared_audio_phase)
         prepared_text_phase = self.prepare_request_gpu_text_phase(prepared_audio_phase)
@@ -3840,7 +4454,19 @@ class GPTSoVITSRuntime:
     def prepare_requests(self, requests: list[dict[str, Any]]) -> list[GPTSoVITSPreparedRequest]:
         if not requests:
             return []
-        prepared_cpu_stages = self.prepare_request_cpu_stages(requests)
+        specs = [
+            self._build_scheduler_request_spec(
+                request,
+                request_id=str(request.get("engine_request_id") or f"gpt_sovits_{index}"),
+            )
+            for index, request in enumerate(requests)
+        ]
+        return self.prepare_request_specs(specs)
+
+    def prepare_request_specs(self, specs: list[GPTSoVITSRequestSpec]) -> list[GPTSoVITSPreparedRequest]:
+        if not specs:
+            return []
+        prepared_cpu_stages = self.prepare_request_spec_cpu_stages(specs)
         audio_phase_start = time.perf_counter()
         prepared_audio_phases = self.prepare_request_gpu_audio_phases(prepared_cpu_stages)
         audio_phase_wall_ms = max(0.0, (time.perf_counter() - audio_phase_start) * 1000.0)
@@ -3927,10 +4553,16 @@ class GPTSoVITSRuntime:
         )
 
     def start_ar_session(self, request: dict[str, Any], *, request_id: str | None = None) -> GPTSoVITSARSession:
-        resolved_request_id = request_id or request.get("engine_request_id") or f"gpt_sovits_ar_{time.time_ns()}"
+        spec = self._build_scheduler_request_spec(
+            request,
+            request_id=str(request_id or request.get("engine_request_id") or f"gpt_sovits_ar_{time.time_ns()}"),
+        )
+        return self.start_ar_session_from_spec(spec)
+
+    def start_ar_session_from_spec(self, spec: GPTSoVITSRequestSpec) -> GPTSoVITSARSession:
         with self._run_lock:
             with torch.inference_mode(False), torch.no_grad():
-                prepared = self.prepare_request(request, request_id=str(resolved_request_id))
+                prepared = self.prepare_request_spec(spec)
                 return self._build_ar_session_from_prepared(prepared)
 
     def advance_ar_session(self, session: GPTSoVITSARSession, sampled_token_id: int) -> torch.Tensor:
@@ -4933,32 +5565,24 @@ class GPTSoVITSRuntime:
             "batch_size": int(request.get("batch_size", 4)),
             "batch_threshold": float(request.get("batch_threshold", 0.75)),
             "split_bucket": bool(request.get("split_bucket", True)),
-            "speed_factor": float(request.get("speed_factor", 1.0)),
+            "speed_factor": float(request.get("speed_factor", request.get("speed", 1.0) or 1.0)),
             "fragment_interval": float(request.get("fragment_interval", 0.3)),
             "seed": int(request.get("seed", -1)),
             "parallel_infer": bool(request.get("parallel_infer", True)),
             "repetition_penalty": float(request.get("repetition_penalty", 1.35)),
             "sample_steps": int(request.get("sample_steps", 32)),
+            "super_sampling": bool(request.get("super_sampling", False)),
             "streaming_mode": False,
             "return_fragment": False,
         }
 
     def synthesize(self, request: dict[str, Any]) -> GPTSoVITSResult:
-        pipeline = self._ensure_pipeline()
-        inputs = self.build_tts_inputs(request)
-
-        final_chunk: tuple[int, np.ndarray] | None = None
-        with self._run_lock:
-            with self._project_root_cwd():
-                for sample_rate, audio in pipeline.run(inputs):
-                    final_chunk = (int(sample_rate), np.asarray(audio))
-
-        if final_chunk is None:
-            raise RuntimeError("GPT-SoVITS returned no audio chunk")
-
-        sample_rate, audio = final_chunk
-        audio = self._normalize_audio(audio)
-        return GPTSoVITSResult(sample_rate=sample_rate, audio=audio)
+        spec = self.build_request_spec(request)
+        prepared = self.prepare_request_spec(spec)
+        semantic_tokens = self.generate_semantic_tokens([prepared]).get(str(prepared.request_id))
+        if semantic_tokens is None:
+            raise RuntimeError(f"GPT-SoVITS native synthesize missing semantic tokens for request {prepared.request_id}")
+        return self.decode_semantic_tokens_from_transport(semantic_tokens, prepared.transport_info)
 
 
 _RUNTIME_CACHE: dict[tuple[str, str], GPTSoVITSRuntime] = {}

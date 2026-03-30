@@ -149,7 +149,8 @@ class GPTSoVITSV2T2S(nn.Module):
         session = merged_info.get(self._SESSION_KEY)
         request_id = self._request_id_from_info(merged_info)
         if session is None:
-            session = self.runtime.start_ar_session(merged_info, request_id=request_id)
+            spec = self.runtime.build_request_spec(merged_info, request_id=request_id)
+            session = self.runtime.start_ar_session_from_spec(spec)
             return input_ids, embeds, {self._SESSION_KEY: session}
 
         generated_len = int(merged_info.get("generated_len", 0) or 0)
