@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
@@ -326,6 +328,563 @@ def test_synthesize_routes_through_runtime_native_prepare_generate_decode_pipeli
     runtime.generate_semantic_tokens.assert_called_once_with([prepared])
     runtime.decode_semantic_tokens_from_transport.assert_called_once_with(semantic_tokens, {"transport": "ok"})
     assert result is expected
+
+
+def test_extract_ref_spec_from_raw_uses_runtime_native_components(tmp_path):
+    runtime = GPTSoVITSRuntime(
+        project_root="/root/vllm-omni/vllm_omni/model_executor/models/gpt_sovits/runtime_lib",
+        config_path=str(tmp_path / "dummy.yaml"),
+    )
+    pipeline = SimpleNamespace(
+        configs=SimpleNamespace(
+            device="cpu",
+            sampling_rate=32000,
+            filter_length=1280,
+            hop_length=320,
+            win_length=1280,
+            is_half=False,
+        ),
+        is_v2pro=True,
+        _extract_ref_spec_profile_from_raw=Mock(side_effect=AssertionError("should not call pipeline ref_spec helper")),
+    )
+    runtime._ensure_pipeline = Mock(return_value=pipeline)  # type: ignore[method-assign]
+    runtime._resample_audio = Mock(return_value=torch.ones((1, 8), dtype=torch.float32))  # type: ignore[method-assign]
+
+    refer_spec, profile = runtime._extract_ref_spec_from_raw(torch.ones((1, 1600), dtype=torch.float32), 32000)
+
+    pipeline._extract_ref_spec_profile_from_raw.assert_not_called()
+    runtime._resample_audio.assert_called_once()
+    assert isinstance(refer_spec, GPTSoVITSReferSpec)
+    assert refer_spec.spec_audio.ndim == 3
+    assert torch.equal(refer_spec.audio_16k, torch.ones((1, 8), dtype=torch.float32))
+    assert profile["ref_spec_to_device_ms"] >= 0.0
+    assert profile["ref_spec_spectrogram_ms"] >= 0.0
+    assert profile["ref_spec_post_resample_ms"] >= 0.0
+
+
+def test_run_ref_prompt_semantic_stage_uses_runtime_native_helper_without_worker(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+
+    @contextmanager
+    def _enter_stage():
+        yield {"wait_ms": 1.0, "slots": 2.0, "peak_inflight": 3.0}
+
+    pipeline = SimpleNamespace(
+        prepare_ref_semantic_batch_worker=None,
+        prepare_ref_semantic_stage_limiter=SimpleNamespace(enter=_enter_stage),
+        _extract_prompt_semantic_profile_from_prepared_wav16k=Mock(
+            side_effect=AssertionError("should not call pipeline prompt semantic helper")
+        ),
+    )
+    runtime._pipeline = pipeline
+    runtime._extract_prompt_semantic_profile_from_prepared_wav16k = Mock(  # type: ignore[method-assign]
+        return_value=(
+            torch.tensor([7, 8], dtype=torch.long),
+            {
+                "prompt_semantic_h2d_ms": 1.0,
+                "prompt_semantic_ssl_forward_ms": 2.0,
+                "prompt_semantic_hidden_length_ms": 0.0,
+                "prompt_semantic_extract_latent_ms": 3.0,
+                "prompt_semantic_forward_ms": 6.0,
+            },
+        )
+    )
+    prepared_asset = GPTSoVITSPreparedRefAudioAsset(
+        raw_audio=torch.ones((1, 3200), dtype=torch.float32),
+        raw_sr=16000,
+        wav16k=torch.ones((3200,), dtype=torch.float32),
+        profile={
+            "audio_load_ms": 4.0,
+            "prompt_semantic_cpu_prepare_wait_ms": 5.0,
+            "prompt_semantic_cpu_prepare_slots": 6.0,
+            "prompt_semantic_cpu_prepare_inflight_peak": 7.0,
+            "prompt_semantic_cpu_prepare_ms": 8.0,
+        },
+    )
+
+    profiled = runtime._run_awaitable_sync(
+        runtime._run_ref_prompt_semantic_stage(SimpleNamespace(), "/tmp/ref.wav", prepared_asset=prepared_asset)
+    )
+
+    runtime._extract_prompt_semantic_profile_from_prepared_wav16k.assert_called_once_with(prepared_asset.wav16k)
+    pipeline._extract_prompt_semantic_profile_from_prepared_wav16k.assert_not_called()
+    assert torch.equal(profiled.result.prompt_semantic, torch.tensor([7, 8], dtype=torch.long))
+    assert profiled.result.profile["audio_load_ms"] == 4.0
+    assert profiled.result.profile["prompt_semantic_forward_ms"] == 6.0
+    assert profiled.result.profile["prompt_semantic_cpu_prepare_wait_ms"] == 5.0
+    assert profiled.result.profile["audio_stage_slots"] == 2.0
+
+
+def test_build_ref_prompt_semantic_from_raw_uses_runtime_native_wav16k_helper_for_worker(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    worker = SimpleNamespace(
+        bucket_index_for_inputs=Mock(return_value=4),
+        pick_runtime_first_hit_shard_index=Mock(return_value=3),
+        estimate_runtime_exact_prewarm_target_samples=Mock(return_value=3200),
+        run_runtime_exact_prewarm=Mock(
+            return_value={
+                "prompt_semantic_runtime_exact_prewarm_applied": 1.0,
+                "prompt_semantic_runtime_exact_prewarm_ms": 1.5,
+            }
+        ),
+        submit=Mock(
+            return_value=(
+                torch.tensor([9, 10], dtype=torch.long),
+                {
+                    "prompt_semantic_wait_ms": 1.0,
+                    "prompt_semantic_stage_slots": 2.0,
+                    "prompt_semantic_stage_inflight_peak": 3.0,
+                    "prompt_semantic_cpu_prepare_ms": 4.0,
+                    "prompt_semantic_forward_ms": 5.0,
+                    "prompt_semantic_scatter_ms": 6.0,
+                },
+            )
+        )
+    )
+    pipeline = SimpleNamespace(
+        prepare_ref_semantic_batch_worker=worker,
+        _prepare_ref_prompt_wav16k_for_worker=Mock(
+            side_effect=AssertionError("should not call pipeline wav16k helper")
+        ),
+    )
+    runtime._pipeline = pipeline
+    runtime._prepare_coordinator = runtime._coerce_prepare_coordinator(
+        SimpleNamespace(
+            ref_prompt_semantic_runtime_exact_prewarm_enabled=True,
+            ref_prompt_semantic_runtime_exact_prewarm_max_unique=4,
+            ref_prompt_semantic_runtime_exact_prewarm_batch_sizes=(1, 4),
+            ref_prompt_semantic_runtime_exact_prewarm_lock=threading.Lock(),
+            ref_prompt_semantic_runtime_exact_prewarmed_samples=set(),
+            ref_prompt_semantic_runtime_exact_prewarm_inflight_samples=set(),
+            ref_prompt_semantic_runtime_exact_prewarm_total=0,
+            ref_prompt_semantic_runtime_exact_prewarm_total_ms=0.0,
+            ref_prompt_semantic_runtime_exact_prewarm_peak_ms=0.0,
+            ref_prompt_semantic_bucket_first_hit_serialization_enabled=True,
+            ref_prompt_semantic_bucket_first_hit_required_hits=1,
+            ref_prompt_semantic_bucket_first_hit_bucket_indices=(4,),
+            ref_prompt_semantic_bucket_first_hit_lock=threading.Lock(),
+            ref_prompt_semantic_bucket_first_hit_states={},
+        )
+    )
+    runtime._prepare_ref_prompt_wav16k_for_worker = Mock(  # type: ignore[method-assign]
+        return_value=(
+            torch.ones((3200,), dtype=torch.float32),
+            {
+                "prompt_semantic_cpu_prepare_wait_ms": 7.0,
+                "prompt_semantic_cpu_prepare_slots": 8.0,
+                "prompt_semantic_cpu_prepare_inflight_peak": 9.0,
+                "prompt_semantic_cpu_prepare_ms": 10.0,
+            },
+        )
+    )
+
+    result = runtime._build_ref_prompt_semantic_from_raw(torch.ones((1, 3200), dtype=torch.float32), 16000)
+
+    runtime._prepare_ref_prompt_wav16k_for_worker.assert_called_once()
+    pipeline._prepare_ref_prompt_wav16k_for_worker.assert_not_called()
+    worker.submit.assert_called_once()
+    worker.estimate_runtime_exact_prewarm_target_samples.assert_called_once()
+    worker.run_runtime_exact_prewarm.assert_called_once_with(
+        ANY,
+        16000,
+        wav16k=ANY,
+        batch_sizes=[1, 4],
+    )
+    assert worker.submit.call_args.kwargs["runtime_exact_prewarm_profile"] == {
+        "prompt_semantic_runtime_exact_prewarm_applied": 1.0,
+        "prompt_semantic_runtime_exact_prewarm_ms": 1.5,
+        "prompt_semantic_runtime_exact_prewarm_target_samples": 3200.0,
+        "prompt_semantic_runtime_exact_prewarm_batch_sizes": 2.0,
+        "prompt_semantic_runtime_exact_prewarm_skipped_capacity": 0.0,
+    }
+    assert worker.submit.call_args.kwargs["bucket_index"] == 4
+    assert worker.submit.call_args.kwargs["preferred_shard_index"] == 3
+    assert worker.submit.call_args.kwargs["bucket_first_hit_serialized"] is True
+    assert torch.equal(result.prompt_semantic, torch.tensor([9, 10], dtype=torch.long))
+    assert result.profile["prompt_semantic_cpu_prepare_ms"] == 14.0
+    assert result.profile["prompt_semantic_cpu_prepare_wait_ms"] == 7.0
+    assert result.profile["prompt_semantic_cpu_prepare_slots"] == 8.0
+
+
+def test_run_ref_prompt_semantic_stage_prepares_wav16k_before_worker_submit_without_preload(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    worker = SimpleNamespace(
+        bucket_index_for_inputs=Mock(return_value=4),
+        pick_runtime_first_hit_shard_index=Mock(return_value=3),
+        estimate_runtime_exact_prewarm_target_samples=Mock(return_value=3200),
+        run_runtime_exact_prewarm=Mock(
+            return_value={
+                "prompt_semantic_runtime_exact_prewarm_applied": 1.0,
+                "prompt_semantic_runtime_exact_prewarm_ms": 2.5,
+            }
+        ),
+        submit_async=AsyncMock(
+            return_value=(
+                torch.tensor([5, 6], dtype=torch.long),
+                {
+                    "prompt_semantic_wait_ms": 1.0,
+                    "prompt_semantic_stage_slots": 2.0,
+                    "prompt_semantic_stage_inflight_peak": 3.0,
+                    "prompt_semantic_cpu_prepare_ms": 4.0,
+                    "prompt_semantic_forward_ms": 5.0,
+                    "prompt_semantic_scatter_ms": 6.0,
+                },
+            )
+        )
+    )
+    pipeline = SimpleNamespace(
+        prepare_ref_semantic_batch_worker=worker,
+        prepare_ref_semantic_stage_limiter=None,
+    )
+    runtime._pipeline = pipeline
+    runtime._prepare_coordinator = runtime._coerce_prepare_coordinator(
+        SimpleNamespace(
+            ref_prompt_semantic_runtime_exact_prewarm_enabled=True,
+            ref_prompt_semantic_runtime_exact_prewarm_max_unique=4,
+            ref_prompt_semantic_runtime_exact_prewarm_batch_sizes=(1, 2),
+            ref_prompt_semantic_runtime_exact_prewarm_lock=threading.Lock(),
+            ref_prompt_semantic_runtime_exact_prewarmed_samples=set(),
+            ref_prompt_semantic_runtime_exact_prewarm_inflight_samples=set(),
+            ref_prompt_semantic_runtime_exact_prewarm_total=0,
+            ref_prompt_semantic_runtime_exact_prewarm_total_ms=0.0,
+            ref_prompt_semantic_runtime_exact_prewarm_peak_ms=0.0,
+            ref_prompt_semantic_bucket_first_hit_serialization_enabled=True,
+            ref_prompt_semantic_bucket_first_hit_required_hits=1,
+            ref_prompt_semantic_bucket_first_hit_bucket_indices=(4,),
+            ref_prompt_semantic_bucket_first_hit_lock=threading.Lock(),
+            ref_prompt_semantic_bucket_first_hit_states={},
+        )
+    )
+    runtime._prepare_run_on_executor = AsyncMock(  # type: ignore[method-assign]
+        return_value=GPTSoVITSPrepareProfiledResult(
+            result=(torch.ones((1, 3200), dtype=torch.float32), 16000),
+            submit_at=1.0,
+            started_at=1.5,
+            finished_at=2.0,
+        )
+    )
+    runtime._prepare_ref_prompt_wav16k_for_worker = Mock(  # type: ignore[method-assign]
+        return_value=(
+            torch.ones((3200,), dtype=torch.float32),
+            {
+                "prompt_semantic_cpu_prepare_wait_ms": 7.0,
+                "prompt_semantic_cpu_prepare_slots": 8.0,
+                "prompt_semantic_cpu_prepare_inflight_peak": 9.0,
+                "prompt_semantic_cpu_prepare_ms": 10.0,
+            },
+        )
+    )
+
+    profiled = runtime._run_awaitable_sync(
+        runtime._run_ref_prompt_semantic_stage(runtime._prepare_coordinator, "/tmp/ref.wav", prepared_asset_future=None)
+    )
+
+    runtime._prepare_ref_prompt_wav16k_for_worker.assert_called_once()
+    worker.submit_async.assert_awaited_once()
+    submit_args = worker.submit_async.await_args.args
+    submit_kwargs = worker.submit_async.await_args.kwargs
+    worker.estimate_runtime_exact_prewarm_target_samples.assert_called_once()
+    worker.run_runtime_exact_prewarm.assert_called_once_with(
+        ANY,
+        16000,
+        wav16k=ANY,
+        batch_sizes=[1, 2],
+    )
+    assert submit_args[1] == 16000
+    assert torch.equal(submit_kwargs["wav16k"], torch.ones((3200,), dtype=torch.float32))
+    assert submit_kwargs["runtime_exact_prewarm_profile"] == {
+        "prompt_semantic_runtime_exact_prewarm_applied": 1.0,
+        "prompt_semantic_runtime_exact_prewarm_ms": 2.5,
+        "prompt_semantic_runtime_exact_prewarm_target_samples": 3200.0,
+        "prompt_semantic_runtime_exact_prewarm_batch_sizes": 2.0,
+        "prompt_semantic_runtime_exact_prewarm_skipped_capacity": 0.0,
+    }
+    assert submit_kwargs["bucket_index"] == 4
+    assert submit_kwargs["preferred_shard_index"] == 3
+    assert submit_kwargs["bucket_first_hit_serialized"] is True
+    assert profiled.result.profile["prompt_semantic_preload_cpu_prepare_ms"] == 10.0
+    assert profiled.result.profile["prompt_semantic_cpu_prepare_wait_ms"] == 7.0
+    assert profiled.result.profile["prompt_semantic_cpu_prepare_slots"] == 8.0
+
+
+def test_run_ref_prompt_semantic_stage_batch_uses_worker_with_preloaded_assets(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    worker = SimpleNamespace(
+        bucket_index_for_inputs=Mock(side_effect=[4, 4]),
+        pick_runtime_first_hit_shard_index=Mock(return_value=3),
+        estimate_runtime_exact_prewarm_target_samples=Mock(side_effect=[3200, 6400]),
+        run_runtime_exact_prewarm=Mock(
+            side_effect=[
+                {
+                    "prompt_semantic_runtime_exact_prewarm_applied": 1.0,
+                    "prompt_semantic_runtime_exact_prewarm_ms": 3.5,
+                    "prompt_semantic_runtime_exact_prewarm_target_samples": 3200.0,
+                    "prompt_semantic_runtime_exact_prewarm_batch_sizes": 2.0,
+                    "prompt_semantic_runtime_exact_prewarm_skipped_capacity": 0.0,
+                },
+                {
+                    "prompt_semantic_runtime_exact_prewarm_applied": 0.0,
+                    "prompt_semantic_runtime_exact_prewarm_ms": 0.0,
+                    "prompt_semantic_runtime_exact_prewarm_target_samples": 6400.0,
+                    "prompt_semantic_runtime_exact_prewarm_batch_sizes": 2.0,
+                    "prompt_semantic_runtime_exact_prewarm_skipped_capacity": 0.0,
+                },
+            ]
+        ),
+        submit_async=AsyncMock(
+            side_effect=[
+                (
+                    torch.tensor([5, 6], dtype=torch.long),
+                    {
+                        "prompt_semantic_wait_ms": 1.0,
+                        "prompt_semantic_stage_slots": 2.0,
+                        "prompt_semantic_stage_inflight_peak": 3.0,
+                        "prompt_semantic_cpu_prepare_ms": 4.0,
+                        "prompt_semantic_forward_ms": 5.0,
+                        "prompt_semantic_scatter_ms": 6.0,
+                    },
+                ),
+                (
+                    torch.tensor([7, 8], dtype=torch.long),
+                    {
+                        "prompt_semantic_wait_ms": 1.5,
+                        "prompt_semantic_stage_slots": 2.5,
+                        "prompt_semantic_stage_inflight_peak": 3.5,
+                        "prompt_semantic_cpu_prepare_ms": 4.5,
+                        "prompt_semantic_forward_ms": 5.5,
+                        "prompt_semantic_scatter_ms": 6.5,
+                    },
+                ),
+            ]
+        )
+    )
+    pipeline = SimpleNamespace(
+        prepare_ref_semantic_batch_worker=worker,
+        prepare_ref_semantic_stage_limiter=SimpleNamespace(snapshot=Mock(return_value={"slots": 9.0, "peak_inflight": 10.0})),
+    )
+    runtime._pipeline = pipeline
+    runtime._prepare_coordinator = runtime._coerce_prepare_coordinator(
+        SimpleNamespace(
+            ref_prompt_semantic_runtime_exact_prewarm_enabled=True,
+            ref_prompt_semantic_runtime_exact_prewarm_max_unique=4,
+            ref_prompt_semantic_runtime_exact_prewarm_batch_sizes=(1, 2),
+            ref_prompt_semantic_runtime_exact_prewarm_lock=threading.Lock(),
+            ref_prompt_semantic_runtime_exact_prewarmed_samples=set(),
+            ref_prompt_semantic_runtime_exact_prewarm_inflight_samples=set(),
+            ref_prompt_semantic_runtime_exact_prewarm_total=0,
+            ref_prompt_semantic_runtime_exact_prewarm_total_ms=0.0,
+            ref_prompt_semantic_runtime_exact_prewarm_peak_ms=0.0,
+            ref_prompt_semantic_bucket_first_hit_serialization_enabled=True,
+            ref_prompt_semantic_bucket_first_hit_required_hits=2,
+            ref_prompt_semantic_bucket_first_hit_bucket_indices=(4,),
+            ref_prompt_semantic_bucket_first_hit_lock=threading.Lock(),
+            ref_prompt_semantic_bucket_first_hit_states={},
+        )
+    )
+
+    future_a = concurrent.futures.Future()
+    future_a.set_result(
+        GPTSoVITSPrepareProfiledResult(
+            result=GPTSoVITSPreparedRefAudioAsset(
+                raw_audio=torch.ones((1, 3200), dtype=torch.float32),
+                raw_sr=16000,
+                wav16k=torch.ones((3200,), dtype=torch.float32),
+                profile={
+                    "audio_load_ms": 4.0,
+                    "prompt_semantic_cpu_prepare_wait_ms": 5.0,
+                    "prompt_semantic_cpu_prepare_slots": 6.0,
+                    "prompt_semantic_cpu_prepare_inflight_peak": 7.0,
+                    "prompt_semantic_cpu_prepare_ms": 8.0,
+                },
+            ),
+            submit_at=1.0,
+            started_at=1.0,
+            finished_at=1.5,
+        )
+    )
+    future_b = concurrent.futures.Future()
+    future_b.set_result(
+        GPTSoVITSPrepareProfiledResult(
+            result=GPTSoVITSPreparedRefAudioAsset(
+                raw_audio=torch.full((1, 3200), 2.0, dtype=torch.float32),
+                raw_sr=16000,
+                wav16k=torch.full((3200,), 2.0, dtype=torch.float32),
+                profile={
+                    "audio_load_ms": 9.0,
+                    "prompt_semantic_cpu_prepare_wait_ms": 10.0,
+                    "prompt_semantic_cpu_prepare_slots": 11.0,
+                    "prompt_semantic_cpu_prepare_inflight_peak": 12.0,
+                    "prompt_semantic_cpu_prepare_ms": 13.0,
+                },
+            ),
+            submit_at=2.0,
+            started_at=2.0,
+            finished_at=2.5,
+        )
+    )
+
+    results = runtime._run_awaitable_sync(
+        runtime._run_ref_prompt_semantic_stage_batch(
+            runtime._prepare_coordinator,
+            [
+                ("/tmp/a.wav", future_a, None),
+                ("/tmp/b.wav", future_b, None),
+            ],
+        )
+    )
+
+    assert worker.submit_async.await_count == 2
+    assert worker.estimate_runtime_exact_prewarm_target_samples.call_count == 2
+    assert worker.run_runtime_exact_prewarm.call_count == 2
+    first_kwargs = worker.submit_async.await_args_list[0].kwargs
+    second_kwargs = worker.submit_async.await_args_list[1].kwargs
+    assert torch.equal(first_kwargs["wav16k"], torch.ones((3200,), dtype=torch.float32))
+    assert torch.equal(second_kwargs["wav16k"], torch.full((3200,), 2.0, dtype=torch.float32))
+    assert first_kwargs["runtime_exact_prewarm_profile"] == {
+        "prompt_semantic_runtime_exact_prewarm_applied": 1.0,
+        "prompt_semantic_runtime_exact_prewarm_ms": 3.5,
+        "prompt_semantic_runtime_exact_prewarm_target_samples": 3200.0,
+        "prompt_semantic_runtime_exact_prewarm_batch_sizes": 2.0,
+        "prompt_semantic_runtime_exact_prewarm_skipped_capacity": 0.0,
+    }
+    assert first_kwargs["bucket_index"] == 4
+    assert first_kwargs["preferred_shard_index"] == 3
+    assert first_kwargs["bucket_first_hit_serialized"] is True
+    assert second_kwargs["runtime_exact_prewarm_profile"] == {
+        "prompt_semantic_runtime_exact_prewarm_applied": 0.0,
+        "prompt_semantic_runtime_exact_prewarm_ms": 0.0,
+        "prompt_semantic_runtime_exact_prewarm_target_samples": 6400.0,
+        "prompt_semantic_runtime_exact_prewarm_batch_sizes": 2.0,
+        "prompt_semantic_runtime_exact_prewarm_skipped_capacity": 0.0,
+    }
+    assert second_kwargs["bucket_index"] == 4
+    assert second_kwargs["preferred_shard_index"] == 3
+    assert second_kwargs["bucket_first_hit_serialized"] is True
+    assert all(not isinstance(item, Exception) for item in results)
+    first = results[0]
+    second = results[1]
+    assert isinstance(first, GPTSoVITSPrepareProfiledResult)
+    assert isinstance(second, GPTSoVITSPrepareProfiledResult)
+    assert first.result.profile["prompt_semantic_preload_cpu_prepare_ms"] == 8.0
+    assert first.result.profile["prompt_semantic_cpu_prepare_wait_ms"] == 5.0
+    assert first.result.profile["audio_stage_slots"] == 9.0
+    assert second.result.profile["prompt_semantic_preload_cpu_prepare_ms"] == 13.0
+    assert second.result.profile["prompt_semantic_cpu_prepare_slots"] == 11.0
+    assert second.result.profile["audio_stage_inflight_peak"] == 10.0
+
+
+def test_build_ref_prompt_semantic_runtime_exact_prewarm_profile_uses_runtime_coordinator_dedupe_and_capacity(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    coordinator = runtime._coerce_prepare_coordinator(
+        SimpleNamespace(
+            ref_prompt_semantic_runtime_exact_prewarm_enabled=True,
+            ref_prompt_semantic_runtime_exact_prewarm_max_unique=1,
+            ref_prompt_semantic_runtime_exact_prewarm_batch_sizes=(1, 3),
+            ref_prompt_semantic_runtime_exact_prewarm_lock=threading.Lock(),
+            ref_prompt_semantic_runtime_exact_prewarmed_samples=set(),
+            ref_prompt_semantic_runtime_exact_prewarm_inflight_samples=set(),
+            ref_prompt_semantic_runtime_exact_prewarm_total=0,
+            ref_prompt_semantic_runtime_exact_prewarm_total_ms=0.0,
+            ref_prompt_semantic_runtime_exact_prewarm_peak_ms=0.0,
+        )
+    )
+    worker = SimpleNamespace(
+        estimate_runtime_exact_prewarm_target_samples=Mock(side_effect=[3200, 3200, 6400]),
+        run_runtime_exact_prewarm=Mock(
+            return_value={
+                "prompt_semantic_runtime_exact_prewarm_applied": 1.0,
+                "prompt_semantic_runtime_exact_prewarm_ms": 4.0,
+                "prompt_semantic_runtime_exact_prewarm_target_samples": 3200.0,
+                "prompt_semantic_runtime_exact_prewarm_batch_sizes": 2.0,
+                "prompt_semantic_runtime_exact_prewarm_skipped_capacity": 0.0,
+            }
+        ),
+    )
+
+    first = runtime._build_ref_prompt_semantic_runtime_exact_prewarm_profile(
+        coordinator,
+        worker,
+        torch.ones((1, 3200), dtype=torch.float32),
+        16000,
+        wav16k=torch.ones((3200,), dtype=torch.float32),
+    )
+    second = runtime._build_ref_prompt_semantic_runtime_exact_prewarm_profile(
+        coordinator,
+        worker,
+        torch.ones((1, 3200), dtype=torch.float32),
+        16000,
+        wav16k=torch.ones((3200,), dtype=torch.float32),
+    )
+    third = runtime._build_ref_prompt_semantic_runtime_exact_prewarm_profile(
+        coordinator,
+        worker,
+        torch.ones((1, 6400), dtype=torch.float32),
+        16000,
+        wav16k=torch.ones((6400,), dtype=torch.float32),
+    )
+
+    worker.run_runtime_exact_prewarm.assert_called_once_with(
+        ANY,
+        16000,
+        wav16k=ANY,
+        batch_sizes=[1, 3],
+    )
+    assert first["prompt_semantic_runtime_exact_prewarm_applied"] == 1.0
+    assert second["prompt_semantic_runtime_exact_prewarm_applied"] == 0.0
+    assert third["prompt_semantic_runtime_exact_prewarm_skipped_capacity"] == 1.0
+    assert third["prompt_semantic_runtime_exact_prewarm_target_samples"] == 6400.0
+    assert coordinator.ref_prompt_semantic_runtime_exact_prewarm_total == 1
+    assert coordinator.ref_prompt_semantic_runtime_exact_prewarm_total_ms == 4.0
+    assert coordinator.ref_prompt_semantic_runtime_exact_prewarm_peak_ms == 4.0
+
+
+def test_build_ref_prompt_semantic_worker_routing_uses_runtime_coordinator_first_hit_state(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    coordinator = runtime._coerce_prepare_coordinator(
+        SimpleNamespace(
+            ref_prompt_semantic_bucket_first_hit_serialization_enabled=True,
+            ref_prompt_semantic_bucket_first_hit_required_hits=2,
+            ref_prompt_semantic_bucket_first_hit_bucket_indices=(4,),
+            ref_prompt_semantic_bucket_first_hit_lock=threading.Lock(),
+            ref_prompt_semantic_bucket_first_hit_states={},
+        )
+    )
+    worker = SimpleNamespace(
+        bucket_index_for_inputs=Mock(side_effect=[4, 4, 4]),
+        pick_runtime_first_hit_shard_index=Mock(return_value=7),
+    )
+
+    route_a = runtime._build_ref_prompt_semantic_worker_routing(
+        coordinator,
+        worker,
+        torch.ones((1, 3200), dtype=torch.float32),
+        16000,
+        wav16k=torch.ones((3200,), dtype=torch.float32),
+    )
+    route_b = runtime._build_ref_prompt_semantic_worker_routing(
+        coordinator,
+        worker,
+        torch.ones((1, 3200), dtype=torch.float32),
+        16000,
+        wav16k=torch.ones((3200,), dtype=torch.float32),
+    )
+    route_c = runtime._build_ref_prompt_semantic_worker_routing(
+        coordinator,
+        worker,
+        torch.ones((1, 3200), dtype=torch.float32),
+        16000,
+        wav16k=torch.ones((3200,), dtype=torch.float32),
+    )
+
+    runtime._mark_ref_prompt_semantic_worker_routing_completed(coordinator, route_a)
+    runtime._mark_ref_prompt_semantic_worker_routing_completed(coordinator, route_b)
+
+    worker.pick_runtime_first_hit_shard_index.assert_called_once()
+    assert route_a == {"bucket_index": 4, "preferred_shard_index": 7, "bucket_first_hit_serialized": True}
+    assert route_b == {"bucket_index": 4, "preferred_shard_index": 7, "bucket_first_hit_serialized": True}
+    assert route_c == {"bucket_index": 4, "preferred_shard_index": None, "bucket_first_hit_serialized": False}
+    assert coordinator.ref_prompt_semantic_bucket_first_hit_states[4]["dispatched_hits"] == 2
+    assert coordinator.ref_prompt_semantic_bucket_first_hit_states[4]["completed_hits"] == 2
 
 
 def test_prepare_decode_requests_batches_prepare_contract(tmp_path):
@@ -952,25 +1511,23 @@ def test_preload_ref_audio_asset_wraps_runtime_future_into_runtime_native_types(
 
 def test_native_prepare_coordinator_ref_audio_preload_uses_cache(tmp_path):
     wav_path = tmp_path / "ref.wav"
-    sf.write(wav_path, np.zeros(1600, dtype=np.float32), 16000)
+    sf.write(wav_path, np.zeros(48000, dtype=np.float32), 16000)
 
     load_calls = []
 
     def _load_ref_audio_raw(path: str):
         load_calls.append(path)
-        return torch.ones((1, 1600), dtype=torch.float32), 16000
+        return torch.ones((1, 48000), dtype=torch.float32), 16000
 
     pipeline = SimpleNamespace(
         prepare_bert_batch_worker=None,
         prepare_text_cpu_workers=2,
+        configs=SimpleNamespace(sampling_rate=32000),
+        prepare_ref_audio_cpu_limiter=None,
         snapshot_prepare_runtime_components=Mock(return_value={"g2pw": {"worker_count": 1}}),
         _load_ref_audio_raw=_load_ref_audio_raw,
         _prepare_prompt_semantic_wav16k_profile=Mock(
-            return_value=(
-                torch.ones((1600,), dtype=torch.float32),
-                4.0,
-                {"wait_ms": 1.0, "slots": 2.0, "peak_inflight": 3.0},
-            )
+            side_effect=AssertionError("should not call tts preload wav16k helper")
         ),
     )
     coordinator = GPTSoVITSPrepareRuntimeCoordinator.build_native(pipeline)
@@ -987,6 +1544,7 @@ def test_native_prepare_coordinator_ref_audio_preload_uses_cache(tmp_path):
             coordinator.ref_audio_executor.shutdown(wait=True, cancel_futures=True)
 
     assert len(load_calls) == 1
+    pipeline._prepare_prompt_semantic_wav16k_profile.assert_not_called()
     assert isinstance(first, GPTSoVITSPrepareProfiledResult)
     assert isinstance(first.result, GPTSoVITSPreparedRefAudioAsset)
     assert first.result.profile["prepared_ref_audio_cache_hit"] == 0.0
@@ -1248,6 +1806,87 @@ def test_prepare_gpu_audio_phase_async_uses_runtime_native_prepare_kernels(tmp_p
     assert phase_one.prompt_g2pw_profiled is prompt_g2pw
     assert phase_one.target_g2pw_profiled is target_g2pw
     assert phase_one.ref_audio_profiled is ref_audio
+
+
+def test_prepare_gpu_audio_phase_batch_async_uses_runtime_native_ref_audio_batch_helper(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    coordinator = SimpleNamespace(g2pw_audio_batch_merge_group_size=8)
+    prompt_a = GPTSoVITSPrepareProfiledResult(result=["prompt-a"], submit_at=1.0, started_at=1.0, finished_at=2.0)
+    target_a = GPTSoVITSPrepareProfiledResult(result=["target-a"], submit_at=1.0, started_at=1.0, finished_at=2.0)
+    prompt_b = GPTSoVITSPrepareProfiledResult(result=["prompt-b"], submit_at=1.0, started_at=1.0, finished_at=2.0)
+    target_b = GPTSoVITSPrepareProfiledResult(result=["target-b"], submit_at=1.0, started_at=1.0, finished_at=2.0)
+    ref_a = GPTSoVITSPrepareProfiledResult(
+        result=GPTSoVITSRefAudioBundle(
+            prompt_semantic=torch.tensor([1], dtype=torch.long),
+            raw_audio=torch.tensor([0.1]),
+            raw_sr=16000,
+            profile={},
+        ),
+        submit_at=1.0,
+        started_at=1.0,
+        finished_at=3.0,
+    )
+    ref_b = GPTSoVITSPrepareProfiledResult(
+        result=GPTSoVITSRefAudioBundle(
+            prompt_semantic=torch.tensor([2], dtype=torch.long),
+            raw_audio=torch.tensor([0.2]),
+            raw_sr=16000,
+            profile={},
+        ),
+        submit_at=1.0,
+        started_at=1.0,
+        finished_at=3.5,
+    )
+    runtime._run_g2pw_pair_stage_batch = AsyncMock(return_value=[(prompt_a, target_a), (prompt_b, target_b)])  # type: ignore[method-assign]
+    runtime._run_ref_prompt_semantic_stage_batch = AsyncMock(return_value=[ref_a, ref_b])  # type: ignore[method-assign]
+    runtime._run_ref_prompt_semantic_stage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("should not call per-request ref audio helper")
+    )
+
+    prepared_cpu_stages = [
+        GPTSoVITSPreparedCpuStage(
+            request_id="req-a",
+            spec=SimpleNamespace(ref_audio_path="/tmp/a.wav"),
+            prepare_submit_at=0.0,
+            prepare_start=0.0,
+            prompt_text="prompt-a",
+            text="target-a",
+            prepare_admission_wait_ms=0.0,
+            current_inflight=0,
+            peak_inflight=0,
+            prompt_cpu_profiled=SimpleNamespace(result=["prompt-a"]),
+            target_cpu_profiled=SimpleNamespace(result=["target-a"]),
+            ref_audio_prepare_future="future-a",
+        ),
+        GPTSoVITSPreparedCpuStage(
+            request_id="req-b",
+            spec=SimpleNamespace(ref_audio_path="/tmp/b.wav"),
+            prepare_submit_at=0.0,
+            prepare_start=0.0,
+            prompt_text="prompt-b",
+            text="target-b",
+            prepare_admission_wait_ms=0.0,
+            current_inflight=0,
+            peak_inflight=0,
+            prompt_cpu_profiled=SimpleNamespace(result=["prompt-b"]),
+            target_cpu_profiled=SimpleNamespace(result=["target-b"]),
+            ref_audio_prepare_future="future-b",
+        ),
+    ]
+
+    outputs = runtime._run_awaitable_sync(runtime._prepare_gpu_audio_phase_batch_async(coordinator, prepared_cpu_stages))
+
+    runtime._run_ref_prompt_semantic_stage_batch.assert_awaited_once_with(
+        ANY,
+        [
+            ("/tmp/a.wav", "future-a", None),
+            ("/tmp/b.wav", "future-b", None),
+        ],
+    )
+    runtime._run_ref_prompt_semantic_stage.assert_not_awaited()
+    assert len(outputs) == 2
+    assert outputs[0].ref_audio_profiled is ref_a
+    assert outputs[1].ref_audio_profiled is ref_b
 
 
 def test_prepare_request_gpu_audio_phases_batch_merge_uses_runtime_native_batch_helper(tmp_path):

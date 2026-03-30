@@ -896,6 +896,15 @@ class PrepareRefSemanticBatchWorkerPool:
     ) -> int:
         return self.shards[0].bucket_index_for_inputs(raw_audio, raw_sr, wav16k=wav16k)
 
+    def bucket_index_for_inputs(
+        self,
+        raw_audio: torch.Tensor,
+        raw_sr: int,
+        *,
+        wav16k: torch.Tensor | None = None,
+    ) -> int:
+        return int(self._bucket_index_for_inputs(raw_audio, raw_sr, wav16k=wav16k))
+
     def _estimate_input_samples(
         self,
         raw_audio: torch.Tensor,
@@ -904,6 +913,55 @@ class PrepareRefSemanticBatchWorkerPool:
         wav16k: torch.Tensor | None = None,
     ) -> int:
         return self.shards[0].estimate_input_samples(raw_audio, raw_sr, wav16k=wav16k)
+
+    def estimate_runtime_exact_prewarm_target_samples(
+        self,
+        raw_audio: torch.Tensor,
+        raw_sr: int,
+        *,
+        wav16k: torch.Tensor | None = None,
+    ) -> int:
+        return int(self._estimate_input_samples(raw_audio, raw_sr, wav16k=wav16k))
+
+    def run_runtime_exact_prewarm(
+        self,
+        raw_audio: torch.Tensor,
+        raw_sr: int,
+        *,
+        wav16k: torch.Tensor | None = None,
+        batch_sizes: List[int] | None = None,
+    ) -> Dict[str, float]:
+        profile = {
+            "prompt_semantic_runtime_exact_prewarm_applied": 0.0,
+            "prompt_semantic_runtime_exact_prewarm_ms": 0.0,
+            "prompt_semantic_runtime_exact_prewarm_target_samples": 0.0,
+            "prompt_semantic_runtime_exact_prewarm_batch_sizes": 0.0,
+            "prompt_semantic_runtime_exact_prewarm_skipped_capacity": 0.0,
+        }
+        target_samples = int(self._estimate_input_samples(raw_audio, raw_sr, wav16k=wav16k))
+        if target_samples <= 0:
+            return profile
+        selected_batch_sizes = sorted(
+            {
+                max(1, int(batch_size))
+                for batch_size in (batch_sizes if batch_sizes is not None else self.runtime_exact_prewarm_batch_sizes)
+            }
+        ) or [1]
+        warm_start = time.perf_counter()
+        shard = self.shards[0]
+        for batch_size in selected_batch_sizes:
+            shard.prewarm_shape(
+                raw_audio,
+                int(raw_sr),
+                wav16k=wav16k,
+                batch_size=int(batch_size),
+            )
+        warm_ms = max(0.0, (time.perf_counter() - warm_start) * 1000.0)
+        profile["prompt_semantic_runtime_exact_prewarm_applied"] = 1.0
+        profile["prompt_semantic_runtime_exact_prewarm_ms"] = float(warm_ms)
+        profile["prompt_semantic_runtime_exact_prewarm_target_samples"] = float(target_samples)
+        profile["prompt_semantic_runtime_exact_prewarm_batch_sizes"] = float(len(selected_batch_sizes))
+        return profile
 
     def _maybe_runtime_exact_prewarm(
         self,
@@ -931,27 +989,27 @@ class PrepareRefSemanticBatchWorkerPool:
                 profile["prompt_semantic_runtime_exact_prewarm_skipped_capacity"] = 1.0
                 profile["prompt_semantic_runtime_exact_prewarm_target_samples"] = float(target_samples)
                 return profile
-            warm_start = time.perf_counter()
-            shard = self.shards[0]
-            for batch_size in self.runtime_exact_prewarm_batch_sizes:
-                shard.prewarm_shape(
-                    raw_audio,
-                    int(raw_sr),
-                    wav16k=wav16k,
-                    batch_size=int(batch_size),
-                )
-            warm_ms = max(0.0, (time.perf_counter() - warm_start) * 1000.0)
+            profile = self.run_runtime_exact_prewarm(
+                raw_audio,
+                int(raw_sr),
+                wav16k=wav16k,
+                batch_sizes=list(self.runtime_exact_prewarm_batch_sizes),
+            )
+            warm_ms = float(profile.get("prompt_semantic_runtime_exact_prewarm_ms", 0.0))
             self.runtime_exact_prewarmed_samples.add(int(target_samples))
             self.runtime_exact_prewarm_total += 1
             self.runtime_exact_prewarm_total_ms += float(warm_ms)
             self.runtime_exact_prewarm_peak_ms = max(self.runtime_exact_prewarm_peak_ms, float(warm_ms))
-            profile["prompt_semantic_runtime_exact_prewarm_applied"] = 1.0
-            profile["prompt_semantic_runtime_exact_prewarm_ms"] = float(warm_ms)
-            profile["prompt_semantic_runtime_exact_prewarm_target_samples"] = float(target_samples)
-            profile["prompt_semantic_runtime_exact_prewarm_batch_sizes"] = float(
-                len(self.runtime_exact_prewarm_batch_sizes)
-            )
             return profile
+
+    def build_runtime_exact_prewarm_profile(
+        self,
+        raw_audio: torch.Tensor,
+        raw_sr: int,
+        *,
+        wav16k: torch.Tensor | None = None,
+    ) -> Dict[str, float]:
+        return self._maybe_runtime_exact_prewarm(raw_audio, raw_sr, wav16k=wav16k)
 
     def _pick_shard(self, bucket_index: int | None = None) -> PrepareRefSemanticBatchWorker:
         with self.lock:
@@ -985,6 +1043,29 @@ class PrepareRefSemanticBatchWorkerPool:
                     shard.shard_index,
                 ),
             )
+
+    def pick_runtime_shard_index(self, bucket_index: int | None = None) -> int:
+        return int(self._pick_shard(bucket_index).shard_index)
+
+    def pick_runtime_first_hit_shard_index(self) -> int:
+        preferred = min(
+            self.shards,
+            key=lambda shard: (
+                shard.outstanding_count(),
+                shard.outstanding_samples(),
+                shard.snapshot().get("active_batch_size", 0),
+                shard.shard_index,
+            ),
+        )
+        return int(preferred.shard_index)
+
+    def _shard_by_index(self, shard_index: int | None) -> PrepareRefSemanticBatchWorker | None:
+        if shard_index is None:
+            return None
+        return next(
+            (shard for shard in self.shards if int(shard.shard_index) == int(shard_index)),
+            None,
+        )
 
     def _pick_first_hit_serialized_shard(self, bucket_index: int | None) -> PrepareRefSemanticBatchWorker | None:
         if (
@@ -1044,19 +1125,32 @@ class PrepareRefSemanticBatchWorkerPool:
         raw_sr: int,
         *,
         wav16k: torch.Tensor | None = None,
+        runtime_exact_prewarm_profile: Dict[str, float] | None = None,
+        bucket_index: int | None = None,
+        preferred_shard_index: int | None = None,
+        bucket_first_hit_serialized: bool | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        runtime_exact_prewarm_profile = self._maybe_runtime_exact_prewarm(raw_audio, raw_sr, wav16k=wav16k)
-        bucket_index = self._bucket_index_for_inputs(raw_audio, raw_sr, wav16k=wav16k)
-        serialized_shard = self._pick_first_hit_serialized_shard(bucket_index)
-        shard = serialized_shard or self._pick_shard(bucket_index)
+        runtime_exact_prewarm_profile = dict(runtime_exact_prewarm_profile or {})
+        if not runtime_exact_prewarm_profile:
+            runtime_exact_prewarm_profile = self._maybe_runtime_exact_prewarm(raw_audio, raw_sr, wav16k=wav16k)
+        bucket_index = (
+            self._bucket_index_for_inputs(raw_audio, raw_sr, wav16k=wav16k)
+            if bucket_index is None
+            else int(bucket_index)
+        )
+        serialized_shard = None if bucket_first_hit_serialized is not None else self._pick_first_hit_serialized_shard(bucket_index)
+        shard = self._shard_by_index(preferred_shard_index) or serialized_shard or self._pick_shard(bucket_index)
         try:
             result, profile = shard.submit(raw_audio, raw_sr, wav16k=wav16k)
         finally:
-            self._mark_first_hit_bucket_completed(bucket_index)
+            if bucket_first_hit_serialized is None:
+                self._mark_first_hit_bucket_completed(bucket_index)
         profile.update(runtime_exact_prewarm_profile)
         profile["prompt_semantic_pool_workers"] = float(self.worker_count)
         profile["prompt_semantic_pool_bucket_index"] = float(bucket_index)
-        profile["prompt_semantic_bucket_first_hit_serialized"] = 1.0 if serialized_shard is not None else 0.0
+        profile["prompt_semantic_bucket_first_hit_serialized"] = float(
+            1.0 if (bucket_first_hit_serialized if bucket_first_hit_serialized is not None else serialized_shard is not None) else 0.0
+        )
         return result, profile
 
     def prewarm(
@@ -1094,19 +1188,32 @@ class PrepareRefSemanticBatchWorkerPool:
         raw_sr: int,
         *,
         wav16k: torch.Tensor | None = None,
+        runtime_exact_prewarm_profile: Dict[str, float] | None = None,
+        bucket_index: int | None = None,
+        preferred_shard_index: int | None = None,
+        bucket_first_hit_serialized: bool | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        runtime_exact_prewarm_profile = self._maybe_runtime_exact_prewarm(raw_audio, raw_sr, wav16k=wav16k)
-        bucket_index = self._bucket_index_for_inputs(raw_audio, raw_sr, wav16k=wav16k)
-        serialized_shard = self._pick_first_hit_serialized_shard(bucket_index)
-        shard = serialized_shard or self._pick_shard(bucket_index)
+        runtime_exact_prewarm_profile = dict(runtime_exact_prewarm_profile or {})
+        if not runtime_exact_prewarm_profile:
+            runtime_exact_prewarm_profile = self._maybe_runtime_exact_prewarm(raw_audio, raw_sr, wav16k=wav16k)
+        bucket_index = (
+            self._bucket_index_for_inputs(raw_audio, raw_sr, wav16k=wav16k)
+            if bucket_index is None
+            else int(bucket_index)
+        )
+        serialized_shard = None if bucket_first_hit_serialized is not None else self._pick_first_hit_serialized_shard(bucket_index)
+        shard = self._shard_by_index(preferred_shard_index) or serialized_shard or self._pick_shard(bucket_index)
         try:
             result, profile = await shard.submit_async(raw_audio, raw_sr, wav16k=wav16k)
         finally:
-            self._mark_first_hit_bucket_completed(bucket_index)
+            if bucket_first_hit_serialized is None:
+                self._mark_first_hit_bucket_completed(bucket_index)
         profile.update(runtime_exact_prewarm_profile)
         profile["prompt_semantic_pool_workers"] = float(self.worker_count)
         profile["prompt_semantic_pool_bucket_index"] = float(bucket_index)
-        profile["prompt_semantic_bucket_first_hit_serialized"] = 1.0 if serialized_shard is not None else 0.0
+        profile["prompt_semantic_bucket_first_hit_serialized"] = float(
+            1.0 if (bucket_first_hit_serialized if bucket_first_hit_serialized is not None else serialized_shard is not None) else 0.0
+        )
         return result, profile
 
     def snapshot(self) -> Dict[str, int | List[Dict[str, int]]]:
