@@ -15,6 +15,15 @@ PP_DICT_PATH = os.path.join(current_file_path, "polyphonic.rep")
 PP_FIX_DICT_PATH = os.path.join(current_file_path, "polyphonic-fix.rep")
 
 
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 class G2PWPinyin(Pinyin):
     def __init__(
         self,
@@ -27,6 +36,7 @@ class G2PWPinyin(Pinyin):
         **kwargs,
     ):
         backend = os.environ.get("GPTSOVITS_G2PW_BACKEND", "cuda").strip().lower()
+        allow_onnx_fallback = _env_enabled("GPTSOVITS_G2PW_ONNX_FALLBACK", "0")
         last_error = None
         self._g2pw = None
         if backend in {"cuda", "auto"}:
@@ -41,25 +51,28 @@ class G2PWPinyin(Pinyin):
                 )
             except Exception as exc:
                 last_error = exc
-                strict_mode = os.environ.get("GPTSOVITS_G2PW_CUDA_STRICT", "0").strip().lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                }
+                strict_mode = _env_enabled("GPTSOVITS_G2PW_CUDA_STRICT", "0")
                 if backend == "cuda" and strict_mode:
                     raise
-        if self._g2pw is None:
-            from .onnx_api import G2PWOnnxConverter
+        should_try_onnx = backend == "onnx" or (self._g2pw is None and allow_onnx_fallback)
+        if self._g2pw is None and should_try_onnx:
+            try:
+                from .onnx_api import G2PWOnnxConverter
 
-            self._g2pw = G2PWOnnxConverter(
-                model_dir=model_dir,
-                style="pinyin",
-                model_source=model_source,
-                enable_non_tradional_chinese=enable_non_tradional_chinese,
-            )
-            if last_error is not None:
-                print(f"[g2pw] cuda backend unavailable, fallback to onnx: {last_error}")
+                self._g2pw = G2PWOnnxConverter(
+                    model_dir=model_dir,
+                    style="pinyin",
+                    model_source=model_source,
+                    enable_non_tradional_chinese=enable_non_tradional_chinese,
+                )
+                if last_error is not None:
+                    print(f"[g2pw] cuda backend unavailable, fallback to onnx: {last_error}")
+            except Exception as exc:
+                last_error = exc
+                if backend == "onnx":
+                    raise
+        if self._g2pw is None and last_error is not None:
+            print(f"[g2pw] backend unavailable, fallback to pypinyin: {last_error}")
         self._converter = Converter(
             self._g2pw,
             v_to_u=v_to_u,
@@ -104,6 +117,9 @@ class Converter(UltimateConverter):
 
     def _to_pinyin(self, han, style, heteronym, errors, strict, **kwargs):
         pinyins = []
+
+        if self._g2pw is None:
+            return super(Converter, self).convert(han, Style.TONE, heteronym, errors, strict, **kwargs)
 
         g2pw_pinyin = self._g2pw(han)
 

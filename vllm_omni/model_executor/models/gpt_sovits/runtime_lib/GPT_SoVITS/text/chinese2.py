@@ -30,20 +30,39 @@ import logging
 jieba_fast.setLogLevel(logging.CRITICAL)
 import jieba_fast.posseg as psg
 
-# is_g2pw_str = os.environ.get("is_g2pw", "True")##默认开启
-# is_g2pw = False#True if is_g2pw_str.lower() == 'true' else False
-is_g2pw = True  # True if is_g2pw_str.lower() == 'true' else False
-if is_g2pw:
-    # print("当前使用g2pw进行拼音推理")
-    from text.g2pw import G2PWPinyin, correct_pronunciation
+def _env_enabled(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
 
-    parent_directory = os.path.dirname(current_file_path)
-    g2pw = G2PWPinyin(
-        model_dir=os.environ.get("g2pw_model_dir", _DEFAULT_G2PW_MODEL_DIR),
-        model_source=os.environ.get("bert_path", _DEFAULT_G2PW_BERT_PATH),
-        v_to_u=False,
-        neutral_tone_with_five=True,
-    )
+
+def correct_pronunciation(word, word_pinyins):
+    return word_pinyins
+
+
+g2pw = None
+is_g2pw = _env_enabled("is_g2pw", "1")
+if is_g2pw:
+    try:
+        from text.g2pw import G2PWPinyin, correct_pronunciation
+
+        parent_directory = os.path.dirname(current_file_path)
+        g2pw = G2PWPinyin(
+            model_dir=os.environ.get("g2pw_model_dir", _DEFAULT_G2PW_MODEL_DIR),
+            model_source=os.environ.get("bert_path", _DEFAULT_G2PW_BERT_PATH),
+            v_to_u=False,
+            neutral_tone_with_five=True,
+        )
+        if getattr(g2pw, "_g2pw", None) is None:
+            is_g2pw = False
+    except Exception as exc:
+        print(f"[g2pw] disabled during chinese2 init: {exc}")
+        g2pw = None
+        is_g2pw = False
 
 rep_map = {
     "：": ",",
@@ -141,9 +160,11 @@ def _new_g2pw_profile() -> Dict[str, float]:
 
 def _predict_g2pw_batch(batch_inputs: Sequence[str]) -> Tuple[List[List[str]], Dict[str, float]]:
     profile = _new_g2pw_profile()
-    if not (is_g2pw and batch_inputs):
+    if not (is_g2pw and batch_inputs and g2pw is not None):
         return [], profile
-    converter = g2pw._g2pw
+    converter = getattr(g2pw, "_g2pw", None)
+    if converter is None:
+        return [], profile
     if hasattr(converter, "predict_sentences_with_profile"):
         g2pw_batch_results, predict_profile = converter.predict_sentences_with_profile(list(batch_inputs))
         for key, value in dict(predict_profile or {}).items():
@@ -228,12 +249,16 @@ def g2p_segments_batch(
             if not segment:
                 results.append(([], [], segment))
                 continue
-            if not is_g2pw:
+            if not is_g2pw or g2pw is None or batch_cursor >= len(g2pw_batch_results):
                 phones, word2ph = _build_segment_without_g2pw(segment, item["seg_cut"])
                 results.append((phones, word2ph, segment))
                 continue
             pinyins = g2pw_batch_results[batch_cursor]
             batch_cursor += 1
+            if not pinyins:
+                phones, word2ph = _build_segment_without_g2pw(segment, item["seg_cut"])
+                results.append((phones, word2ph, segment))
+                continue
             phones, word2ph = _build_segment_from_g2pw(segment, item["seg_cut"], pinyins)
             results.append((phones, word2ph, segment))
         profile["g2pw_post_ms"] = float((time.perf_counter() - post_start) * 1000.0)
@@ -248,7 +273,7 @@ def g2p_segments_batch(
 
 def prewarm_g2pw_pipeline(sentences: Sequence[str] | None = None, rounds: int = 1) -> bool:
     global _G2PW_PIPELINE_PREWARMED
-    if not is_g2pw:
+    if not is_g2pw or g2pw is None or getattr(g2pw, "_g2pw", None) is None:
         return False
     with _G2PW_PIPELINE_PREWARM_LOCK:
         if _G2PW_PIPELINE_PREWARMED:

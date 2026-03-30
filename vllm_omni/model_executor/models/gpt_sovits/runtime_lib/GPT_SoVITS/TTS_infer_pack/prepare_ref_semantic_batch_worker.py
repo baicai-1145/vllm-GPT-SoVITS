@@ -1059,6 +1059,17 @@ class PrepareRefSemanticBatchWorkerPool:
         )
         return int(preferred.shard_index)
 
+    def runtime_routing_snapshots_for_bucket(self, bucket_index: int | None) -> List[Dict[str, int]]:
+        if bucket_index is None:
+            return [dict(shard.snapshot()) for shard in self.shards]
+        return [
+            {
+                "shard_index": int(shard.shard_index),
+                **dict(shard.routing_snapshot_for_bucket(int(bucket_index))),
+            }
+            for shard in self.shards
+        ]
+
     def _shard_by_index(self, shard_index: int | None) -> PrepareRefSemanticBatchWorker | None:
         if shard_index is None:
             return None

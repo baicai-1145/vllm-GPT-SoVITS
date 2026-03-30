@@ -867,6 +867,18 @@ def _pack_active_batch_into_pool(model: Any, active_batch: T2SActiveBatch) -> bo
         or active_batch.kv_lens.numel() <= 0
     ):
         return False
+    batch_size = int(active_batch.kv_lens.shape[0])
+    max_kv_len = int(active_batch.kv_lens.max().item())
+    if max_kv_len + 1 > int(pool.max_seq_len):
+        try:
+            pool.record_fallback(f"pack_decode_headroom_overflow(batch={batch_size},seq={max_kv_len},next={max_kv_len + 1})")
+        except Exception:
+            pass
+        active_batch.kv_cache_pooled = False
+        active_batch.kv_cache_capacity = 0
+        active_batch.kv_cache_batch_capacity = 0
+        _set_kv_pool_active_rows(model, 0)
+        return False
     pooled_views = pool.pack_dynamic_cache_layers(
         k_layers=active_batch.k_cache,
         v_layers=active_batch.v_cache,
@@ -887,6 +899,23 @@ def _pack_active_batch_into_pool(model: Any, active_batch: T2SActiveBatch) -> bo
     return True
 
 
+def _build_decode_mask_from_kv_lens(
+    kv_lens: torch.LongTensor,
+    *,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if kv_lens.numel() <= 0:
+        return None
+    target_len = int(kv_lens.max().item()) + 1
+    mask = torch.ones((int(kv_lens.shape[0]), 1, 1, target_len), dtype=torch.bool, device=device)
+    for batch_index, kv_len in enumerate(kv_lens.tolist()):
+        current_len = kv_len + 1
+        mask[batch_index, :, :, -current_len:] = False
+    if not mask.any().item():
+        return None
+    return mask
+
+
 def _compact_pooled_active_batch(model: Any, active_batch: T2SActiveBatch, keep_indices: Sequence[int]) -> bool:
     pool = _get_kv_pool(model)
     if pool is None or active_batch.kv_lens is None:
@@ -905,6 +934,46 @@ def _compact_pooled_active_batch(model: Any, active_batch: T2SActiveBatch, keep_
     active_batch.kv_cache_batch_capacity = int(pool.max_batch_size)
     _set_kv_pool_active_rows(model, len(active_batch.request_ids))
     return True
+
+
+def _fallback_pooled_active_batch_to_dynamic_cache(
+    model: Any,
+    active_batch: T2SActiveBatch,
+    *,
+    reason: str,
+) -> None:
+    if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
+        raise ValueError("pooled KV fallback 缺少 KV cache 或 kv_lens")
+    pool = _get_kv_pool(model)
+    if pool is not None:
+        try:
+            pool.record_fallback(reason)
+        except Exception:
+            pass
+    target_len = int(active_batch.kv_lens.max().item())
+    kv_lens_list = [int(item) for item in active_batch.kv_lens.tolist()]
+    unpacked_k_cache: List[torch.Tensor] = []
+    unpacked_v_cache: List[torch.Tensor] = []
+    for pooled_k, pooled_v in zip(active_batch.k_cache, active_batch.v_cache):
+        unpacked_k = pooled_k.new_zeros((pooled_k.shape[0], target_len, pooled_k.shape[2]))
+        unpacked_v = pooled_v.new_zeros((pooled_v.shape[0], target_len, pooled_v.shape[2]))
+        for batch_index, kv_len in enumerate(kv_lens_list):
+            if kv_len <= 0:
+                continue
+            unpacked_k[batch_index, -kv_len:, :] = pooled_k[batch_index, :kv_len, :]
+            unpacked_v[batch_index, -kv_len:, :] = pooled_v[batch_index, :kv_len, :]
+        unpacked_k_cache.append(unpacked_k)
+        unpacked_v_cache.append(unpacked_v)
+    active_batch.k_cache = unpacked_k_cache
+    active_batch.v_cache = unpacked_v_cache
+    active_batch.decode_attn_mask = _build_decode_mask_from_kv_lens(
+        active_batch.kv_lens,
+        device=active_batch.k_cache[0].device,
+    )
+    active_batch.kv_cache_pooled = False
+    active_batch.kv_cache_capacity = 0
+    active_batch.kv_cache_batch_capacity = 0
+    _set_kv_pool_active_rows(model, 0)
 
 
 def _compact_cache_to_kv_lens(
@@ -1097,27 +1166,90 @@ def decode_one_step(
             if pool is None:
                 raise ValueError("pooled KV cache 已丢失")
             next_kv_lens = active_batch.kv_lens + 1
-            batched_decode_attn_mask = pool.build_decode_mask(next_kv_lens)
-            xy_dec, active_batch.k_cache, active_batch.v_cache = model.decode_next_token_prealloc_runtime(
-                active_batch.xy_pos,
-                active_batch.k_cache,
-                active_batch.v_cache,
-                active_batch.kv_lens,
-                batched_decode_attn_mask,
-            )
-        else:
-            batched_decode_attn_mask = None
-            if active_batch.decode_attn_mask is not None:
-                batched_decode_attn_mask = _materialize_decode_mask_for_active_batch(active_batch)
-                if not batched_decode_attn_mask.any().item():
-                    batched_decode_attn_mask = None
-            xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.decode_next_token(
-                active_batch.xy_pos,
-                active_batch.k_cache,
-                active_batch.v_cache,
-                batched_decode_attn_mask,
-            )
-            active_batch.decode_attn_mask = _advance_decode_mask(active_batch.decode_attn_mask, active_batch.kv_lens)
+            if int(next_kv_lens.max().item()) > int(pool.max_seq_len):
+                _fallback_pooled_active_batch_to_dynamic_cache(
+                    model,
+                    active_batch,
+                    reason=(
+                        "decode_headroom_overflow"
+                        f"(batch={int(next_kv_lens.shape[0])},seq={int(active_batch.kv_lens.max().item())},"
+                        f"next={int(next_kv_lens.max().item())})"
+                    ),
+                )
+            else:
+                batched_decode_attn_mask = pool.build_decode_mask(next_kv_lens)
+                xy_dec, active_batch.k_cache, active_batch.v_cache = model.decode_next_token_prealloc_runtime(
+                    active_batch.xy_pos,
+                    active_batch.k_cache,
+                    active_batch.v_cache,
+                    active_batch.kv_lens,
+                    batched_decode_attn_mask,
+                )
+                logits = model.ar_predict_layer(xy_dec[:, -1])
+                finished_items, keep_indices, updated_sequences = _sample_per_request(
+                    model,
+                    active_batch,
+                    logits,
+                    max_steps=max_steps,
+                )
+                if len(keep_indices) == 0:
+                    _set_kv_pool_active_rows(model, 0)
+                    return None, finished_items
+                if len(keep_indices) == len(active_batch.request_ids):
+                    active_batch.y_sequences = updated_sequences
+                    active_batch.step_indices = active_batch.step_indices + 1
+                    active_batch.kv_lens = active_batch.kv_lens + 1
+                    active_batch.xy_pos = build_next_xy_pos(model, active_batch.y_sequences)
+                    return active_batch, finished_items
+                device = logits.device
+                keep_tensor = torch.LongTensor(keep_indices).to(device)
+                active_batch.request_ids = [active_batch.request_ids[i] for i in keep_indices]
+                active_batch.states = [active_batch.states[i] for i in keep_indices]
+                active_batch.y_sequences = updated_sequences
+                active_batch.prefix_lens = torch.index_select(active_batch.prefix_lens, dim=0, index=keep_tensor)
+                next_step_indices = torch.index_select(active_batch.step_indices, dim=0, index=keep_tensor)
+                next_kv_lens = torch.index_select(active_batch.kv_lens, dim=0, index=keep_tensor) + 1
+                active_batch.step_indices = next_step_indices + 1
+                active_batch.kv_lens = next_kv_lens
+                pooled_compacted = _compact_pooled_active_batch(model, active_batch, keep_indices)
+                if not pooled_compacted:
+                    active_batch.kv_cache_pooled = False
+                if (not active_batch.kv_cache_pooled) and active_batch.k_cache is not None and active_batch.v_cache is not None:
+                    for cache_index in range(len(active_batch.k_cache)):
+                        active_batch.k_cache[cache_index] = torch.index_select(
+                            active_batch.k_cache[cache_index],
+                            dim=0,
+                            index=keep_tensor,
+                        )
+                        active_batch.v_cache[cache_index] = torch.index_select(
+                            active_batch.v_cache[cache_index],
+                            dim=0,
+                            index=keep_tensor,
+                        )
+                    active_batch.k_cache = [
+                        _compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
+                    ]
+                    active_batch.v_cache = [
+                        _compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
+                    ]
+                    active_batch.decode_attn_mask = _build_decode_mask_from_kv_lens(
+                        active_batch.kv_lens,
+                        device=active_batch.k_cache[0].device,
+                    )
+                active_batch.xy_pos = build_next_xy_pos(model, active_batch.y_sequences)
+                return active_batch, finished_items
+        batched_decode_attn_mask = None
+        if active_batch.decode_attn_mask is not None:
+            batched_decode_attn_mask = _materialize_decode_mask_for_active_batch(active_batch)
+            if not batched_decode_attn_mask.any().item():
+                batched_decode_attn_mask = None
+        xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.decode_next_token(
+            active_batch.xy_pos,
+            active_batch.k_cache,
+            active_batch.v_cache,
+            batched_decode_attn_mask,
+        )
+        active_batch.decode_attn_mask = _advance_decode_mask(active_batch.decode_attn_mask, active_batch.kv_lens)
 
     logits = model.ar_predict_layer(xy_dec[:, -1])
 

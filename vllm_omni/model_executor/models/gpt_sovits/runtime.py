@@ -571,6 +571,8 @@ class GPTSoVITSPrepareRuntimeCoordinator:
     ref_prompt_semantic_bucket_first_hit_bucket_indices: tuple[int, ...] = ()
     ref_prompt_semantic_bucket_first_hit_lock: Any | None = None
     ref_prompt_semantic_bucket_first_hit_states: dict[int, dict[str, int]] = field(default_factory=dict)
+    ref_prompt_semantic_bucket_aware_sharding: bool = False
+    ref_prompt_semantic_bucket_aware_max_outstanding_gap: int = 0
 
     @staticmethod
     def _resolve_ref_prompt_semantic_runtime_exact_prewarm_batch_sizes(tts: Any) -> tuple[int, ...]:
@@ -733,6 +735,25 @@ class GPTSoVITSPrepareRuntimeCoordinator:
                     dict(getattr(coordinator, "ref_prompt_semantic_bucket_first_hit_states", {}) or {}).items()
                 )
             },
+            ref_prompt_semantic_bucket_aware_sharding=bool(
+                getattr(
+                    coordinator,
+                    "ref_prompt_semantic_bucket_aware_sharding",
+                    str(os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_AWARE_SHARDING", "1")).strip().lower()
+                    not in {"0", "false", "no", "off"},
+                )
+            ),
+            ref_prompt_semantic_bucket_aware_max_outstanding_gap=max(
+                0,
+                int(
+                    getattr(
+                        coordinator,
+                        "ref_prompt_semantic_bucket_aware_max_outstanding_gap",
+                        os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_AWARE_MAX_OUTSTANDING_GAP", "2"),
+                    )
+                    or 0
+                ),
+            ),
         )
 
     @staticmethod
@@ -873,6 +894,14 @@ class GPTSoVITSPrepareRuntimeCoordinator:
                 tts
             ),
             ref_prompt_semantic_bucket_first_hit_lock=threading.Lock(),
+            ref_prompt_semantic_bucket_aware_sharding=(
+                str(os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_AWARE_SHARDING", "1")).strip().lower()
+                not in {"0", "false", "no", "off"}
+            ),
+            ref_prompt_semantic_bucket_aware_max_outstanding_gap=max(
+                0,
+                int(os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_AWARE_MAX_OUTSTANDING_GAP", "2")),
+            ),
         )
 
     @staticmethod
@@ -1268,6 +1297,15 @@ class GPTSoVITSRuntime:
     def _ensure_native_runtime_deps(self) -> None:
         if self._native_runtime_ready:
             return
+        preload_native_deps = str(os.environ.get("GPTSOVITS_PRELOAD_NATIVE_RUNTIME_DEPS", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not preload_native_deps:
+            self._native_runtime_ready = True
+            return
 
         lib_roots = []
         for root in {
@@ -1485,6 +1523,18 @@ class GPTSoVITSRuntime:
             or active_batch.kv_lens.numel() <= 0
         ):
             return False
+        batch_size = int(active_batch.kv_lens.shape[0])
+        max_kv_len = int(active_batch.kv_lens.max().item())
+        if max_kv_len + 1 > int(pool.max_seq_len):
+            try:
+                pool.record_fallback(f"pack_decode_headroom_overflow(batch={batch_size},seq={max_kv_len},next={max_kv_len + 1})")
+            except Exception:
+                pass
+            active_batch.kv_cache_pooled = False
+            active_batch.kv_cache_capacity = 0
+            active_batch.kv_cache_batch_capacity = 0
+            self._set_kv_pool_active_rows(model, 0)
+            return False
         pooled_views = pool.pack_dynamic_cache_layers(
             k_layers=active_batch.k_cache,
             v_layers=active_batch.v_cache,
@@ -1503,6 +1553,23 @@ class GPTSoVITSRuntime:
         active_batch.kv_cache_batch_capacity = int(pool.max_batch_size)
         self._set_kv_pool_active_rows(model, len(active_batch.request_ids))
         return True
+
+    @staticmethod
+    def _build_decode_mask_from_kv_lens(
+        kv_lens: torch.LongTensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if kv_lens.numel() <= 0:
+            return None
+        target_len = int(kv_lens.max().item()) + 1
+        mask = torch.ones((int(kv_lens.shape[0]), 1, 1, target_len), dtype=torch.bool, device=device)
+        for batch_index, kv_len in enumerate(kv_lens.tolist()):
+            current_len = kv_len + 1
+            mask[batch_index, :, :, -current_len:] = False
+        if not mask.any().item():
+            return None
+        return mask
 
     @staticmethod
     def _compact_cache_to_kv_lens(cache: torch.Tensor, kv_lens: torch.LongTensor) -> torch.Tensor:
@@ -1647,6 +1714,46 @@ class GPTSoVITSRuntime:
         active_batch.kv_cache_batch_capacity = int(pool.max_batch_size)
         self._set_kv_pool_active_rows(model, len(active_batch.request_ids))
         return True
+
+    def _fallback_pooled_active_batch_to_dynamic_cache(
+        self,
+        model: Any,
+        active_batch: Any,
+        *,
+        reason: str,
+    ) -> None:
+        if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
+            raise ValueError("GPT-SoVITS pooled KV fallback requires KV cache and kv_lens")
+        pool = self._get_kv_pool(model)
+        if pool is not None:
+            try:
+                pool.record_fallback(reason)
+            except Exception:
+                pass
+        target_len = int(active_batch.kv_lens.max().item())
+        kv_lens_list = [int(item) for item in active_batch.kv_lens.tolist()]
+        unpacked_k_cache: list[torch.Tensor] = []
+        unpacked_v_cache: list[torch.Tensor] = []
+        for pooled_k, pooled_v in zip(active_batch.k_cache, active_batch.v_cache):
+            unpacked_k = pooled_k.new_zeros((pooled_k.shape[0], target_len, pooled_k.shape[2]))
+            unpacked_v = pooled_v.new_zeros((pooled_v.shape[0], target_len, pooled_v.shape[2]))
+            for batch_index, kv_len in enumerate(kv_lens_list):
+                if kv_len <= 0:
+                    continue
+                unpacked_k[batch_index, -kv_len:, :] = pooled_k[batch_index, :kv_len, :]
+                unpacked_v[batch_index, -kv_len:, :] = pooled_v[batch_index, :kv_len, :]
+            unpacked_k_cache.append(unpacked_k)
+            unpacked_v_cache.append(unpacked_v)
+        active_batch.k_cache = unpacked_k_cache
+        active_batch.v_cache = unpacked_v_cache
+        active_batch.decode_attn_mask = self._build_decode_mask_from_kv_lens(
+            active_batch.kv_lens,
+            device=active_batch.k_cache[0].device,
+        )
+        active_batch.kv_cache_pooled = False
+        active_batch.kv_cache_capacity = 0
+        active_batch.kv_cache_batch_capacity = 0
+        self._set_kv_pool_active_rows(model, 0)
 
     def _get_sampling_ops(self) -> tuple[Any, Any]:
         self._ensure_import_path()
@@ -1941,27 +2048,90 @@ class GPTSoVITSRuntime:
                 if pool is None:
                     raise ValueError("GPT-SoVITS AR pooled KV cache is unavailable")
                 next_kv_lens = active_batch.kv_lens + 1
-                batched_decode_attn_mask = pool.build_decode_mask(next_kv_lens)
-                xy_dec, active_batch.k_cache, active_batch.v_cache = model.decode_next_token_prealloc_runtime(
-                    active_batch.xy_pos,
-                    active_batch.k_cache,
-                    active_batch.v_cache,
-                    active_batch.kv_lens,
-                    batched_decode_attn_mask,
-                )
-            else:
-                batched_decode_attn_mask = None
-                if active_batch.decode_attn_mask is not None:
-                    batched_decode_attn_mask = self._materialize_decode_mask_for_active_batch(active_batch)
-                    if not batched_decode_attn_mask.any().item():
-                        batched_decode_attn_mask = None
-                xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.decode_next_token(
-                    active_batch.xy_pos,
-                    active_batch.k_cache,
-                    active_batch.v_cache,
-                    batched_decode_attn_mask,
-                )
-                active_batch.decode_attn_mask = self._advance_decode_mask(active_batch.decode_attn_mask, active_batch.kv_lens)
+                if int(next_kv_lens.max().item()) > int(pool.max_seq_len):
+                    self._fallback_pooled_active_batch_to_dynamic_cache(
+                        model,
+                        active_batch,
+                        reason=(
+                            "decode_headroom_overflow"
+                            f"(batch={int(next_kv_lens.shape[0])},seq={int(active_batch.kv_lens.max().item())},"
+                            f"next={int(next_kv_lens.max().item())})"
+                        ),
+                    )
+                else:
+                    batched_decode_attn_mask = pool.build_decode_mask(next_kv_lens)
+                    xy_dec, active_batch.k_cache, active_batch.v_cache = model.decode_next_token_prealloc_runtime(
+                        active_batch.xy_pos,
+                        active_batch.k_cache,
+                        active_batch.v_cache,
+                        active_batch.kv_lens,
+                        batched_decode_attn_mask,
+                    )
+                    logits = model.ar_predict_layer(xy_dec[:, -1])
+                    finished_items, keep_indices, updated_sequences = self._sample_active_batch_requests(
+                        model,
+                        active_batch,
+                        logits,
+                        max_steps=max_steps,
+                    )
+                    if len(keep_indices) == 0:
+                        self._set_kv_pool_active_rows(model, 0)
+                        return None, finished_items
+                    if len(keep_indices) == len(active_batch.request_ids):
+                        active_batch.y_sequences = updated_sequences
+                        active_batch.step_indices = active_batch.step_indices + 1
+                        active_batch.kv_lens = active_batch.kv_lens + 1
+                        active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+                        return active_batch, finished_items
+                    device = logits.device
+                    keep_tensor = torch.tensor(keep_indices, dtype=torch.long, device=device)
+                    active_batch.request_ids = [active_batch.request_ids[i] for i in keep_indices]
+                    active_batch.states = [active_batch.states[i] for i in keep_indices]
+                    active_batch.y_sequences = updated_sequences
+                    active_batch.prefix_lens = torch.index_select(active_batch.prefix_lens, dim=0, index=keep_tensor)
+                    next_step_indices = torch.index_select(active_batch.step_indices, dim=0, index=keep_tensor)
+                    next_kv_lens = torch.index_select(active_batch.kv_lens, dim=0, index=keep_tensor) + 1
+                    active_batch.step_indices = next_step_indices + 1
+                    active_batch.kv_lens = next_kv_lens
+                    pooled_compacted = self._compact_pooled_active_batch(model, active_batch, keep_indices)
+                    if not pooled_compacted:
+                        active_batch.kv_cache_pooled = False
+                    if (not active_batch.kv_cache_pooled) and active_batch.k_cache is not None and active_batch.v_cache is not None:
+                        for cache_index in range(len(active_batch.k_cache)):
+                            active_batch.k_cache[cache_index] = torch.index_select(
+                                active_batch.k_cache[cache_index],
+                                dim=0,
+                                index=keep_tensor,
+                            )
+                            active_batch.v_cache[cache_index] = torch.index_select(
+                                active_batch.v_cache[cache_index],
+                                dim=0,
+                                index=keep_tensor,
+                            )
+                        active_batch.k_cache = [
+                            self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
+                        ]
+                        active_batch.v_cache = [
+                            self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
+                        ]
+                        active_batch.decode_attn_mask = self._build_decode_mask_from_kv_lens(
+                            active_batch.kv_lens,
+                            device=active_batch.k_cache[0].device,
+                        )
+                    active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+                    return active_batch, finished_items
+            batched_decode_attn_mask = None
+            if active_batch.decode_attn_mask is not None:
+                batched_decode_attn_mask = self._materialize_decode_mask_for_active_batch(active_batch)
+                if not batched_decode_attn_mask.any().item():
+                    batched_decode_attn_mask = None
+            xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.decode_next_token(
+                active_batch.xy_pos,
+                active_batch.k_cache,
+                active_batch.v_cache,
+                batched_decode_attn_mask,
+            )
+            active_batch.decode_attn_mask = self._advance_decode_mask(active_batch.decode_attn_mask, active_batch.kv_lens)
 
         logits = model.ar_predict_layer(xy_dec[:, -1])
         finished_items, keep_indices, updated_sequences = self._sample_active_batch_requests(
@@ -2355,23 +2525,168 @@ class GPTSoVITSRuntime:
     def _prepare_result_has_pending_g2pw(prepared_segments: Any) -> bool:
         return any(bool(getattr(segment, "needs_g2pw", False)) for segment in (prepared_segments or []))
 
-    def _prepare_text_cpu(self, text: str, language: str) -> Any:
+    def _get_text_preprocessor_symbol(self, symbol: str) -> Any:
+        self._ensure_import_path()
+        with self._project_root_cwd():
+            from GPT_SoVITS.TTS_infer_pack import TextPreprocessor as _text_preprocessor_module
+
+        return getattr(_text_preprocessor_module, symbol)
+
+    def _get_text_frontend_symbol(self, module_name: str, symbol: str) -> Any:
+        self._ensure_import_path()
+        with self._project_root_cwd():
+            module = __import__(module_name, fromlist=[symbol])
+        return getattr(module, symbol)
+
+    def _current_text_frontend_version(self) -> str:
         pipeline = self._ensure_pipeline()
-        return pipeline.prepare_text_segments(text, language)
+        return str(getattr(getattr(pipeline, "configs", None), "version", "v2"))
+
+    def _preprocess_text_segments_payload(
+        self,
+        text: str,
+        language: str,
+        version: str,
+    ) -> list[dict[str, object]]:
+        preprocess_text_segments_payload = self._get_text_frontend_symbol(
+            "GPT_SoVITS.TTS_infer_pack.text_cpu_preprocess",
+            "preprocess_text_segments_payload",
+        )
+        return list(preprocess_text_segments_payload(text, language, version))
+
+    def _payloads_to_prepared_text_segments(self, payloads: list[dict[str, object]]) -> list[Any]:
+        prepared_text_segment_cls = self._get_text_preprocessor_symbol("PreparedTextSegment")
+        return [
+            prepared_text_segment_cls(
+                language=str(payload["language"]),
+                phones=list(payload["phones"]),
+                word2ph=None if payload["word2ph"] is None else list(payload["word2ph"]),
+                norm_text=str(payload["norm_text"]),
+                needs_g2pw=bool(payload.get("needs_g2pw", False)),
+            )
+            for payload in payloads
+        ]
+
+    def _prepare_text_cpu(self, text: str, language: str) -> Any:
+        version = self._current_text_frontend_version()
+        payloads = self._preprocess_text_segments_payload(text, language, version)
+        return self._payloads_to_prepared_text_segments(payloads)
+
+    @classmethod
+    def _merge_g2pw_profile(
+        cls,
+        profile: dict[str, float] | None,
+        g2pw_profile: dict[str, float],
+    ) -> None:
+        cls._accumulate_profile_metric(profile, "g2pw_prepare_ms", g2pw_profile.get("g2pw_prepare_ms", 0.0))
+        cls._accumulate_profile_metric(profile, "g2pw_predict_ms", g2pw_profile.get("g2pw_predict_ms", 0.0))
+        cls._accumulate_profile_metric(profile, "g2pw_post_ms", g2pw_profile.get("g2pw_post_ms", 0.0))
+        cls._accumulate_profile_metric(profile, "g2pw_total_ms", g2pw_profile.get("g2pw_total_ms", 0.0))
+        cls._accumulate_profile_metric(
+            profile,
+            "g2pw_runtime_total_ms",
+            g2pw_profile.get("g2pw_runtime_total_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(
+            profile,
+            "g2pw_runtime_queue_wait_ms",
+            g2pw_profile.get("g2pw_runtime_queue_wait_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(
+            profile,
+            "g2pw_runtime_collect_wait_ms",
+            g2pw_profile.get("g2pw_runtime_collect_wait_ms", 0.0),
+        )
+        cls._accumulate_profile_metric(
+            profile,
+            "g2pw_runtime_run_ms",
+            g2pw_profile.get("g2pw_runtime_run_ms", 0.0),
+        )
+        cls._update_profile_metric_peak(
+            profile,
+            "g2pw_runtime_batch_rows_peak",
+            g2pw_profile.get("g2pw_runtime_batch_rows", 0.0),
+        )
+        cls._update_profile_metric_peak(
+            profile,
+            "g2pw_runtime_batch_requests_peak",
+            g2pw_profile.get("g2pw_runtime_batch_requests", 0.0),
+        )
+        cls._update_profile_metric_peak(
+            profile,
+            "g2pw_runtime_pool_workers",
+            g2pw_profile.get("g2pw_runtime_pool_workers", 0.0),
+        )
 
     def _resolve_g2pw_segments(self, prepared_segments: Any) -> tuple[Any, dict[str, float]]:
-        pipeline = self._ensure_pipeline()
         profile: dict[str, float] = {}
-        resolved_segments = pipeline.resolve_g2pw_segments(prepared_segments, profile=profile)
-        return resolved_segments, profile
+        prepared_segment_list = list(prepared_segments or [])
+        zh_indices = [
+            index for index, segment in enumerate(prepared_segment_list) if bool(getattr(segment, "needs_g2pw", False))
+        ]
+        if not zh_indices:
+            return prepared_segment_list, profile
+
+        g2p_segments = self._get_text_frontend_symbol("text.chinese2", "g2p_segments")
+        cleaned_text_to_sequence = self._get_text_frontend_symbol("text", "cleaned_text_to_sequence")
+        prepared_text_segment_cls = self._get_text_preprocessor_symbol("PreparedTextSegment")
+        version = self._current_text_frontend_version()
+        normalized_segments = [str(getattr(prepared_segment_list[index], "norm_text", "") or "") for index in zh_indices]
+        resolved_segments, g2pw_profile = g2p_segments(normalized_segments, return_profile=True)
+        self._merge_g2pw_profile(profile, dict(g2pw_profile or {}))
+        for index, (phones, word2ph, norm_text) in zip(zh_indices, resolved_segments):
+            prepared_segment_list[index] = prepared_text_segment_cls(
+                language=str(getattr(prepared_segment_list[index], "language", "")),
+                phones=list(cleaned_text_to_sequence(phones, version)),
+                word2ph=None if word2ph is None else list(word2ph),
+                norm_text=str(norm_text),
+                needs_g2pw=False,
+            )
+        return prepared_segment_list, profile
 
     def _resolve_g2pw_segment_batches(
         self,
         prepared_segment_batches: list[Any],
     ) -> tuple[Any, list[dict[str, float]]]:
-        pipeline = self._ensure_pipeline()
-        profiles: list[dict[str, float]] = [{} for _ in prepared_segment_batches]
-        resolved_batches = pipeline.resolve_g2pw_segments_batch(prepared_segment_batches, profiles=profiles)
+        prepared_batches = [list(batch or []) for batch in (prepared_segment_batches or [])]
+        profiles: list[dict[str, float]] = [{} for _ in prepared_batches]
+        if not prepared_batches:
+            return prepared_batches, profiles
+        zh_indices_batches = [
+            [index for index, segment in enumerate(prepared_segments) if bool(getattr(segment, "needs_g2pw", False))]
+            for prepared_segments in prepared_batches
+        ]
+        if not any(zh_indices_batches):
+            return prepared_batches, profiles
+
+        g2p_segments_batch = self._get_text_frontend_symbol("text.chinese2", "g2p_segments_batch")
+        cleaned_text_to_sequence = self._get_text_frontend_symbol("text", "cleaned_text_to_sequence")
+        prepared_text_segment_cls = self._get_text_preprocessor_symbol("PreparedTextSegment")
+        version = self._current_text_frontend_version()
+        normalized_segment_batches = [
+            [str(getattr(prepared_segments[index], "norm_text", "") or "") for index in zh_indices]
+            for prepared_segments, zh_indices in zip(prepared_batches, zh_indices_batches)
+        ]
+        resolved_segment_batches, g2pw_profiles = g2p_segments_batch(
+            normalized_segment_batches,
+            return_profiles=True,
+        )
+        resolved_batches: list[Any] = []
+        for batch_index, (prepared_segments, zh_indices, resolved_segments) in enumerate(
+            zip(prepared_batches, zh_indices_batches, resolved_segment_batches)
+        ):
+            batch_profile = dict((g2pw_profiles or [])[batch_index] or {})
+            self._merge_g2pw_profile(profiles[batch_index], batch_profile)
+            batch_result = list(prepared_segments)
+            for index, (phones, word2ph, norm_text) in zip(zh_indices, resolved_segments):
+                batch_result[index] = prepared_text_segment_cls(
+                    language=str(getattr(batch_result[index], "language", "")),
+                    phones=list(cleaned_text_to_sequence(phones, version)),
+                    word2ph=None if word2ph is None else list(word2ph),
+                    norm_text=str(norm_text),
+                    needs_g2pw=False,
+                )
+            resolved_batches.append(batch_result)
         return resolved_batches, profiles
 
     def _load_ref_audio_raw(self, ref_audio_path: str) -> Any:
@@ -2621,9 +2936,14 @@ class GPTSoVITSRuntime:
                 "bucket_first_hit_serialized": False,
             }
         bucket_index = int(bucket_index_fn(raw_audio, int(raw_sr), wav16k=wav16k))
+        preferred_shard_index = self._select_ref_prompt_semantic_worker_shard_index(
+            coordinator,
+            worker,
+            bucket_index=bucket_index,
+        )
         route = {
             "bucket_index": int(bucket_index),
-            "preferred_shard_index": None,
+            "preferred_shard_index": preferred_shard_index,
             "bucket_first_hit_serialized": False,
         }
         if (
@@ -2653,8 +2973,11 @@ class GPTSoVITSRuntime:
                 if callable(pick_first_hit_fn):
                     reserved_shard_index = int(pick_first_hit_fn())
                 else:
-                    pick_shard_fn = getattr(worker, "pick_runtime_shard_index", None)
-                    reserved_shard_index = int(pick_shard_fn(bucket_index)) if callable(pick_shard_fn) else 0
+                    reserved_shard_index = (
+                        int(preferred_shard_index)
+                        if preferred_shard_index is not None
+                        else 0
+                    )
                 state = {
                     "reserved_shard_index": int(reserved_shard_index),
                     "dispatched_hits": 0,
@@ -2668,6 +2991,66 @@ class GPTSoVITSRuntime:
             route["preferred_shard_index"] = int(state.get("reserved_shard_index", 0))
             route["bucket_first_hit_serialized"] = True
         return route
+
+    def _select_ref_prompt_semantic_worker_shard_index(
+        self,
+        coordinator: Any,
+        worker: Any,
+        *,
+        bucket_index: int | None,
+    ) -> int | None:
+        coordinator = self._coerce_prepare_coordinator(coordinator)
+        snapshots_fn = getattr(worker, "runtime_routing_snapshots_for_bucket", None)
+        if not callable(snapshots_fn):
+            pick_shard_fn = getattr(worker, "pick_runtime_shard_index", None)
+            return int(pick_shard_fn(bucket_index)) if callable(pick_shard_fn) else None
+        snapshots_raw = list(snapshots_fn(bucket_index))
+        if not snapshots_raw:
+            return None
+        snapshots = []
+        for snapshot in snapshots_raw:
+            normalized = {str(key): int(value) for key, value in dict(snapshot).items()}
+            if "shard_index" not in normalized:
+                continue
+            snapshots.append(normalized)
+        if not snapshots:
+            return None
+        if (
+            bool(getattr(coordinator, "ref_prompt_semantic_bucket_aware_sharding", False))
+            and bucket_index is not None
+            and len(snapshots) > 1
+        ):
+            min_outstanding = min(int(snapshot.get("outstanding", 0)) for snapshot in snapshots)
+            allowed_gap = int(getattr(coordinator, "ref_prompt_semantic_bucket_aware_max_outstanding_gap", 0) or 0)
+            preferred = [
+                snapshot
+                for snapshot in snapshots
+                if int(snapshot.get("mergeable_pending", 0)) > 0
+                and int(snapshot.get("outstanding", 0)) <= (min_outstanding + allowed_gap)
+            ]
+            if preferred:
+                best = min(
+                    preferred,
+                    key=lambda snapshot: (
+                        -int(snapshot.get("mergeable_pending", 0)),
+                        -int(snapshot.get("exact_pending", 0)),
+                        int(snapshot.get("outstanding", 0)),
+                        int(snapshot.get("outstanding_samples", 0)),
+                        0 if int(snapshot.get("active_mergeable", 0)) > 0 else 1,
+                        int(snapshot.get("shard_index", 0)),
+                    ),
+                )
+                return int(best.get("shard_index", 0))
+        fallback = min(
+            snapshots,
+            key=lambda snapshot: (
+                int(snapshot.get("outstanding", snapshot.get("pending", 0))),
+                int(snapshot.get("outstanding_samples", snapshot.get("pending_samples", 0))),
+                int(snapshot.get("active_batch_size", 0)),
+                int(snapshot.get("shard_index", 0)),
+            ),
+        )
+        return int(fallback.get("shard_index", 0))
 
     def _mark_ref_prompt_semantic_worker_routing_completed(
         self,
@@ -2876,6 +3259,74 @@ class GPTSoVITSRuntime:
     def _empty_bert_feature(phone_count: int, device: Any) -> torch.Tensor:
         return torch.zeros((1024, max(0, int(phone_count))), dtype=torch.float32, device=device)
 
+    def _compute_sync_bert_feature(
+        self,
+        text: str,
+        word2ph: list[int],
+        profile: dict[str, float] | None = None,
+    ) -> torch.Tensor:
+        pipeline = self._ensure_pipeline()
+        worker = getattr(pipeline, "prepare_bert_batch_worker", None)
+        self._mark_bert_submit_offsets(profile)
+        if worker is not None:
+            feature, worker_profile = worker.submit(text, list(word2ph))
+            self._merge_bert_worker_profile(profile, dict(worker_profile))
+            return feature.to(getattr(getattr(pipeline, "configs", None), "device", "cpu"))
+
+        tokenizer = getattr(pipeline, "bert_tokenizer")
+        bert_model = getattr(pipeline, "bert_model")
+        device = getattr(getattr(pipeline, "configs", None), "device", "cpu")
+        limiter = getattr(pipeline, "prepare_bert_stage_limiter", None)
+        limiter_stats = {"wait_ms": 0.0, "inflight": 1, "peak_inflight": 1, "slots": 0}
+
+        def _run_bert_forward() -> torch.Tensor:
+            inputs = tokenizer(text, return_tensors="pt")
+            tokenize_ms = 0.0
+            h2d_start = time.perf_counter()
+            for key in inputs:
+                inputs[key] = inputs[key].to(device)
+            tokenize_ms += (time.perf_counter() - h2d_start) * 1000.0
+            forward_start = time.perf_counter()
+            with torch.no_grad():
+                result = bert_model(**inputs, output_hidden_states=True)
+                hidden = torch.cat(result["hidden_states"][-3:-2], -1)[0].cpu()[1:-1]
+            forward_ms = (time.perf_counter() - forward_start) * 1000.0
+            self._accumulate_profile_metric(profile, "bert_tokenize_ms", tokenize_ms)
+            self._accumulate_profile_metric(profile, "bert_forward_ms", forward_ms)
+            return hidden
+
+        if limiter is None:
+            hidden = _run_bert_forward()
+        else:
+            with limiter.enter() as limiter_stats:
+                hidden = _run_bert_forward()
+        self._accumulate_profile_metric(profile, "bert_wait_ms", limiter_stats.get("wait_ms", 0.0))
+        self._accumulate_profile_metric(profile, "bert_calls", 1.0)
+        self._update_profile_metric_peak(profile, "bert_stage_inflight_peak", limiter_stats.get("peak_inflight", 0.0))
+        if profile is not None:
+            profile["bert_stage_slots"] = float(limiter_stats.get("slots", 0.0))
+        if len(word2ph) != len(text):
+            raise ValueError("中文文本 word2ph 与文本长度不一致，无法提取 BERT 特征")
+        phone_level_feature = [hidden[index].repeat(int(phone_count), 1) for index, phone_count in enumerate(word2ph)]
+        return torch.cat(phone_level_feature, dim=0).T.to(device)
+
+    def _build_segment_bert_feature(
+        self,
+        segment: Any,
+        profile: dict[str, float] | None = None,
+    ) -> torch.Tensor:
+        pipeline = self._ensure_pipeline()
+        device = getattr(getattr(pipeline, "configs", None), "device", "cpu")
+        phones = [int(item) for item in list(getattr(segment, "phones", []) or [])]
+        segment_language = str(getattr(segment, "language", "") or "").replace("all_", "")
+        if segment_language != "zh":
+            return self._empty_bert_feature(len(phones), device)
+        word2ph = getattr(segment, "word2ph", None)
+        if word2ph is None:
+            raise ValueError("中文文本缺少 word2ph，无法提取 BERT 特征")
+        norm_text = str(getattr(segment, "norm_text", "") or "")
+        return self._compute_sync_bert_feature(norm_text, list(word2ph), profile=profile)
+
     def _prepare_text_feature_segment_jobs(
         self,
         prepared_segments: Any,
@@ -2954,14 +3405,27 @@ class GPTSoVITSRuntime:
         cpu_run_ms: float,
         base_profile: dict[str, float] | None = None,
     ) -> GPTSoVITSTextFeatures:
-        pipeline = self._ensure_pipeline()
+        del language
         profile: dict[str, float] = dict(base_profile or {})
         profile["cpu_preprocess_ms"] = float(cpu_run_ms)
         branch_start = time.perf_counter()
-        phones, bert_features, norm_text = pipeline.build_text_features_from_segments(
-            prepared_segments,
-            profile=profile,
-        )
+        resolved_segments, g2pw_profile = self._resolve_g2pw_segments(prepared_segments)
+        self._merge_g2pw_profile(profile, g2pw_profile)
+        phones_list: list[list[int]] = []
+        bert_list: list[torch.Tensor] = []
+        norm_text_list: list[str] = []
+        for segment in resolved_segments:
+            phones = [int(item) for item in list(getattr(segment, "phones", []) or [])]
+            norm_text = str(getattr(segment, "norm_text", "") or "")
+            phones_list.append(phones)
+            norm_text_list.append(norm_text)
+            bert_list.append(self._build_segment_bert_feature(segment, profile=profile))
+        if bert_list:
+            bert_features = torch.cat(bert_list, dim=1)
+        else:
+            bert_features = self._empty_bert_feature(0, "cpu")
+        phones = sum(phones_list, [])
+        norm_text = "".join(norm_text_list)
         total_ms = float(cpu_run_ms + (time.perf_counter() - branch_start) * 1000.0)
         profile["bert_total_ms"] = max(0.0, total_ms - float(cpu_run_ms))
         return self._make_text_features(
@@ -5309,12 +5773,6 @@ class GPTSoVITSRuntime:
         active_batch = self._build_prefill_active_batch(model, [prepared.state])
         if active_batch.prefill_attn_mask is None or active_batch.key_padding_mask is None:
             raise ValueError("GPT-SoVITS AR prefill batch is missing attention masks")
-        enable_pooled_kv = str(os.environ.get("GPT_SOVITS_ENABLE_AR_KV_POOL", "")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
 
         xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.process_prompt(
             active_batch.xy_pos,
@@ -5325,9 +5783,7 @@ class GPTSoVITSRuntime:
         if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
             raise ValueError("GPT-SoVITS AR prefill did not produce KV cache")
 
-        packed_into_pool = False
-        if enable_pooled_kv:
-            packed_into_pool = bool(self._pack_active_batch_into_pool(model, active_batch))
+        packed_into_pool = bool(self._pack_active_batch_into_pool(model, active_batch))
         if not packed_into_pool:
             active_batch.decode_attn_mask = F.pad(
                 active_batch.key_padding_mask.unsqueeze(1).unsqueeze(1),
@@ -5612,18 +6068,66 @@ class GPTSoVITSRuntime:
             int(prepared.raw_sr),
         )
 
+    @staticmethod
+    def _default_vocoder_runtime_config(version: str) -> dict[str, int]:
+        normalized = str(version or "").strip()
+        if normalized == "v3":
+            return {
+                "sr": 24000,
+                "T_ref": 468,
+                "T_chunk": 934,
+                "upsample_rate": 256,
+                "overlapped_len": 12,
+            }
+        if normalized == "v4":
+            return {
+                "sr": 48000,
+                "T_ref": 500,
+                "T_chunk": 1000,
+                "upsample_rate": 480,
+                "overlapped_len": 12,
+            }
+        return {
+            "sr": 0,
+            "T_ref": 0,
+            "T_chunk": 0,
+            "upsample_rate": 1,
+            "overlapped_len": 0,
+        }
+
+    def _resolve_vocoder_runtime_config(self, pipeline: Any) -> dict[str, int]:
+        version = str(getattr(getattr(pipeline, "configs", None), "version", "") or "")
+        config = self._default_vocoder_runtime_config(version)
+        configured = dict(getattr(pipeline, "vocoder_configs", {}) or {})
+        for key, default_value in config.items():
+            value = configured.get(key, default_value)
+            if value is None:
+                value = default_value
+            config[key] = int(value)
+        return config
+
+    @staticmethod
+    def _run_vocoder_module(vocoder: Any, pred_spec: torch.Tensor) -> torch.Tensor:
+        return vocoder(pred_spec)
+
     def _build_vocoder_prompt_context(
         self,
         pipeline: Any,
         prepared: GPTSoVITSDecodePreparedRequest,
         refer_audio_spec: torch.Tensor,
     ) -> dict[str, Any]:
+        vocoder_config = self._resolve_vocoder_runtime_config(pipeline)
         device = torch.device(pipeline.configs.device)
         prompt_semantic_tokens = prepared.prompt_semantic.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long)
         prompt_phones = prepared.prompt_phones.unsqueeze(0).to(device=device, dtype=torch.long)
         refer_audio_spec = refer_audio_spec.to(dtype=pipeline.precision, device=device)
 
-        fea_ref, ge = pipeline.vits_model.decode_encp(prompt_semantic_tokens, prompt_phones, refer_audio_spec)
+        fea_ref, ge = self._run_vits_vocoder_feature_decode(
+            pipeline.vits_model,
+            codes=prompt_semantic_tokens,
+            text=prompt_phones,
+            refer_audio_spec=refer_audio_spec,
+        )
         ref_audio = prepared.raw_audio.to(device=device, dtype=torch.float32)
         if ref_audio.ndim == 1:
             ref_audio = ref_audio.unsqueeze(0)
@@ -5639,8 +6143,8 @@ class GPTSoVITSRuntime:
         t_min = min(int(mel2.shape[2]), int(fea_ref.shape[2]))
         mel2 = mel2[:, :, :t_min]
         fea_ref = fea_ref[:, :, :t_min]
-        t_ref = int(pipeline.vocoder_configs["T_ref"])
-        t_chunk = int(pipeline.vocoder_configs["T_chunk"])
+        t_ref = int(vocoder_config["T_ref"])
+        t_chunk = int(vocoder_config["T_chunk"])
         if t_min > t_ref:
             mel2 = mel2[:, :, -t_ref:]
             fea_ref = fea_ref[:, :, -t_ref:]
@@ -5654,7 +6158,8 @@ class GPTSoVITSRuntime:
             "mel2": mel2.to(dtype=pipeline.precision),
             "t_min": int(t_min),
             "chunk_len": int(chunk_len),
-            "output_sr": int(pipeline.vocoder_configs["sr"]),
+            "output_sr": int(vocoder_config["sr"]),
+            "vocoder_config": vocoder_config,
         }
 
     def _decode_vocoder_with_prompt_context(
@@ -5672,12 +6177,13 @@ class GPTSoVITSRuntime:
         chunk_len = int(prompt_context["chunk_len"])
         semantic_tokens = prepared.semantic_tokens.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long)
         phones = prepared.phones.unsqueeze(0).to(device=device, dtype=torch.long)
-        fea_todo, ge = pipeline.vits_model.decode_encp(
-            semantic_tokens,
-            phones,
-            refer_audio_spec,
-            ge,
-            float(prepared.speed_factor),
+        fea_todo, ge = self._run_vits_vocoder_feature_decode(
+            pipeline.vits_model,
+            codes=semantic_tokens,
+            text=phones,
+            refer_audio_spec=refer_audio_spec,
+            ge=ge,
+            speed=float(prepared.speed_factor),
         )
 
         mel2 = mel2_base.clone()
@@ -5704,7 +6210,7 @@ class GPTSoVITSRuntime:
 
         cfm_res = torch.cat(cfm_results, dim=2)
         cfm_res = self._denorm_vocoder_spec(cfm_res)
-        wav_gen = pipeline.vocoder(cfm_res)
+        wav_gen = self._run_vocoder_module(pipeline.vocoder, cfm_res)
         return wav_gen[0][0], int(prompt_context["output_sr"])
 
     @staticmethod
@@ -5774,8 +6280,9 @@ class GPTSoVITSRuntime:
             raise ValueError("GPT-SoVITS batched vocoder decode requires identical sample_steps")
 
         chunk_len = int(prompt_context["chunk_len"])
-        overlapped_len = int(pipeline.vocoder_configs.get("overlapped_len", 0))
-        upsample_rate = int(pipeline.vocoder_configs.get("upsample_rate", 1))
+        vocoder_config = dict(prompt_context.get("vocoder_config", {}) or {})
+        overlapped_len = int(vocoder_config.get("overlapped_len", 0))
+        upsample_rate = int(vocoder_config.get("upsample_rate", 1))
         if chunk_len <= 0 or overlapped_len < 0 or upsample_rate <= 0:
             return [
                 GPTSoVITSDecodedAudio(
@@ -5810,12 +6317,13 @@ class GPTSoVITSRuntime:
         for prepared in prepared_requests:
             semantic_tokens = prepared.semantic_tokens.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long)
             phones = prepared.phones.unsqueeze(0).to(device=device, dtype=torch.long)
-            feat, _ = pipeline.vits_model.decode_encp(
-                semantic_tokens,
-                phones,
-                refer_audio_spec,
-                ge,
-                first_speed,
+            feat, _ = self._run_vits_vocoder_feature_decode(
+                pipeline.vits_model,
+                codes=semantic_tokens,
+                text=phones,
+                refer_audio_spec=refer_audio_spec,
+                ge=ge,
+                speed=first_speed,
             )
             feats.append(feat)
             feat_lens.append(int(feat.shape[2]))
@@ -5867,7 +6375,7 @@ class GPTSoVITSRuntime:
         pred_spec = pred_spec.permute(1, 0, 2).contiguous().view(channel_dim, -1).unsqueeze(0)
         pred_spec = self._denorm_vocoder_spec(pred_spec)
 
-        wav_gen = pipeline.vocoder(pred_spec)
+        wav_gen = self._run_vocoder_module(pipeline.vocoder, pred_spec)
         audio = wav_gen[0][0]
         audio_chunks: list[torch.Tensor] = []
         audio_position = 0
@@ -5951,6 +6459,124 @@ class GPTSoVITSRuntime:
                     decoded[index] = decoded_item
         return [item for item in decoded if item is not None]
 
+    def _compute_vits_reference_ge(
+        self,
+        vits_model: Any,
+        refer_audio_spec: torch.Tensor,
+        *,
+        refer_lengths: torch.Tensor | None = None,
+        sv_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        commons = self._get_text_frontend_symbol("GPT_SoVITS.module", "commons")
+        if refer_audio_spec.ndim != 3:
+            raise ValueError(f"GPT-SoVITS refer_audio_spec 维度非法: expected 3D, got {tuple(refer_audio_spec.shape)}")
+        batch_size = int(refer_audio_spec.size(0))
+        if refer_lengths is None:
+            refer_lengths = torch.full(
+                (batch_size,),
+                int(refer_audio_spec.size(2)),
+                dtype=torch.long,
+                device=refer_audio_spec.device,
+            )
+        else:
+            refer_lengths = refer_lengths.to(device=refer_audio_spec.device, dtype=torch.long)
+        refer_mask = torch.unsqueeze(
+            commons.sequence_mask(refer_lengths, int(refer_audio_spec.size(2))),
+            1,
+        ).to(refer_audio_spec.dtype)
+        refer_source = refer_audio_spec if getattr(vits_model, "version", "v2") == "v1" else refer_audio_spec[:, :704]
+        ge = vits_model.ref_enc(refer_source * refer_mask, refer_mask)
+        if bool(getattr(vits_model, "is_v2pro", False)):
+            if sv_emb is None:
+                raise ValueError("GPT-SoVITS v2Pro request-local synthesis 缺少 sv_emb")
+            ge = ge + vits_model.sv_emb(sv_emb).unsqueeze(-1)
+            ge = vits_model.prelu(ge)
+        return ge
+
+    def _run_vits_non_vocoder_decode(
+        self,
+        vits_model: Any,
+        *,
+        codes: torch.Tensor,
+        code_lengths: torch.Tensor,
+        text: torch.Tensor,
+        text_lengths: torch.Tensor,
+        ge: torch.Tensor,
+        speed: float,
+        noise_scale: float = 0.5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        quantized = vits_model.quantizer.decode(codes)
+        if getattr(vits_model, "semantic_frame_rate", "") == "25hz":
+            quantized = F.interpolate(quantized, scale_factor=2, mode="nearest")
+        code_lengths = code_lengths.to(device=codes.device, dtype=torch.long)
+        text_lengths = text_lengths.to(device=text.device, dtype=torch.long)
+        y_lengths = code_lengths * 2
+        encoder_ge = (
+            vits_model.ge_to512(ge.transpose(2, 1)).transpose(2, 1)
+            if bool(getattr(vits_model, "is_v2pro", False))
+            else ge
+        )
+        x, m_p, logs_p, y_mask, _, _ = vits_model.enc_p(
+            quantized,
+            y_lengths,
+            text,
+            text_lengths,
+            encoder_ge,
+            speed,
+        )
+        del x
+        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * float(noise_scale)
+        z = vits_model.flow(z_p, y_mask, g=ge, reverse=True)
+        audio = vits_model._decode_audio_runtime((z * y_mask)[:, :, :], g=ge)
+        return audio, y_mask
+
+    @staticmethod
+    def _measure_vits_audio_lengths(vits_model: Any, y_mask: torch.Tensor) -> torch.Tensor:
+        upsample_factor = 1
+        for up_layer in getattr(getattr(vits_model, "dec", None), "ups", []):
+            stride = up_layer.stride[0] if isinstance(up_layer.stride, tuple) else int(up_layer.stride)
+            upsample_factor *= int(stride)
+        return y_mask.squeeze(1).sum(dim=1).to(dtype=torch.long) * int(upsample_factor)
+
+    def _run_vits_vocoder_feature_decode(
+        self,
+        vits_model: Any,
+        *,
+        codes: torch.Tensor,
+        text: torch.Tensor,
+        refer_audio_spec: torch.Tensor,
+        ge: torch.Tensor | None = None,
+        speed: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        commons = self._get_text_frontend_symbol("GPT_SoVITS.module", "commons")
+        if ge is None:
+            refer_lengths = torch.LongTensor([int(refer_audio_spec.size(2))]).to(refer_audio_spec.device)
+            refer_mask = torch.unsqueeze(
+                commons.sequence_mask(refer_lengths, int(refer_audio_spec.size(2))),
+                1,
+            ).to(refer_audio_spec.dtype)
+            ge = vits_model.ref_enc(refer_audio_spec[:, :704] * refer_mask, refer_mask)
+        y_lengths = torch.LongTensor([int(codes.size(2) * 2)]).to(codes.device)
+        version = str(getattr(vits_model, "version", "v2"))
+        base_scale = 3.875 if version == "v3" else 4.0
+        if float(speed) == 1.0:
+            sizee = int(codes.size(2) * base_scale)
+        else:
+            sizee = int(codes.size(2) * base_scale / float(speed)) + 1
+        y_lengths1 = torch.LongTensor([sizee]).to(codes.device)
+        text_lengths = torch.LongTensor([int(text.size(-1))]).to(text.device)
+        quantized = vits_model.quantizer.decode(codes)
+        if getattr(vits_model, "semantic_frame_rate", "") == "25hz":
+            quantized = F.interpolate(quantized, scale_factor=2, mode="nearest")
+        try:
+            x, _m_p, _logs_p, _y_mask, *_ = vits_model.enc_p(quantized, y_lengths, text, text_lengths, ge, speed)
+        except TypeError:
+            x, _m_p, _logs_p, _y_mask, *_ = vits_model.enc_p(quantized, y_lengths, text, text_lengths, ge)
+        fea = vits_model.bridge(x)
+        fea = F.interpolate(fea, scale_factor=(1.875 if version == "v3" else 2), mode="nearest")
+        fea, _ = vits_model.wns1(fea, y_lengths1, ge)
+        return fea, ge
+
     def _decode_prepared_request_fragment(
         self,
         pipeline: Any,
@@ -5964,20 +6590,30 @@ class GPTSoVITSRuntime:
                 refer_spec.spec_audio,
             )
 
-        refer_audio_spec_list = [refer_spec.spec_audio.to(dtype=pipeline.precision, device=pipeline.configs.device)]
+        device = torch.device(pipeline.configs.device)
+        refer_audio_spec = refer_spec.spec_audio.to(dtype=pipeline.precision, device=device)
         sv_emb = None
         if bool(getattr(pipeline, "is_v2pro", False)):
             audio_tensor = refer_spec.audio_16k
             if audio_tensor is None:
                 raise ValueError("GPT-SoVITS v2Pro request-local synthesis 缺少 16k 参考音频")
-            sv_emb = [pipeline.sv_model.compute_embedding3(audio_tensor).to(pipeline.configs.device)]
-        audio_fragment = pipeline.vits_model.decode(
-            prepared.semantic_tokens.unsqueeze(0).unsqueeze(0),
-            prepared.phones.unsqueeze(0),
-            refer_audio_spec_list,
-            speed=float(prepared.speed_factor),
+            sv_emb = pipeline.sv_model.compute_embedding3(audio_tensor).to(device)
+        ge = self._compute_vits_reference_ge(
+            pipeline.vits_model,
+            refer_audio_spec,
             sv_emb=sv_emb,
-        ).detach()[0, 0, :]
+        )
+        audio_batch, y_mask = self._run_vits_non_vocoder_decode(
+            pipeline.vits_model,
+            codes=prepared.semantic_tokens.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long),
+            code_lengths=torch.LongTensor([int(prepared.semantic_tokens.shape[-1])]).to(device),
+            text=prepared.phones.unsqueeze(0).to(device=device, dtype=torch.long),
+            text_lengths=torch.LongTensor([int(prepared.phones.shape[-1])]).to(device),
+            ge=ge,
+            speed=float(prepared.speed_factor),
+        )
+        audio_lengths = self._measure_vits_audio_lengths(pipeline.vits_model, y_mask)
+        audio_fragment = audio_batch[0, 0, : int(audio_lengths[0].item())].detach()
         return audio_fragment, int(pipeline.configs.sampling_rate)
 
     def _decode_prepared_requests_batched_non_vocoder(
@@ -6087,41 +6723,45 @@ class GPTSoVITSRuntime:
             else:
                 sv_emb_batch = torch.cat(sv_emb_list, dim=0)
 
-        precomputed_ge = None
+        ge_batch = None
         if shared_single_refer:
             if shared_refer_audio_spec is None:
                 raise ValueError("shared_single_refer detected but refer_audio_spec missing")
             refer_audio_specs = [shared_refer_audio_spec]
-            with self._project_root_cwd():
-                from GPT_SoVITS.module import commons
-
-            refer_lengths = torch.LongTensor([int(shared_refer_audio_spec.size(2))]).to(device)
-            refer_mask = torch.unsqueeze(
-                commons.sequence_mask(refer_lengths, int(shared_refer_audio_spec.size(2))),
-                1,
-            ).to(shared_refer_audio_spec.dtype)
-            if pipeline.vits_model.version == "v1":
-                precomputed_ge = pipeline.vits_model.ref_enc(shared_refer_audio_spec * refer_mask, refer_mask)
-            else:
-                precomputed_ge = pipeline.vits_model.ref_enc(shared_refer_audio_spec[:, :704] * refer_mask, refer_mask)
-            if bool(getattr(pipeline, "is_v2pro", False)):
-                if sv_emb_batch is None:
-                    raise ValueError("GPT-SoVITS v2Pro batched non-vocoder decode 缺少 sv_emb")
-                precomputed_ge = precomputed_ge + pipeline.vits_model.sv_emb(sv_emb_batch[:1]).unsqueeze(-1)
-                precomputed_ge = pipeline.vits_model.prelu(precomputed_ge)
+            ge_batch = self._compute_vits_reference_ge(
+                pipeline.vits_model,
+                shared_refer_audio_spec,
+                sv_emb=(sv_emb_batch[:1] if sv_emb_batch is not None else None),
+            )
+            ge_batch = ge_batch.expand(batch_size, -1, -1)
+        else:
+            refer_lengths = torch.LongTensor([int(item.size(2)) for item in refer_audio_specs]).to(device)
+            max_refer_len = int(refer_lengths.max().item())
+            refer_batch = torch.zeros(
+                (batch_size, int(refer_audio_specs[0].size(1)), max_refer_len),
+                dtype=refer_audio_specs[0].dtype,
+                device=device,
+            )
+            for batch_index, refer in enumerate(refer_audio_specs):
+                refer_batch[batch_index, :, : int(refer.size(2))] = refer.squeeze(0)
+            ge_batch = self._compute_vits_reference_ge(
+                pipeline.vits_model,
+                refer_batch,
+                refer_lengths=refer_lengths,
+                sv_emb=sv_emb_batch,
+            )
 
         with self._run_lock:
-            audio_batch, audio_lengths = pipeline.vits_model.decode_batched_request_local(
+            audio_batch, y_mask = self._run_vits_non_vocoder_decode(
+                pipeline.vits_model,
                 codes=semantic_batch,
                 code_lengths=torch.LongTensor(semantic_lengths).to(device),
                 text=phone_batch,
                 text_lengths=torch.LongTensor(phone_lengths).to(device),
-                refer_list=refer_audio_specs,
+                ge=ge_batch,
                 speed=first_speed,
-                sv_emb=sv_emb_batch,
-                shared_refer=shared_single_refer,
-                precomputed_ge=precomputed_ge,
             )
+        audio_lengths = self._measure_vits_audio_lengths(pipeline.vits_model, y_mask)
         audio_fragments = [
             audio_batch[batch_index, 0, : int(audio_lengths[batch_index].item())].detach()
             for batch_index in range(batch_size)

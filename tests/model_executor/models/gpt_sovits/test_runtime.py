@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import concurrent.futures
+import importlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
 import numpy as np
@@ -36,6 +42,32 @@ from vllm_omni.model_executor.models.gpt_sovits.runtime import (
     GPTSoVITSStageTransport,
     GPTSoVITSRuntime,
 )
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_GPT_SOVITS_PROJECT_ROOT = Path("/root/GPT-SoVITS")
+_G2PW_CU_RUNTIME_LIB = _GPT_SOVITS_PROJECT_ROOT / "third_party" / "g2pw-cu" / "build" / "libg2pw_runtime.so"
+_G2PW_CU_MANIFEST = _GPT_SOVITS_PROJECT_ROOT / "third_party" / "g2pw-cu" / "artifacts" / "model" / "manifest.txt"
+_G2PW_CU_WEIGHTS = _GPT_SOVITS_PROJECT_ROOT / "third_party" / "g2pw-cu" / "artifacts" / "model" / "weights.bin"
+_GPT_SOVITS_S1_V3 = _GPT_SOVITS_PROJECT_ROOT / "GPT_SoVITS" / "pretrained_models" / "s1v3.ckpt"
+_GPT_SOVITS_V2PROPLUS = (
+    _GPT_SOVITS_PROJECT_ROOT / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2ProPlus.pth"
+)
+_G2PW_CU_RUNTIME_CONFIG = _REPO_ROOT / ".artifacts" / "tts_infer_v2proplus_cpu_longprompt.yaml"
+
+
+def _has_g2pw_cuda_runtime_test_assets() -> bool:
+    return torch.cuda.is_available() and all(
+        path.exists()
+        for path in (
+            _G2PW_CU_RUNTIME_LIB,
+            _G2PW_CU_MANIFEST,
+            _G2PW_CU_WEIGHTS,
+            _GPT_SOVITS_S1_V3,
+            _GPT_SOVITS_V2PROPLUS,
+            _G2PW_CU_RUNTIME_CONFIG,
+        )
+    )
 
 
 def test_ref_audio_loader_falls_back_to_soundfile(tmp_path):
@@ -129,6 +161,32 @@ def test_build_tts_inputs_defaults_to_upstream_cut1(tmp_path):
     )
 
     assert inputs["text_split_method"] == "cut1"
+
+
+def test_ensure_native_runtime_deps_skips_global_preload_by_default(tmp_path, monkeypatch):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    preload = Mock()
+    monkeypatch.setattr("vllm_omni.model_executor.models.gpt_sovits.runtime.ctypes.CDLL", preload)
+    monkeypatch.delenv("GPTSOVITS_PRELOAD_NATIVE_RUNTIME_DEPS", raising=False)
+
+    runtime._ensure_native_runtime_deps()
+
+    preload.assert_not_called()
+    assert runtime._native_runtime_ready is True
+
+
+def test_ensure_native_runtime_deps_supports_opt_in_preload(tmp_path, monkeypatch):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    preload = Mock()
+    monkeypatch.setattr("vllm_omni.model_executor.models.gpt_sovits.runtime.ctypes.CDLL", preload)
+    monkeypatch.setattr("vllm_omni.model_executor.models.gpt_sovits.runtime.os.path.isdir", lambda _path: True)
+    monkeypatch.setattr("vllm_omni.model_executor.models.gpt_sovits.runtime.os.path.exists", lambda _path: True)
+    monkeypatch.setenv("GPTSOVITS_PRELOAD_NATIVE_RUNTIME_DEPS", "1")
+
+    runtime._ensure_native_runtime_deps()
+
+    assert runtime._native_runtime_ready is True
+    assert preload.call_count >= 2
 
 
 def test_get_ar_session_semantic_tokens_drops_prefix_and_trailing_eos(tmp_path):
@@ -887,6 +945,58 @@ def test_build_ref_prompt_semantic_worker_routing_uses_runtime_coordinator_first
     assert coordinator.ref_prompt_semantic_bucket_first_hit_states[4]["completed_hits"] == 2
 
 
+def test_select_ref_prompt_semantic_worker_shard_index_uses_runtime_bucket_aware_policy(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    coordinator = runtime._coerce_prepare_coordinator(
+        SimpleNamespace(
+            ref_prompt_semantic_bucket_aware_sharding=True,
+            ref_prompt_semantic_bucket_aware_max_outstanding_gap=2,
+        )
+    )
+    worker = SimpleNamespace(
+        runtime_routing_snapshots_for_bucket=Mock(
+            return_value=[
+                {
+                    "shard_index": 0,
+                    "mergeable_pending": 0,
+                    "exact_pending": 0,
+                    "outstanding": 1,
+                    "outstanding_samples": 100,
+                    "active_mergeable": 0,
+                    "active_batch_size": 0,
+                },
+                {
+                    "shard_index": 1,
+                    "mergeable_pending": 3,
+                    "exact_pending": 1,
+                    "outstanding": 2,
+                    "outstanding_samples": 140,
+                    "active_mergeable": 1,
+                    "active_batch_size": 1,
+                },
+                {
+                    "shard_index": 2,
+                    "mergeable_pending": 2,
+                    "exact_pending": 2,
+                    "outstanding": 3,
+                    "outstanding_samples": 120,
+                    "active_mergeable": 1,
+                    "active_batch_size": 2,
+                },
+            ]
+        )
+    )
+
+    shard_index = runtime._select_ref_prompt_semantic_worker_shard_index(
+        coordinator,
+        worker,
+        bucket_index=4,
+    )
+
+    worker.runtime_routing_snapshots_for_bucket.assert_called_once_with(4)
+    assert shard_index == 1
+
+
 def test_prepare_decode_requests_batches_prepare_contract(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     runtime.prepare_decode_request = Mock(side_effect=["prepared-a", "prepared-b"])  # type: ignore[method-assign]
@@ -1061,21 +1171,47 @@ def test_finalize_decoded_audio_normalizes_output(tmp_path):
 
 def test_decode_prepared_requests_batched_non_vocoder_uses_native_vits_batch(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._get_text_frontend_symbol = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            sequence_mask=lambda lengths, max_len: (
+                torch.arange(max_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+            )
+        )
+    )
     vits_model = SimpleNamespace(
         version="v2",
-        ref_enc=Mock(return_value=torch.ones((1, 2, 3), dtype=torch.float32)),
-        decode_batched_request_local=Mock(
+        is_v2pro=False,
+        semantic_frame_rate="50hz",
+        ref_enc=Mock(side_effect=lambda refer, mask: torch.ones((refer.shape[0], 2, 3), dtype=torch.float32)),
+        quantizer=SimpleNamespace(decode=Mock(return_value=torch.ones((1, 2, 3), dtype=torch.float32))),
+        enc_p=Mock(
             return_value=(
+                torch.zeros((2, 1, 4), dtype=torch.float32),
+                torch.zeros((2, 1, 4), dtype=torch.float32),
+                torch.zeros((2, 1, 4), dtype=torch.float32),
                 torch.tensor(
                     [
-                        [[0.1, 0.2, 0.3]],
-                        [[0.4, 0.5, 0.0]],
+                        [[1.0, 1.0, 1.0, 0.0]],
+                        [[1.0, 1.0, 0.0, 0.0]],
                     ],
                     dtype=torch.float32,
                 ),
-                torch.tensor([3, 2], dtype=torch.long),
+                None,
+                None,
             )
         ),
+        flow=Mock(side_effect=lambda z_p, y_mask, g=None, reverse=True: z_p),
+        _decode_audio_runtime=Mock(
+            return_value=torch.tensor(
+                [
+                    [[0.1, 0.2, 0.3, 0.0]],
+                    [[0.4, 0.5, 0.0, 0.0]],
+                ],
+                dtype=torch.float32,
+            )
+        ),
+        dec=SimpleNamespace(ups=[SimpleNamespace(stride=(1,))]),
+        decode_batched_request_local=Mock(side_effect=AssertionError("should not call vits wrapper")),
     )
     pipeline = SimpleNamespace(
         configs=SimpleNamespace(sampling_rate=32000, use_vocoder=False, device="cpu"),
@@ -1110,23 +1246,129 @@ def test_decode_prepared_requests_batched_non_vocoder_uses_native_vits_batch(tmp
         ],
     )
 
-    vits_model.decode_batched_request_local.assert_called_once()
+    vits_model.quantizer.decode.assert_called_once()
+    vits_model.enc_p.assert_called_once()
+    vits_model._decode_audio_runtime.assert_called_once()
+    vits_model.decode_batched_request_local.assert_not_called()
     assert [item.request_id for item in decoded] == ["a", "b"]
     assert decoded[0].audio_fragment.tolist() == pytest.approx([0.1, 0.2, 0.3])
     assert decoded[1].audio_fragment.tolist() == pytest.approx([0.4, 0.5])
+
+
+def test_decode_prepared_request_fragment_uses_runtime_native_vits_path(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._get_text_frontend_symbol = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            sequence_mask=lambda lengths, max_len: (
+                torch.arange(max_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+            )
+        )
+    )
+    vits_model = SimpleNamespace(
+        version="v2",
+        is_v2pro=False,
+        semantic_frame_rate="50hz",
+        ref_enc=Mock(return_value=torch.ones((1, 2, 3), dtype=torch.float32)),
+        quantizer=SimpleNamespace(decode=Mock(return_value=torch.ones((1, 1, 3), dtype=torch.float32))),
+        enc_p=Mock(
+            return_value=(
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.tensor([[[1.0, 1.0, 1.0]]], dtype=torch.float32),
+                None,
+                None,
+            )
+        ),
+        flow=Mock(side_effect=lambda z_p, y_mask, g=None, reverse=True: z_p),
+        _decode_audio_runtime=Mock(return_value=torch.tensor([[[0.1, 0.2, 0.3]]], dtype=torch.float32)),
+        dec=SimpleNamespace(ups=[SimpleNamespace(stride=(1,))]),
+        decode=Mock(side_effect=AssertionError("should not call vits decode wrapper")),
+    )
+    pipeline = SimpleNamespace(
+        configs=SimpleNamespace(sampling_rate=32000, use_vocoder=False, device="cpu"),
+        precision=torch.float16,
+        is_v2pro=False,
+        vits_model=vits_model,
+    )
+
+    audio_fragment, output_sr = runtime._decode_prepared_request_fragment(
+        pipeline,
+        SimpleNamespace(
+            semantic_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+            phones=torch.tensor([10, 11], dtype=torch.long),
+            refer_audio_spec=torch.ones((1, 704, 4), dtype=torch.float32),
+            refer_audio_16k=torch.zeros((0,), dtype=torch.float32),
+            speed_factor=1.0,
+            sample_steps=32,
+        ),
+    )
+
+    vits_model.quantizer.decode.assert_called_once()
+    vits_model.enc_p.assert_called_once()
+    vits_model._decode_audio_runtime.assert_called_once()
+    vits_model.decode.assert_not_called()
+    assert audio_fragment.tolist() == pytest.approx([0.1, 0.2, 0.3])
+    assert output_sr == 32000
 
 
 def test_decode_prepared_request_vocoder_fragment_uses_native_components(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     runtime._compute_vocoder_mel = Mock(return_value=torch.ones((1, 100, 6), dtype=torch.float32))  # type: ignore[method-assign]
     runtime._resample_audio = Mock(side_effect=lambda audio, sr0, sr1, device: audio)  # type: ignore[method-assign]
+    runtime._get_text_frontend_symbol = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            sequence_mask=lambda lengths, max_len: (
+                torch.arange(max_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+            )
+        )
+    )
 
-    decode_encp_calls = [
-        (torch.ones((1, 100, 6), dtype=torch.float32), torch.ones((1, 2, 1), dtype=torch.float32)),
-        (torch.ones((1, 100, 8), dtype=torch.float32), torch.ones((1, 2, 1), dtype=torch.float32)),
-    ]
     vits_model = SimpleNamespace(
-        decode_encp=Mock(side_effect=decode_encp_calls),
+        version="v3",
+        semantic_frame_rate="50hz",
+        ref_enc=Mock(return_value=torch.ones((1, 2, 1), dtype=torch.float32)),
+        quantizer=SimpleNamespace(
+            decode=Mock(
+                side_effect=[
+                    torch.ones((1, 1, 3), dtype=torch.float32),
+                    torch.ones((1, 1, 4), dtype=torch.float32),
+                ]
+            )
+        ),
+        enc_p=Mock(
+            side_effect=[
+                (
+                    torch.ones((1, 50, 3), dtype=torch.float32),
+                    None,
+                    None,
+                    torch.ones((1, 1, 3), dtype=torch.float32),
+                    None,
+                    None,
+                ),
+                (
+                    torch.ones((1, 50, 4), dtype=torch.float32),
+                    None,
+                    None,
+                    torch.ones((1, 1, 4), dtype=torch.float32),
+                    None,
+                    None,
+                ),
+            ]
+        ),
+        bridge=Mock(
+            side_effect=[
+                torch.ones((1, 100, 4), dtype=torch.float32),
+                torch.ones((1, 100, 5), dtype=torch.float32),
+            ]
+        ),
+        wns1=Mock(
+            side_effect=[
+                (torch.ones((1, 100, 6), dtype=torch.float32), torch.ones((1, 1, 6), dtype=torch.float32)),
+                (torch.ones((1, 100, 8), dtype=torch.float32), torch.ones((1, 1, 8), dtype=torch.float32)),
+            ]
+        ),
+        decode_encp=Mock(side_effect=AssertionError("should not call decode_encp wrapper")),
         cfm=SimpleNamespace(inference=Mock(return_value=torch.ones((1, 100, 10), dtype=torch.float32))),
     )
     pipeline = SimpleNamespace(
@@ -1152,9 +1394,73 @@ def test_decode_prepared_request_vocoder_fragment_uses_native_components(tmp_pat
         torch.ones((1, 704, 4), dtype=torch.float32),
     )
 
-    assert vits_model.decode_encp.call_count == 2
+    assert vits_model.quantizer.decode.call_count == 2
+    assert vits_model.enc_p.call_count == 2
+    assert vits_model.bridge.call_count == 2
+    assert vits_model.wns1.call_count == 2
+    vits_model.decode_encp.assert_not_called()
     vits_model.cfm.inference.assert_called()
     pipeline.vocoder.assert_called_once()
+    assert audio_fragment.tolist() == pytest.approx([0.1, 0.2, 0.3])
+    assert output_sr == 24000
+
+
+def test_resolve_vocoder_runtime_config_fills_defaults_from_version(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+
+    config = runtime._resolve_vocoder_runtime_config(
+        SimpleNamespace(
+            configs=SimpleNamespace(version="v3"),
+            vocoder_configs={"sr": None, "T_ref": 256},
+        )
+    )
+
+    assert config == {
+        "sr": 24000,
+        "T_ref": 256,
+        "T_chunk": 934,
+        "upsample_rate": 256,
+        "overlapped_len": 12,
+    }
+
+
+def test_decode_vocoder_with_prompt_context_uses_runtime_vocoder_helper(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._run_vits_vocoder_feature_decode = Mock(  # type: ignore[method-assign]
+        return_value=(torch.ones((1, 100, 4), dtype=torch.float32), torch.ones((1, 2, 1), dtype=torch.float32))
+    )
+    runtime._run_vocoder_module = Mock(return_value=torch.tensor([[[0.1, 0.2, 0.3]]], dtype=torch.float32))  # type: ignore[method-assign]
+    vits_model = SimpleNamespace(
+        cfm=SimpleNamespace(inference=Mock(return_value=torch.ones((1, 100, 6), dtype=torch.float32))),
+    )
+    pipeline = SimpleNamespace(
+        configs=SimpleNamespace(device="cpu"),
+        vits_model=vits_model,
+        vocoder="vocoder-module",
+    )
+    prompt_context = {
+        "refer_audio_spec": torch.ones((1, 704, 4), dtype=torch.float32),
+        "ge": torch.ones((1, 2, 1), dtype=torch.float32),
+        "fea_ref": torch.ones((1, 100, 2), dtype=torch.float32),
+        "mel2": torch.ones((1, 100, 2), dtype=torch.float32),
+        "t_min": 2,
+        "chunk_len": 4,
+        "output_sr": 24000,
+    }
+
+    audio_fragment, output_sr = runtime._decode_vocoder_with_prompt_context(
+        pipeline,
+        SimpleNamespace(
+            semantic_tokens=torch.tensor([1, 2], dtype=torch.long),
+            phones=torch.tensor([3, 4], dtype=torch.long),
+            speed_factor=1.0,
+            sample_steps=16,
+        ),
+        prompt_context,
+    )
+
+    runtime._run_vits_vocoder_feature_decode.assert_called_once()
+    runtime._run_vocoder_module.assert_called_once()
     assert audio_fragment.tolist() == pytest.approx([0.1, 0.2, 0.3])
     assert output_sr == 24000
 
@@ -1266,13 +1572,59 @@ def test_decode_prepared_requests_batched_vocoder_uses_native_components(tmp_pat
     runtime._sola_merge_audio_fragments = Mock(  # type: ignore[method-assign]
         return_value=torch.tensor([9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0], dtype=torch.float32)
     )
+    runtime._get_text_frontend_symbol = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            sequence_mask=lambda lengths, max_len: (
+                torch.arange(max_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+            )
+        )
+    )
     ge = torch.ones((1, 2, 1), dtype=torch.float32)
-    decode_encp_calls = [
-        (torch.ones((1, 100, 3), dtype=torch.float32), ge),
-        (torch.ones((1, 100, 2), dtype=torch.float32) * 2, ge),
-    ]
     vits_model = SimpleNamespace(
-        decode_encp=Mock(side_effect=decode_encp_calls),
+        version="v2",
+        semantic_frame_rate="50hz",
+        ref_enc=Mock(return_value=ge),
+        quantizer=SimpleNamespace(
+            decode=Mock(
+                side_effect=[
+                    torch.ones((1, 1, 2), dtype=torch.float32),
+                    torch.ones((1, 1, 1), dtype=torch.float32) * 2,
+                ]
+            )
+        ),
+        enc_p=Mock(
+            side_effect=[
+                (
+                    torch.ones((1, 50, 2), dtype=torch.float32),
+                    None,
+                    None,
+                    torch.ones((1, 1, 2), dtype=torch.float32),
+                    None,
+                    None,
+                ),
+                (
+                    torch.ones((1, 50, 1), dtype=torch.float32),
+                    None,
+                    None,
+                    torch.ones((1, 1, 1), dtype=torch.float32),
+                    None,
+                    None,
+                ),
+            ]
+        ),
+        bridge=Mock(
+            side_effect=[
+                torch.ones((1, 100, 2), dtype=torch.float32),
+                torch.ones((1, 100, 1), dtype=torch.float32) * 2,
+            ]
+        ),
+        wns1=Mock(
+            side_effect=[
+                (torch.ones((1, 100, 3), dtype=torch.float32), torch.ones((1, 1, 3), dtype=torch.float32)),
+                (torch.ones((1, 100, 2), dtype=torch.float32) * 2, torch.ones((1, 1, 2), dtype=torch.float32)),
+            ]
+        ),
+        decode_encp=Mock(side_effect=AssertionError("should not call decode_encp wrapper")),
         cfm=SimpleNamespace(
             inference=Mock(return_value=torch.ones((2, 100, 6), dtype=torch.float32)),
         ),
@@ -1290,6 +1642,7 @@ def test_decode_prepared_requests_batched_vocoder_uses_native_components(tmp_pat
         "mel2": torch.ones((1, 100, 2), dtype=torch.float32),
         "chunk_len": 4,
         "output_sr": 24000,
+        "vocoder_config": {"overlapped_len": 1, "upsample_rate": 1},
     }
 
     decoded = runtime._decode_prepared_requests_batched_vocoder(
@@ -1315,7 +1668,11 @@ def test_decode_prepared_requests_batched_vocoder_uses_native_components(tmp_pat
         prompt_context,
     )
 
-    assert vits_model.decode_encp.call_count == 2
+    assert vits_model.quantizer.decode.call_count == 2
+    assert vits_model.enc_p.call_count == 2
+    assert vits_model.bridge.call_count == 2
+    assert vits_model.wns1.call_count == 2
+    vits_model.decode_encp.assert_not_called()
     vits_model.cfm.inference.assert_called_once()
     pipeline.vocoder.assert_called_once()
     runtime._sola_merge_audio_fragments.assert_called_once()
@@ -2159,6 +2516,89 @@ def test_run_text_cpu_stage_pair_uses_worker_batch_submission(tmp_path):
     assert target_profiled.run_ms == pytest.approx(6.0, abs=1e-6)
 
 
+def test_prepare_text_cpu_uses_runtime_native_payload_conversion(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._current_text_frontend_version = Mock(return_value="v2")  # type: ignore[method-assign]
+    runtime._preprocess_text_segments_payload = Mock(  # type: ignore[method-assign]
+        return_value=[
+            {
+                "language": "zh",
+                "phones": [1, 2],
+                "word2ph": [1, 1],
+                "norm_text": "你好",
+                "needs_g2pw": False,
+            }
+        ]
+    )
+    runtime._payloads_to_prepared_text_segments = Mock(  # type: ignore[method-assign]
+        return_value=["prepared-segments"]
+    )
+    runtime._pipeline = SimpleNamespace(prepare_text_segments=Mock(side_effect=AssertionError("should not call pipeline helper")))
+
+    result = runtime._prepare_text_cpu("你好", "zh")
+
+    runtime._current_text_frontend_version.assert_called_once_with()
+    runtime._preprocess_text_segments_payload.assert_called_once_with("你好", "zh", "v2")
+    runtime._payloads_to_prepared_text_segments.assert_called_once()
+    assert result == ["prepared-segments"]
+
+
+def test_resolve_g2pw_segments_uses_runtime_native_frontend_path(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._current_text_frontend_version = Mock(return_value="v2")  # type: ignore[method-assign]
+    runtime._get_text_frontend_symbol = Mock(  # type: ignore[method-assign]
+        side_effect=[
+            Mock(return_value=([(["ni3"], [1], "你")], {"g2pw_predict_ms": 3.0})),
+            Mock(return_value=[9]),
+        ]
+    )
+    runtime._get_text_preprocessor_symbol = Mock(  # type: ignore[method-assign]
+        return_value=lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    runtime._pipeline = SimpleNamespace(resolve_g2pw_segments=Mock(side_effect=AssertionError("should not call pipeline helper")))
+    prepared_segments = [SimpleNamespace(language="zh", phones=[], word2ph=None, norm_text="你", needs_g2pw=True)]
+
+    resolved_segments, profile = runtime._resolve_g2pw_segments(prepared_segments)
+
+    assert resolved_segments[0].language == "zh"
+    assert resolved_segments[0].phones == [9]
+    assert resolved_segments[0].word2ph == [1]
+    assert resolved_segments[0].norm_text == "你"
+    assert resolved_segments[0].needs_g2pw is False
+    assert profile["g2pw_predict_ms"] == pytest.approx(3.0)
+
+
+def test_build_text_features_uses_runtime_native_sync_helpers(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._resolve_g2pw_segments = Mock(  # type: ignore[method-assign]
+        return_value=(
+            [
+                SimpleNamespace(language="zh", phones=[1, 2], word2ph=[1, 1], norm_text="你好", needs_g2pw=False),
+                SimpleNamespace(language="en", phones=[3], word2ph=None, norm_text="a", needs_g2pw=False),
+            ],
+            {"g2pw_predict_ms": 1.5},
+        )
+    )
+    runtime._build_segment_bert_feature = Mock(  # type: ignore[method-assign]
+        side_effect=[
+            torch.ones((1024, 2), dtype=torch.float32),
+            torch.full((1024, 1), 2.0, dtype=torch.float32),
+        ]
+    )
+    runtime._pipeline = SimpleNamespace(build_text_features_from_segments=Mock(side_effect=AssertionError("should not call pipeline helper")))
+
+    result = runtime._build_text_features(["prepared"], "zh", 5.0, base_profile={"seed": 1.0})
+
+    runtime._resolve_g2pw_segments.assert_called_once_with(["prepared"])
+    assert runtime._build_segment_bert_feature.call_count == 2
+    assert result.phones == [1, 2, 3]
+    assert result.norm_text == "你好a"
+    assert result.bert_features.shape == (1024, 3)
+    assert result.profile["seed"] == pytest.approx(1.0)
+    assert result.profile["cpu_preprocess_ms"] == pytest.approx(5.0)
+    assert result.profile["g2pw_predict_ms"] == pytest.approx(1.5)
+
+
 def test_run_text_feature_stage_uses_native_bert_worker_async_path(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     worker = SimpleNamespace(
@@ -2277,9 +2717,8 @@ def test_run_text_feature_pair_stage_uses_native_bert_worker_async_path(tmp_path
     assert target_profiled.result.profile["cpu_preprocess_ms"] == 7.0
 
 
-def test_build_ar_session_routes_through_runtime_native_ar_helpers(tmp_path, monkeypatch):
+def test_build_ar_session_routes_through_runtime_native_ar_helpers(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
-    monkeypatch.setenv("GPT_SOVITS_ENABLE_AR_KV_POOL", "1")
 
     active_batch = SimpleNamespace(
         request_ids=["req-native"],
@@ -2343,6 +2782,37 @@ def test_build_ar_session_routes_through_runtime_native_ar_helpers(tmp_path, mon
     assert torch.equal(session.current_logits, torch.tensor([[0.1, 0.2]], dtype=torch.float32))
 
 
+def test_pack_active_batch_into_pool_rejects_decode_headroom_overflow(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    pool = SimpleNamespace(
+        max_seq_len=4,
+        max_batch_size=8,
+        state=SimpleNamespace(enabled=True),
+        record_fallback=Mock(),
+        set_active_rows=Mock(),
+        pack_dynamic_cache_layers=Mock(),
+    )
+    active_batch = SimpleNamespace(
+        request_ids=["req-overflow"],
+        k_cache=[torch.ones((1, 4, 3), dtype=torch.float32)],
+        v_cache=[torch.ones((1, 4, 3), dtype=torch.float32)],
+        kv_lens=torch.tensor([4], dtype=torch.long),
+        kv_cache_pooled=True,
+        kv_cache_capacity=4,
+        kv_cache_batch_capacity=8,
+        decode_attn_mask=None,
+    )
+
+    packed = runtime._pack_active_batch_into_pool(SimpleNamespace(kv_cache_pool=pool), active_batch)
+
+    assert packed is False
+    pool.pack_dynamic_cache_layers.assert_not_called()
+    pool.record_fallback.assert_called_once()
+    assert active_batch.kv_cache_pooled is False
+    assert active_batch.kv_cache_capacity == 0
+    assert active_batch.kv_cache_batch_capacity == 0
+
+
 def test_advance_ar_session_routes_non_pooled_decode_through_runtime_helpers(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
 
@@ -2401,6 +2871,87 @@ def test_advance_ar_session_routes_non_pooled_decode_through_runtime_helpers(tmp
     assert torch.equal(logits, session.current_logits)
 
 
+def test_decode_active_batch_falls_back_from_pooled_cache_when_decode_headroom_exhausted(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    pool = SimpleNamespace(
+        max_seq_len=4,
+        max_batch_size=8,
+        state=SimpleNamespace(enabled=True),
+        record_fallback=Mock(),
+        set_active_rows=Mock(),
+    )
+    active_batch = SimpleNamespace(
+        request_ids=["req-a", "req-b"],
+        states=[SimpleNamespace(request_id="req-a"), SimpleNamespace(request_id="req-b")],
+        y_sequences=[torch.tensor([5], dtype=torch.long), torch.tensor([6], dtype=torch.long)],
+        prefix_lens=torch.tensor([1, 1], dtype=torch.long),
+        step_indices=torch.tensor([0, 0], dtype=torch.long),
+        xy_pos=torch.zeros((2, 1, 4), dtype=torch.float32),
+        k_cache=[
+            torch.tensor(
+                [
+                    [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [3.0, 3.0, 3.0], [0.0, 0.0, 0.0]],
+                    [[4.0, 4.0, 4.0], [5.0, 5.0, 5.0], [6.0, 6.0, 6.0], [7.0, 7.0, 7.0]],
+                ],
+                dtype=torch.float32,
+            )
+        ],
+        v_cache=[
+            torch.tensor(
+                [
+                    [[10.0, 10.0, 10.0], [20.0, 20.0, 20.0], [30.0, 30.0, 30.0], [0.0, 0.0, 0.0]],
+                    [[40.0, 40.0, 40.0], [50.0, 50.0, 50.0], [60.0, 60.0, 60.0], [70.0, 70.0, 70.0]],
+                ],
+                dtype=torch.float32,
+            )
+        ],
+        kv_lens=torch.tensor([3, 4], dtype=torch.long),
+        kv_cache_pooled=True,
+        kv_cache_capacity=4,
+        kv_cache_batch_capacity=8,
+        decode_attn_mask=None,
+        prefill_done=True,
+    )
+    fake_model = SimpleNamespace(
+        kv_cache_pool=pool,
+        t2s_transformer=SimpleNamespace(
+            decode_next_token=Mock(
+                return_value=(
+                    torch.ones((2, 1, 4), dtype=torch.float32),
+                    [torch.ones((2, 5, 3), dtype=torch.float32)],
+                    [torch.ones((2, 5, 3), dtype=torch.float32)],
+                )
+            )
+        ),
+        decode_next_token_prealloc_runtime=Mock(),
+        ar_predict_layer=Mock(return_value=torch.tensor([[0.1, 0.2], [0.3, 0.4]], dtype=torch.float32)),
+    )
+    runtime._sample_active_batch_requests = Mock(  # type: ignore[method-assign]
+        return_value=(
+            [],
+            [0, 1],
+            [torch.tensor([5, 9], dtype=torch.long), torch.tensor([6, 8], dtype=torch.long)],
+        )
+    )
+    runtime._build_next_xy_pos = Mock(return_value=torch.ones((2, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
+
+    updated_batch, finished_items = runtime._decode_active_batch_one_step(fake_model, active_batch, max_steps=8)
+
+    assert finished_items == []
+    assert updated_batch is active_batch
+    fake_model.decode_next_token_prealloc_runtime.assert_not_called()
+    fake_model.t2s_transformer.decode_next_token.assert_called_once()
+    decode_mask = fake_model.t2s_transformer.decode_next_token.call_args.args[3]
+    assert decode_mask.shape == (2, 1, 1, 5)
+    assert torch.equal(decode_mask[0, 0, 0], torch.tensor([True, False, False, False, False], dtype=torch.bool))
+    assert torch.equal(decode_mask[1, 0, 0], torch.tensor([False, False, False, False, False], dtype=torch.bool))
+    assert active_batch.kv_cache_pooled is False
+    assert active_batch.kv_cache_capacity == 0
+    assert active_batch.kv_cache_batch_capacity == 0
+    assert torch.equal(active_batch.kv_lens, torch.tensor([4, 5], dtype=torch.long))
+    pool.record_fallback.assert_called_once()
+
+
 def test_generate_semantic_tokens_uses_runtime_native_batch_scheduler(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     runtime._pipeline = SimpleNamespace(t2s_model=SimpleNamespace(model="fake-model"))
@@ -2432,6 +2983,172 @@ def test_generate_semantic_tokens_uses_runtime_native_batch_scheduler(tmp_path):
     runtime._run_continuous_batch_scheduler.assert_called_once_with("fake-model", [item.state for item in prepared_requests], max_steps=37)
     assert torch.equal(result["req-a"], torch.tensor([1, 2], dtype=torch.long))
     assert torch.equal(result["req-b"], torch.tensor([3], dtype=torch.long))
+
+
+def test_g2pw_pinyin_defaults_to_pypinyin_when_cuda_backend_fails(monkeypatch):
+    package_root = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "..",
+            "vllm_omni",
+            "model_executor",
+            "models",
+            "gpt_sovits",
+            "runtime_lib",
+            "GPT_SoVITS",
+        )
+    )
+    module_name = "text.g2pw.g2pw"
+    cuda_module_name = "text.g2pw.cuda_api"
+    onnx_module_name = "text.g2pw.onnx_api"
+
+    cuda_stub = ModuleType(cuda_module_name)
+
+    class BrokenCudaConverter:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("cuda backend unavailable")
+
+    cuda_stub.G2PWCudaConverter = BrokenCudaConverter
+
+    onnx_stub = ModuleType(onnx_module_name)
+
+    class ForbiddenOnnxConverter:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("onnx fallback should stay disabled by default")
+
+    onnx_stub.G2PWOnnxConverter = ForbiddenOnnxConverter
+
+    monkeypatch.setenv("GPTSOVITS_G2PW_BACKEND", "cuda")
+    monkeypatch.delenv("GPTSOVITS_G2PW_ONNX_FALLBACK", raising=False)
+    monkeypatch.syspath_prepend(package_root)
+    monkeypatch.setitem(sys.modules, cuda_module_name, cuda_stub)
+    monkeypatch.setitem(sys.modules, onnx_module_name, onnx_stub)
+
+    g2pw_module = importlib.import_module(module_name)
+    instance = g2pw_module.G2PWPinyin(model_dir="dummy", model_source="dummy")
+
+    assert instance._g2pw is None
+
+
+def test_attach_t2s_kv_cache_pool_honors_legacy_enable_env(monkeypatch):
+    from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.TTS_infer_pack.t2s_kv_cache_pool import (
+        attach_t2s_kv_cache_pool,
+    )
+
+    class DummyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+            self.num_layers = 1
+            self.model_dim = 1
+
+    model = DummyModel()
+    monkeypatch.delenv("GPTSOVITS_ENGINE_KV_POOL_ENABLE", raising=False)
+    monkeypatch.setenv("GPT_SOVITS_ENABLE_AR_KV_POOL", "0")
+
+    state = attach_t2s_kv_cache_pool(model, "cpu")
+
+    assert state.enabled is False
+    assert getattr(model, "kv_cache_pool", None) is None
+
+
+def test_chinese2_init_falls_back_when_g2pw_init_fails(monkeypatch):
+    package_root = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "..",
+            "vllm_omni",
+            "model_executor",
+            "models",
+            "gpt_sovits",
+            "runtime_lib",
+            "GPT_SoVITS",
+        )
+    )
+    fake_g2pw = ModuleType("text.g2pw")
+
+    class BrokenG2PWPinyin:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("g2pw init failed")
+
+    fake_g2pw.G2PWPinyin = BrokenG2PWPinyin
+    fake_g2pw.correct_pronunciation = lambda word, word_pinyins: word_pinyins
+
+    monkeypatch.syspath_prepend(package_root)
+    monkeypatch.setitem(sys.modules, "text.g2pw", fake_g2pw)
+    monkeypatch.delitem(sys.modules, "text.chinese2", raising=False)
+
+    chinese2 = importlib.import_module("text.chinese2")
+    g2pw_results, profile = chinese2._predict_g2pw_batch(["重庆银行的行长。"])
+
+    assert chinese2.is_g2pw is False
+    assert chinese2.g2pw is None
+    assert g2pw_results == []
+    assert profile["g2pw_predict_ms"] == 0.0
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not _has_g2pw_cuda_runtime_test_assets(),
+    reason="g2pw-cu runtime integration regression test requires CUDA plus local GPT-SoVITS/g2pw-cu assets",
+)
+def test_runtime_pipeline_keeps_g2pw_cuda_backend_in_fresh_subprocess():
+    script = f"""
+import json
+from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSRuntime
+
+runtime = GPTSoVITSRuntime(
+    project_root={str(_GPT_SOVITS_PROJECT_ROOT)!r},
+    config_path={str(_G2PW_CU_RUNTIME_CONFIG)!r},
+)
+runtime._ensure_pipeline()
+
+import text.chinese2 as chinese2
+
+results, profile = chinese2._predict_g2pw_batch(["重庆银行的行长。"])
+backend = getattr(getattr(chinese2, "g2pw", None), "_g2pw", None)
+print(
+    json.dumps(
+        {{
+            "backend_type": type(backend).__name__ if backend is not None else None,
+            "is_g2pw": bool(getattr(chinese2, "is_g2pw", False)),
+            "result_count": len(results),
+            "profile": profile,
+        }},
+        ensure_ascii=False,
+    )
+)
+"""
+    env = os.environ.copy()
+    env.pop("GPTSOVITS_PRELOAD_NATIVE_RUNTIME_DEPS", None)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    combined_output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+    assert completed.returncode == 0, combined_output
+    assert "fallback to pypinyin" not in combined_output
+    assert "invalid tensor header in manifest" not in combined_output
+
+    payload_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith("{")), None)
+    assert payload_line is not None, combined_output
+    payload = json.loads(payload_line)
+
+    assert payload["backend_type"] == "G2PWCudaConverter"
+    assert payload["is_g2pw"] is True
+    assert payload["result_count"] == 1
 
 
 def test_merge_active_batches_uses_runtime_native_merge_helpers(tmp_path):

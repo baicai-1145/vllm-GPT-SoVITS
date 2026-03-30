@@ -8,6 +8,18 @@ from typing import Any, List, Optional, Sequence, Tuple
 import torch
 
 
+def _env_truthy(raw: str | None, default: bool) -> bool:
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
 @dataclass
 class T2SKVCachePoolState:
     enabled: bool
@@ -224,13 +236,10 @@ class T2SKVCachePool:
 
 
 def attach_t2s_kv_cache_pool(model: Any, device: Any) -> T2SKVCachePoolState:
-    enabled = str(os.environ.get("GPTSOVITS_ENGINE_KV_POOL_ENABLE", "1")).strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-        "",
-    }
+    enabled_raw = os.environ.get("GPTSOVITS_ENGINE_KV_POOL_ENABLE")
+    if enabled_raw is None:
+        enabled_raw = os.environ.get("GPT_SOVITS_ENABLE_AR_KV_POOL")
+    enabled = _env_truthy(enabled_raw, True)
     if not enabled:
         state = T2SKVCachePoolState(
             enabled=False,
