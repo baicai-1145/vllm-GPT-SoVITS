@@ -57,6 +57,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         cached_prompt_token_ids: dict[str, list[int]] = {}
         cached_additional_information: dict[str, dict | None] = {}
+        cached_model_intermediate_buffer: dict[str, object | None] = {}
 
         # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -116,6 +117,7 @@ class OmniGenerationScheduler(VLLMScheduler):
             if request.num_cached_tokens < 0:
                 request.num_cached_tokens = num_computed_tokens
             cached_additional_information[request.request_id] = getattr(request, "additional_information", None)
+            cached_model_intermediate_buffer[request.request_id] = getattr(request, "model_intermediate_buffer", None)
             token_budget -= num_new_tokens
             scheduled_running_reqs.append(request)
             req_index += 1
@@ -244,6 +246,7 @@ class OmniGenerationScheduler(VLLMScheduler):
             num_output_tokens=cached_reqs_data.num_output_tokens,
             prompt_token_ids=cached_prompt_token_ids,
             additional_information=cached_additional_information,
+            model_intermediate_buffer=cached_model_intermediate_buffer,
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -304,6 +307,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
                     additional_information=(getattr(request, "additional_information", None) if request else None),
+                    model_intermediate_buffer=(getattr(request, "model_intermediate_buffer", None) if request else None),
                 )
                 new_list.append(omni_nr)
 

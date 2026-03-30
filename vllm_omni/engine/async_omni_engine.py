@@ -121,6 +121,7 @@ def _upgrade_to_omni_request(
     """Restore omni-only fields omitted by upstream InputProcessor."""
     prompt_embeds = request.prompt_embeds
     additional_information = None
+    model_intermediate_buffer = None
 
     if isinstance(raw_prompt, dict):
         if prompt_embeds is None:
@@ -131,8 +132,12 @@ def _upgrade_to_omni_request(
             raw_prompt.get("additional_information"),
             log_prefix="AsyncOmniEngine",
         )
+        model_intermediate_buffer = serialize_additional_information(
+            raw_prompt.get("model_intermediate_buffer"),
+            log_prefix="AsyncOmniEngine model_intermediate_buffer",
+        )
 
-    if prompt_embeds is None and additional_information is None:
+    if prompt_embeds is None and additional_information is None and model_intermediate_buffer is None:
         return request
 
     return OmniEngineCoreRequest(
@@ -154,6 +159,7 @@ def _upgrade_to_omni_request(
         external_req_id=request.external_req_id,
         reasoning_ended=request.reasoning_ended,
         additional_information=additional_information,
+        model_intermediate_buffer=model_intermediate_buffer,
     )
 
 

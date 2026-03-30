@@ -66,10 +66,14 @@ def build_engine_core_request_from_tokens(
 
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
 
-    # Serialize additional_information if present
+    # Serialize prompt metadata and stage-runtime buffer payloads if present.
     additional_info_payload = serialize_additional_information(
         prompt.get("additional_information"),
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
+    )
+    model_buffer_payload = serialize_additional_information(
+        prompt.get("model_intermediate_buffer"),
+        log_prefix=f"build_engine_core_request_from_tokens req={request_id} model_intermediate_buffer",
     )
 
     return OmniEngineCoreRequest(
@@ -84,6 +88,7 @@ def build_engine_core_request_from_tokens(
         data_parallel_rank=None,
         prompt_embeds=prompt_embeds,
         additional_information=additional_info_payload,
+        model_intermediate_buffer=model_buffer_payload,
     )
 
 

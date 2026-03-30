@@ -69,12 +69,16 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     torch.Tensor before constructing this request.
 
     Attributes:
-        additional_information: Optional serialized additional information
+        additional_information: Optional serialized prompt metadata
             dictionary containing tensors or lists to pass along with the request
+        model_intermediate_buffer: Optional serialized runtime buffer payload
+            used for stage-to-stage handoff of native omni intermediate state
     """
 
-    # Optional additional information dictionary (serialized)
+    # Optional prompt metadata dictionary (serialized)
     additional_information: AdditionalInformationPayload | None = None
+    # Optional stage-runtime intermediate buffer payload (serialized)
+    model_intermediate_buffer: AdditionalInformationPayload | None = None
 
 
 class OmniEngineCoreOutput(EngineCoreOutput):

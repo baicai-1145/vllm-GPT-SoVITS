@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -238,6 +239,26 @@ def test_gather_runtime_additional_information_returns_live_buffer_dict():
 
     runner.model_intermediate_buffer["r1"]["gpt_sovits_ar_session"] = "session"
     assert gathered[0]["gpt_sovits_ar_session"] == "session"
+
+
+def test_decode_request_runtime_info_prefers_model_intermediate_buffer():
+    payload = serialize_additional_information(
+        {
+            "gpt_sovits_request_id": "req-1",
+            "gpt_sovits_semantic_token_count": 4,
+        }
+    )
+    request_like = SimpleNamespace(
+        model_intermediate_buffer=payload,
+        additional_information=serialize_additional_information({"legacy": True}),
+    )
+
+    decoded = OmniGPUModelRunner._decode_request_runtime_info(request_like)
+
+    assert decoded == {
+        "gpt_sovits_request_id": "req-1",
+        "gpt_sovits_semantic_token_count": 4,
+    }
 
 
 def test_maybe_attach_mimo_audio_req_infos_enriches_dict():

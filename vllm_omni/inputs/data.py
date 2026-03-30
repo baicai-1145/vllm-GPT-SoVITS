@@ -35,6 +35,7 @@ class OmniTextPrompt(TextPrompt):
     prompt_embeds: NotRequired[torch.Tensor]
     negative_prompt_embeds: NotRequired[torch.Tensor]
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniTokensPrompt(TokensPrompt):
@@ -57,6 +58,7 @@ class OmniTokensPrompt(TokensPrompt):
     # New: optional additional information dictionary
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniTokenInputs(TokenInputs):
@@ -80,6 +82,7 @@ class OmniTokenInputs(TokenInputs):
     # New: optional additional information dictionary
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniEmbedsPrompt(EmbedsPrompt):
@@ -101,6 +104,7 @@ class OmniEmbedsPrompt(EmbedsPrompt):
     # New: optional additional information dictionary
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniCustomPrompt(TypedDict, total=False):

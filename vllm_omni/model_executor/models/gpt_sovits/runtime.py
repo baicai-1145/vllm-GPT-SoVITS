@@ -86,11 +86,191 @@ class GPTSoVITSResult:
     audio: np.ndarray
 
 
+def _clone_transport_tensor(value: Any, *, dtype: torch.dtype) -> torch.Tensor:
+    if value is None:
+        return torch.empty((0,), dtype=dtype)
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu").contiguous().to(dtype=dtype)
+    return torch.as_tensor(value, dtype=dtype).detach().to("cpu").contiguous()
+
+
+@dataclass(slots=True)
+class GPTSoVITSStageTransport:
+    request_id: str
+    semantic_tokens: torch.Tensor
+    phones: torch.Tensor
+    prompt_phones: torch.Tensor
+    prompt_semantic: torch.Tensor
+    refer_audio_spec: torch.Tensor
+    refer_audio_16k: torch.Tensor
+    raw_audio: torch.Tensor
+    raw_sr: int
+    speed_factor: float
+    sample_steps: int
+    super_sampling: bool
+
+    @property
+    def semantic_token_count(self) -> int:
+        return int(self.semantic_tokens.numel())
+
+    @classmethod
+    def empty(
+        cls,
+        *,
+        request_id: str = "",
+        speed_factor: float = 1.0,
+        sample_steps: int = 32,
+        super_sampling: bool = False,
+    ) -> "GPTSoVITSStageTransport":
+        return cls(
+            request_id=str(request_id),
+            semantic_tokens=torch.empty((0,), dtype=torch.long),
+            phones=torch.empty((0,), dtype=torch.long),
+            prompt_phones=torch.empty((0,), dtype=torch.long),
+            prompt_semantic=torch.empty((0,), dtype=torch.long),
+            refer_audio_spec=torch.empty((0,), dtype=torch.float32),
+            refer_audio_16k=torch.empty((0,), dtype=torch.float32),
+            raw_audio=torch.empty((0,), dtype=torch.float32),
+            raw_sr=0,
+            speed_factor=float(speed_factor),
+            sample_steps=int(sample_steps),
+            super_sampling=bool(super_sampling),
+        )
+
+    @classmethod
+    def from_state(cls, state: Any, request: dict[str, Any]) -> "GPTSoVITSStageTransport":
+        refer_spec = getattr(state, "refer_spec", None)
+        refer_audio_spec = refer_spec.spec_audio if refer_spec is not None else None
+        refer_audio_16k = refer_spec.audio_16k if refer_spec is not None else None
+        return cls(
+            request_id=str(getattr(state, "request_id", "")),
+            semantic_tokens=torch.empty((0,), dtype=torch.long),
+            phones=_clone_transport_tensor(getattr(state, "phones", None), dtype=torch.long),
+            prompt_phones=_clone_transport_tensor(getattr(state, "prompt_phones", None), dtype=torch.long),
+            prompt_semantic=_clone_transport_tensor(getattr(state, "prompt_semantic", None), dtype=torch.long),
+            refer_audio_spec=_clone_transport_tensor(refer_audio_spec, dtype=torch.float32),
+            refer_audio_16k=_clone_transport_tensor(refer_audio_16k, dtype=torch.float32),
+            raw_audio=_clone_transport_tensor(getattr(state, "raw_audio", None), dtype=torch.float32),
+            raw_sr=int(getattr(state, "raw_sr", 0)),
+            speed_factor=float(request.get("speed_factor", request.get("speed", 1.0) or 1.0)),
+            sample_steps=int(request.get("sample_steps", 32)),
+            super_sampling=bool(request.get("super_sampling", False)),
+        )
+
+    @classmethod
+    def from_info(
+        cls,
+        info: Any,
+        *,
+        semantic_tokens: torch.Tensor | None = None,
+    ) -> "GPTSoVITSStageTransport":
+        if isinstance(info, cls):
+            base = info
+        elif isinstance(info, dict):
+            transport = info.get("gpt_sovits_transport")
+            if isinstance(transport, cls):
+                base = transport
+            elif isinstance(transport, dict):
+                base = cls(
+                    request_id=str(transport.get("request_id", "")),
+                    semantic_tokens=_clone_transport_tensor(transport.get("semantic_tokens"), dtype=torch.long),
+                    phones=_clone_transport_tensor(transport.get("phones"), dtype=torch.long),
+                    prompt_phones=_clone_transport_tensor(transport.get("prompt_phones"), dtype=torch.long),
+                    prompt_semantic=_clone_transport_tensor(transport.get("prompt_semantic"), dtype=torch.long),
+                    refer_audio_spec=_clone_transport_tensor(transport.get("refer_audio_spec"), dtype=torch.float32),
+                    refer_audio_16k=_clone_transport_tensor(transport.get("refer_audio_16k"), dtype=torch.float32),
+                    raw_audio=_clone_transport_tensor(transport.get("raw_audio"), dtype=torch.float32),
+                    raw_sr=int(transport.get("raw_sr", 0) or 0),
+                    speed_factor=float(transport.get("speed_factor", 1.0)),
+                    sample_steps=int(transport.get("sample_steps", 32)),
+                    super_sampling=bool(transport.get("super_sampling", False)),
+                )
+            else:
+                request_id = str(
+                    info.get("gpt_sovits_request_id")
+                    or info.get("engine_request_id")
+                    or info.get("request_id")
+                    or ""
+                )
+                base = cls(
+                    request_id=request_id,
+                    semantic_tokens=_clone_transport_tensor(info.get("gpt_sovits_semantic_tokens"), dtype=torch.long),
+                    phones=_clone_transport_tensor(info.get("gpt_sovits_phones"), dtype=torch.long),
+                    prompt_phones=_clone_transport_tensor(info.get("gpt_sovits_prompt_phones"), dtype=torch.long),
+                    prompt_semantic=_clone_transport_tensor(info.get("gpt_sovits_prompt_semantic"), dtype=torch.long),
+                    refer_audio_spec=_clone_transport_tensor(info.get("gpt_sovits_refer_audio_spec"), dtype=torch.float32),
+                    refer_audio_16k=_clone_transport_tensor(info.get("gpt_sovits_refer_audio_16k"), dtype=torch.float32),
+                    raw_audio=_clone_transport_tensor(info.get("gpt_sovits_raw_audio"), dtype=torch.float32),
+                    raw_sr=int(info.get("gpt_sovits_raw_sr", 0) or 0),
+                    speed_factor=float(info.get("gpt_sovits_speed_factor", 1.0)),
+                    sample_steps=int(info.get("gpt_sovits_sample_steps", 32)),
+                    super_sampling=bool(info.get("gpt_sovits_super_sampling", False)),
+                )
+        else:
+            base = cls.empty()
+        if semantic_tokens is None:
+            return base
+        return base.with_semantic_tokens(semantic_tokens)
+
+    def with_semantic_tokens(self, semantic_tokens: torch.Tensor) -> "GPTSoVITSStageTransport":
+        return GPTSoVITSStageTransport(
+            request_id=self.request_id,
+            semantic_tokens=_clone_transport_tensor(semantic_tokens, dtype=torch.long),
+            phones=self.phones,
+            prompt_phones=self.prompt_phones,
+            prompt_semantic=self.prompt_semantic,
+            refer_audio_spec=self.refer_audio_spec,
+            refer_audio_16k=self.refer_audio_16k,
+            raw_audio=self.raw_audio,
+            raw_sr=int(self.raw_sr),
+            speed_factor=float(self.speed_factor),
+            sample_steps=int(self.sample_steps),
+            super_sampling=bool(self.super_sampling),
+        )
+
+    def has_decode_conditioning(self) -> bool:
+        required = (
+            self.semantic_tokens,
+            self.phones,
+            self.prompt_phones,
+            self.prompt_semantic,
+            self.refer_audio_spec,
+            self.raw_audio,
+        )
+        return all(isinstance(value, torch.Tensor) and value.numel() > 0 for value in required)
+
+    def to_transport_dict(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "semantic_tokens": self.semantic_tokens,
+            "phones": self.phones,
+            "prompt_phones": self.prompt_phones,
+            "prompt_semantic": self.prompt_semantic,
+            "refer_audio_spec": self.refer_audio_spec,
+            "refer_audio_16k": self.refer_audio_16k,
+            "raw_audio": self.raw_audio,
+            "raw_sr": int(self.raw_sr),
+            "speed_factor": float(self.speed_factor),
+            "sample_steps": int(self.sample_steps),
+            "super_sampling": bool(self.super_sampling),
+        }
+
+    def to_additional_information(self) -> dict[str, Any]:
+        return {
+            "gpt_sovits_transport": self.to_transport_dict(),
+            "gpt_sovits_request_id": self.request_id,
+            "gpt_sovits_semantic_token_count": self.semantic_token_count,
+        }
+
+    def to_model_intermediate_buffer(self) -> dict[str, Any]:
+        return self.to_additional_information()
+
+
 @dataclass(slots=True)
 class GPTSoVITSPreparedRequest:
     request_id: str
     state: Any
-    transport_info: dict[str, Any]
+    transport_info: GPTSoVITSStageTransport | dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -436,7 +616,7 @@ class GPTSoVITSDecodedAudio:
 class GPTSoVITSARSession:
     request_id: str
     active_batch: Any
-    transport_info: dict[str, Any]
+    transport_info: GPTSoVITSStageTransport | dict[str, Any]
     current_logits: torch.Tensor
 
 
@@ -1546,32 +1726,8 @@ class GPTSoVITSRuntime:
             ready_step=int(request.get("ready_step", 0)),
         )
 
-    @staticmethod
-    def _clone_tensor_to_cpu(value: torch.Tensor | None, *, dtype: torch.dtype | None = None) -> torch.Tensor:
-        if value is None:
-            return torch.empty((0,), dtype=dtype or torch.float32)
-        cloned = value.detach().to("cpu").contiguous()
-        if dtype is not None:
-            cloned = cloned.to(dtype=dtype)
-        return cloned
-
-    def _state_to_transport_info(self, state: Any, request: dict[str, Any]) -> dict[str, Any]:
-        refer_spec = getattr(state, "refer_spec", None)
-        refer_audio_spec = refer_spec.spec_audio if refer_spec is not None else None
-        refer_audio_16k = refer_spec.audio_16k if refer_spec is not None else None
-        return {
-            "gpt_sovits_request_id": str(state.request_id),
-            "gpt_sovits_phones": self._clone_tensor_to_cpu(getattr(state, "phones", None), dtype=torch.long),
-            "gpt_sovits_prompt_phones": self._clone_tensor_to_cpu(getattr(state, "prompt_phones", None), dtype=torch.long),
-            "gpt_sovits_prompt_semantic": self._clone_tensor_to_cpu(getattr(state, "prompt_semantic", None), dtype=torch.long),
-            "gpt_sovits_refer_audio_spec": self._clone_tensor_to_cpu(refer_audio_spec),
-            "gpt_sovits_refer_audio_16k": self._clone_tensor_to_cpu(refer_audio_16k),
-            "gpt_sovits_raw_audio": self._clone_tensor_to_cpu(getattr(state, "raw_audio", None)),
-            "gpt_sovits_raw_sr": int(getattr(state, "raw_sr", 0)),
-            "gpt_sovits_speed_factor": float(request.get("speed_factor", request.get("speed", 1.0) or 1.0)),
-            "gpt_sovits_sample_steps": int(request.get("sample_steps", 32)),
-            "gpt_sovits_super_sampling": bool(request.get("super_sampling", False)),
-        }
+    def _state_to_transport_info(self, state: Any, request: dict[str, Any]) -> GPTSoVITSStageTransport:
+        return GPTSoVITSStageTransport.from_state(state, request)
 
     @staticmethod
     def _estimate_scheduler_max_steps(states: list[Any]) -> int:
@@ -3875,68 +4031,37 @@ class GPTSoVITSRuntime:
             for item in finished_items
         }
 
-    @staticmethod
-    def _tensor_from_transport(
-        info: dict[str, Any],
-        key: str,
-        *,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        value = info.get(key)
-        if isinstance(value, torch.Tensor):
-            return value.detach().contiguous().to(dtype=dtype)
-        if value is None:
-            return torch.empty((0,), dtype=dtype)
-        return torch.as_tensor(value, dtype=dtype)
-
     def prepare_decode_request(
         self,
         semantic_tokens: torch.Tensor,
-        transport_info: dict[str, Any],
+        transport_info: GPTSoVITSStageTransport | dict[str, Any],
     ) -> GPTSoVITSDecodePreparedRequest:
         pipeline = self._ensure_pipeline()
         device = torch.device(getattr(pipeline.configs, "device", "cpu"))
-        request_id = str(
-            transport_info.get("gpt_sovits_request_id")
-            or transport_info.get("engine_request_id")
-            or transport_info.get("request_id")
-            or f"gpt_sovits_decode_{time.time_ns()}"
+        transport = GPTSoVITSStageTransport.from_info(
+            transport_info,
+            semantic_tokens=semantic_tokens,
         )
+        request_id = str(transport.request_id or f"gpt_sovits_decode_{time.time_ns()}")
         return GPTSoVITSDecodePreparedRequest(
             request_id=request_id,
-            semantic_tokens=semantic_tokens.detach().reshape(-1).to(device=device, dtype=torch.long),
-            phones=self._tensor_from_transport(transport_info, "gpt_sovits_phones", dtype=torch.long).to(device=device),
-            prompt_phones=self._tensor_from_transport(
-                transport_info,
-                "gpt_sovits_prompt_phones",
-                dtype=torch.long,
-            ).to(device=device),
-            prompt_semantic=self._tensor_from_transport(
-                transport_info,
-                "gpt_sovits_prompt_semantic",
-                dtype=torch.long,
-            ).to(device=device),
-            refer_audio_spec=self._tensor_from_transport(
-                transport_info,
-                "gpt_sovits_refer_audio_spec",
-                dtype=torch.float32,
-            ),
-            refer_audio_16k=self._tensor_from_transport(
-                transport_info,
-                "gpt_sovits_refer_audio_16k",
-                dtype=torch.float32,
-            ),
-            raw_audio=self._tensor_from_transport(transport_info, "gpt_sovits_raw_audio", dtype=torch.float32),
-            raw_sr=int(transport_info.get("gpt_sovits_raw_sr", 0)),
-            speed_factor=float(transport_info.get("gpt_sovits_speed_factor", 1.0)),
-            sample_steps=int(transport_info.get("gpt_sovits_sample_steps", 32)),
-            super_sampling=bool(transport_info.get("gpt_sovits_super_sampling", False)),
+            semantic_tokens=transport.semantic_tokens.to(device=device, dtype=torch.long),
+            phones=transport.phones.to(device=device, dtype=torch.long),
+            prompt_phones=transport.prompt_phones.to(device=device, dtype=torch.long),
+            prompt_semantic=transport.prompt_semantic.to(device=device, dtype=torch.long),
+            refer_audio_spec=transport.refer_audio_spec.to(dtype=torch.float32),
+            refer_audio_16k=transport.refer_audio_16k.to(dtype=torch.float32),
+            raw_audio=transport.raw_audio.to(dtype=torch.float32),
+            raw_sr=int(transport.raw_sr),
+            speed_factor=float(transport.speed_factor),
+            sample_steps=int(transport.sample_steps),
+            super_sampling=bool(transport.super_sampling),
         )
 
     def prepare_decode_requests(
         self,
         semantic_tokens_list: list[torch.Tensor],
-        transport_infos: list[dict[str, Any]],
+        transport_infos: list[GPTSoVITSStageTransport | dict[str, Any]],
     ) -> list[GPTSoVITSDecodePreparedRequest]:
         if len(semantic_tokens_list) != len(transport_infos):
             raise ValueError("GPT-SoVITS decode prepare batch input count mismatch")
@@ -4739,7 +4864,7 @@ class GPTSoVITSRuntime:
     def decode_semantic_tokens_from_transport(
         self,
         semantic_tokens: torch.Tensor,
-        transport_info: dict[str, Any],
+        transport_info: GPTSoVITSStageTransport | dict[str, Any],
     ) -> GPTSoVITSResult:
         prepared = self.prepare_decode_request(semantic_tokens, transport_info)
         if prepared.semantic_tokens.numel() == 0:

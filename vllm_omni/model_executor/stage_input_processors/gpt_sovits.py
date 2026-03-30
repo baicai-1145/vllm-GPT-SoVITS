@@ -7,6 +7,7 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSStageTransport
 from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
 
 logger = init_logger(__name__)
@@ -52,36 +53,26 @@ def t2s2decode(
         raw_sr = output.multimodal_output["gpt_sovits_raw_sr"]
         if isinstance(raw_sr, torch.Tensor):
             raw_sr = int(raw_sr.reshape(-1)[0].item()) if raw_sr.numel() > 0 else 0
-        additional_information = {
-            "gpt_sovits_request_id": request_id,
-            "gpt_sovits_semantic_tokens": semantic_tokens,
-            "gpt_sovits_phones": output.multimodal_output["gpt_sovits_phones"].to(torch.long).cpu().contiguous(),
-            "gpt_sovits_prompt_phones": output.multimodal_output["gpt_sovits_prompt_phones"].to(torch.long).cpu().contiguous(),
-            "gpt_sovits_prompt_semantic": output.multimodal_output["gpt_sovits_prompt_semantic"]
-            .to(torch.long)
-            .cpu()
-            .contiguous(),
-            "gpt_sovits_refer_audio_spec": output.multimodal_output["gpt_sovits_refer_audio_spec"]
-            .to(torch.float32)
-            .cpu()
-            .contiguous(),
-            "gpt_sovits_refer_audio_16k": output.multimodal_output["gpt_sovits_refer_audio_16k"]
-            .to(torch.float32)
-            .cpu()
-            .contiguous(),
-            "gpt_sovits_raw_audio": output.multimodal_output["gpt_sovits_raw_audio"].to(torch.float32).cpu().contiguous(),
-            "gpt_sovits_raw_sr": int(raw_sr),
-            "gpt_sovits_semantic_token_count": int(semantic_tokens.numel()),
-            "gpt_sovits_speed_factor": float(_as_scalar(prompt_info.get("speed_factor", prompt_info.get("speed")), 1.0)),
-            "gpt_sovits_sample_steps": int(_as_scalar(prompt_info.get("sample_steps"), 32)),
-            "gpt_sovits_super_sampling": bool(_as_scalar(prompt_info.get("super_sampling"), False)),
-        }
+        transport = GPTSoVITSStageTransport(
+            request_id=request_id,
+            semantic_tokens=semantic_tokens,
+            phones=output.multimodal_output["gpt_sovits_phones"].to(torch.long).cpu().contiguous(),
+            prompt_phones=output.multimodal_output["gpt_sovits_prompt_phones"].to(torch.long).cpu().contiguous(),
+            prompt_semantic=output.multimodal_output["gpt_sovits_prompt_semantic"].to(torch.long).cpu().contiguous(),
+            refer_audio_spec=output.multimodal_output["gpt_sovits_refer_audio_spec"].to(torch.float32).cpu().contiguous(),
+            refer_audio_16k=output.multimodal_output["gpt_sovits_refer_audio_16k"].to(torch.float32).cpu().contiguous(),
+            raw_audio=output.multimodal_output["gpt_sovits_raw_audio"].to(torch.float32).cpu().contiguous(),
+            raw_sr=int(raw_sr),
+            speed_factor=float(_as_scalar(prompt_info.get("speed_factor", prompt_info.get("speed")), 1.0)),
+            sample_steps=int(_as_scalar(prompt_info.get("sample_steps"), 32)),
+            super_sampling=bool(_as_scalar(prompt_info.get("super_sampling"), False)),
+        )
         decode_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0],
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
-                additional_information=additional_information,
+                model_intermediate_buffer=transport.to_model_intermediate_buffer(),
             )
         )
     return decode_inputs

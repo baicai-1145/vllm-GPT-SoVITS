@@ -24,6 +24,7 @@ class OmniNewRequestData(NewRequestData):
 
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | None = None
+    model_intermediate_buffer: AdditionalInformationPayload | None = None
 
     @classmethod
     def from_request(
@@ -55,6 +56,7 @@ class OmniNewRequestData(NewRequestData):
             prompt_embeds=getattr(request, "prompt_embeds", None),
             prefill_token_ids=prefill_token_ids,
             additional_information=getattr(request, "additional_information", None),
+            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
         )
 
 
@@ -68,6 +70,7 @@ class OmniCachedRequestData(CachedRequestData):
 
     prompt_token_ids: dict[str, list[int]]
     additional_information: dict[str, dict | None]
+    model_intermediate_buffer: dict[str, AdditionalInformationPayload | dict | None]
 
 
 @dataclass

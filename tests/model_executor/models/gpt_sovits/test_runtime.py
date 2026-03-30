@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.gpt_sovits.runtime import (
     GPTSoVITSPreparedRefAudioAsset,
     GPTSoVITSPreparedRefSpecPhase,
     GPTSoVITSPreparedTextPhase,
+    GPTSoVITSStageTransport,
     GPTSoVITSRuntime,
 )
 
@@ -261,19 +262,20 @@ def test_prepare_decode_request_moves_transport_to_pipeline_device(tmp_path):
 
     prepared = runtime.prepare_decode_request(
         torch.tensor([10, 11], dtype=torch.int32),
-        {
-            "gpt_sovits_request_id": "decode_req",
-            "gpt_sovits_phones": torch.tensor([1, 2], dtype=torch.int32),
-            "gpt_sovits_prompt_phones": torch.tensor([3], dtype=torch.int32),
-            "gpt_sovits_prompt_semantic": torch.tensor([4], dtype=torch.int32),
-            "gpt_sovits_refer_audio_spec": torch.tensor([0.1], dtype=torch.float16),
-            "gpt_sovits_refer_audio_16k": torch.tensor([0.2], dtype=torch.float16),
-            "gpt_sovits_raw_audio": torch.tensor([0.3], dtype=torch.float64),
-            "gpt_sovits_raw_sr": 16000,
-            "gpt_sovits_speed_factor": 1.25,
-            "gpt_sovits_sample_steps": 48,
-            "gpt_sovits_super_sampling": True,
-        },
+        GPTSoVITSStageTransport(
+            request_id="decode_req",
+            semantic_tokens=torch.tensor([], dtype=torch.long),
+            phones=torch.tensor([1, 2], dtype=torch.int32),
+            prompt_phones=torch.tensor([3], dtype=torch.int32),
+            prompt_semantic=torch.tensor([4], dtype=torch.int32),
+            refer_audio_spec=torch.tensor([0.1], dtype=torch.float16),
+            refer_audio_16k=torch.tensor([0.2], dtype=torch.float16),
+            raw_audio=torch.tensor([0.3], dtype=torch.float64),
+            raw_sr=16000,
+            speed_factor=1.25,
+            sample_steps=48,
+            super_sampling=True,
+        ),
     )
 
     assert prepared.request_id == "decode_req"

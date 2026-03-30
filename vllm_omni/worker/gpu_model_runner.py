@@ -361,19 +361,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 logger.error(f"Error decoding prompt embeds: {e}")
             # Decode additional_information payloads (dictionary)
             try:
-                if getattr(new_req_data, "additional_information", None) is not None:
-                    logger.warning_once(
-                        "additional_information on request data is deprecated, use model_intermediate_buffer"
+                info_dict = self._decode_request_runtime_info(new_req_data)
+                if info_dict:
+                    self.model_intermediate_buffer[req_id] = info_dict
+                    setattr(
+                        self.requests[req_id],
+                        "additional_information_cpu",
+                        info_dict,
                     )
-                    payload_info = new_req_data.additional_information
-                    info_dict = deserialize_additional_information(payload_info)
-                    if info_dict:
-                        self.model_intermediate_buffer[req_id] = info_dict
-                        setattr(
-                            self.requests[req_id],
-                            "additional_information_cpu",
-                            info_dict,
-                        )
             except Exception as e:
                 logger.error(f"Error decoding additional information: {e}")
 
@@ -925,15 +920,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             pe_cpu = self._resolve_prompt_embeds_cpu(getattr(nr, "prompt_embeds", None))
             if pe_cpu is not None:
                 setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
-            info_payload = getattr(nr, "additional_information", None)
-            if info_payload is not None:
-                logger.warning_once(
-                    "additional_information on request data is deprecated, use model_intermediate_buffer"
-                )
-            info_dict = deserialize_additional_information(info_payload)
+            info_dict = self._decode_request_runtime_info(nr)
             if info_dict:
                 self.model_intermediate_buffer[req_id] = info_dict
                 setattr(self.requests[req_id], "additional_information_cpu", info_dict)
+
+    @staticmethod
+    def _decode_request_runtime_info(request_like: object) -> dict:
+        payload = getattr(request_like, "model_intermediate_buffer", None)
+        info_dict = deserialize_additional_information(payload)
+        if info_dict:
+            return info_dict
+        payload = getattr(request_like, "additional_information", None)
+        return deserialize_additional_information(payload)
 
     def _gather_runtime_additional_information(self) -> list[dict]:
         """Gather per-request model_intermediate_buffer in batch order."""
@@ -1039,21 +1038,24 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
         for new_req in scheduler_output.scheduled_new_reqs:
-            payload_info = getattr(new_req, "additional_information", None)
-            if isinstance(payload_info, dict):
-                logger.warning_once(
-                    "additional_information on request data is deprecated, use model_intermediate_buffer"
+            payload_info = deserialize_additional_information(
+                getattr(new_req, "model_intermediate_buffer", None)
+            )
+            if not payload_info:
+                payload_info = deserialize_additional_information(
+                    getattr(new_req, "additional_information", None)
                 )
+            if isinstance(payload_info, dict) and payload_info:
                 self._update_intermediate_buffer(new_req.req_id, payload_info)
 
-        if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
-            logger.warning_once(
-                "additional_information on scheduled_cached_reqs is deprecated, use model_intermediate_buffer"
-            )
+        cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "model_intermediate_buffer", None)
+        if not isinstance(cached_infos, dict):
             cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
-            if isinstance(cached_infos, dict):
-                for req_id, req_infos in cached_infos.items():
-                    self._update_intermediate_buffer(req_id, req_infos)
+        if isinstance(cached_infos, dict):
+            for req_id, req_infos in cached_infos.items():
+                decoded = deserialize_additional_information(req_infos)
+                if isinstance(decoded, dict) and decoded:
+                    self._update_intermediate_buffer(req_id, decoded)
 
     def _maybe_attach_mimo_audio_req_infos(
         self,
@@ -1239,7 +1241,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     decode_req_ids.append(req_id)
 
                 # TODO(Peiqi): the merge stage could move out from the critical path
-                self._merge_additional_information_update(req_id, update_dict)
+                self._update_intermediate_buffer(req_id, update_dict)
 
                 # update the inputs_embeds and input_ids
                 seg_len = min(span_len, req_embeds.shape[0])
@@ -1297,7 +1299,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             start_offset = int(self.query_start_loc.cpu[req_index])
             inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
             update_dict = {out_key: code_predictor_codes[idx : idx + 1]}
-            self._merge_additional_information_update(req_id, update_dict)
+            self._update_intermediate_buffer(req_id, update_dict)
 
     def _model_forward(
         self,
@@ -1351,5 +1353,4 @@ class OmniGPUModelRunner(GPUModelRunner):
         setattr(req_state, "additional_information_cpu", existing)
 
     def _merge_additional_information_update(self, req_id, upd):
-        logger.warning_once("_merge_additional_information_update is deprecated, use _update_intermediate_buffer")
         return self._update_intermediate_buffer(req_id, upd)

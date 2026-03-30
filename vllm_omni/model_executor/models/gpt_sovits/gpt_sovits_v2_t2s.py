@@ -8,18 +8,13 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from vllm_omni.model_executor.models.gpt_sovits.runtime import get_gpt_sovits_runtime
+from vllm_omni.model_executor.models.gpt_sovits.runtime import (
+    GPTSoVITSStageTransport,
+    get_gpt_sovits_runtime,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
-
-
-def _empty_float_tensor() -> torch.Tensor:
-    return torch.zeros((0,), dtype=torch.float32)
-
-
-def _empty_long_tensor() -> torch.Tensor:
-    return torch.zeros((0,), dtype=torch.long)
 
 
 class GPTSoVITSV2T2S(nn.Module):
@@ -87,35 +82,15 @@ class GPTSoVITSV2T2S(nn.Module):
         logits[0, self._get_semantic_eos_id()] = 0.0
         return logits
 
-    def _transport_payload_from_info(self, info_dict: dict[str, Any]) -> dict[str, torch.Tensor]:
-        empty_long = _empty_long_tensor()
-        empty_float = _empty_float_tensor()
-        return {
-            "semantic_tokens": empty_long,
-            "gpt_sovits_phones": info_dict.get("gpt_sovits_phones", empty_long),
-            "gpt_sovits_prompt_phones": info_dict.get("gpt_sovits_prompt_phones", empty_long),
-            "gpt_sovits_prompt_semantic": info_dict.get("gpt_sovits_prompt_semantic", empty_long),
-            "gpt_sovits_refer_audio_spec": info_dict.get("gpt_sovits_refer_audio_spec", empty_float),
-            "gpt_sovits_refer_audio_16k": info_dict.get("gpt_sovits_refer_audio_16k", empty_float),
-            "gpt_sovits_raw_audio": info_dict.get("gpt_sovits_raw_audio", empty_float),
-            "gpt_sovits_raw_sr": torch.tensor(int(info_dict.get("gpt_sovits_raw_sr", 0)), dtype=torch.int32),
-        }
+    def _transport_payload_from_info(self, info_dict: dict[str, Any]) -> GPTSoVITSStageTransport:
+        return GPTSoVITSStageTransport.from_info(info_dict)
 
-    def _transport_payload_from_session(self, info_dict: dict[str, Any]) -> dict[str, torch.Tensor]:
+    def _transport_payload_from_session(self, info_dict: dict[str, Any]) -> GPTSoVITSStageTransport:
         session = info_dict.get(self._SESSION_KEY)
         if session is None:
             return self._transport_payload_from_info(info_dict)
-        transport = session.transport_info
-        return {
-            "semantic_tokens": self.runtime.get_ar_session_semantic_tokens(session),
-            "gpt_sovits_phones": transport["gpt_sovits_phones"].to(dtype=torch.long),
-            "gpt_sovits_prompt_phones": transport["gpt_sovits_prompt_phones"].to(dtype=torch.long),
-            "gpt_sovits_prompt_semantic": transport["gpt_sovits_prompt_semantic"].to(dtype=torch.long),
-            "gpt_sovits_refer_audio_spec": transport["gpt_sovits_refer_audio_spec"].to(dtype=torch.float32),
-            "gpt_sovits_refer_audio_16k": transport["gpt_sovits_refer_audio_16k"].to(dtype=torch.float32),
-            "gpt_sovits_raw_audio": transport["gpt_sovits_raw_audio"].to(dtype=torch.float32),
-            "gpt_sovits_raw_sr": torch.tensor(int(transport["gpt_sovits_raw_sr"]), dtype=torch.int32),
-        }
+        transport = GPTSoVITSStageTransport.from_info(session.transport_info)
+        return transport.with_semantic_tokens(self.runtime.get_ar_session_semantic_tokens(session))
 
     def compute_logits(
         self,
@@ -128,23 +103,29 @@ class GPTSoVITSV2T2S(nn.Module):
             return self._skip_logits(device)
         return self._pending_logits
 
-    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, Any]]:
-        empty_long = _empty_long_tensor()
-        empty_float = _empty_float_tensor()
+    @staticmethod
+    def _request_infos_from_buffers(
+        model_intermediate_buffer: list[dict[str, Any]] | None,
+        runtime_additional_information: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        if model_intermediate_buffer is not None:
+            return model_intermediate_buffer
+        if runtime_additional_information is not None:
+            logger.warning_once("GPT-SoVITS v2 AR received legacy runtime_additional_information")
+            return runtime_additional_information
+        return [{"skip_synthesis": True}]
+
+    def get_dummy_model_intermediate_buffer(self, num_reqs: int) -> list[dict[str, Any]]:
         return [
             {
                 "skip_synthesis": True,
-                "gpt_sovits_phones": empty_long,
-                "gpt_sovits_prompt_phones": empty_long,
-                "gpt_sovits_prompt_semantic": empty_long,
-                "gpt_sovits_refer_audio_spec": empty_float,
-                "gpt_sovits_refer_audio_16k": empty_float,
-                "gpt_sovits_raw_audio": empty_float,
-                "gpt_sovits_raw_sr": 0,
-                "gpt_sovits_semantic_token_count": 0,
+                **GPTSoVITSStageTransport.empty().to_model_intermediate_buffer(),
             }
             for _ in range(max(1, num_reqs))
         ]
+
+    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, Any]]:
+        return self.get_dummy_model_intermediate_buffer(num_reqs)
 
     def preprocess(
         self,
@@ -190,7 +171,10 @@ class GPTSoVITSV2T2S(nn.Module):
     ) -> OmniOutput:
         del positions, intermediate_tensors, inputs_embeds, kwargs
 
-        request_infos = model_intermediate_buffer or runtime_additional_information or [{"skip_synthesis": True}]
+        request_infos = self._request_infos_from_buffers(
+            model_intermediate_buffer,
+            runtime_additional_information,
+        )
         num_reqs = len(request_infos)
 
         logits_rows: list[torch.Tensor] = []
@@ -213,14 +197,14 @@ class GPTSoVITSV2T2S(nn.Module):
                 logits_rows.append(self.runtime.get_ar_session_logits(session))
                 payload = self._transport_payload_from_session(info)
 
-            semantic_tokens.append(payload["semantic_tokens"].to(dtype=torch.long))
-            phones.append(payload["gpt_sovits_phones"].to(dtype=torch.long))
-            prompt_phones.append(payload["gpt_sovits_prompt_phones"].to(dtype=torch.long))
-            prompt_semantic.append(payload["gpt_sovits_prompt_semantic"].to(dtype=torch.long))
-            refer_audio_spec.append(payload["gpt_sovits_refer_audio_spec"].to(dtype=torch.float32))
-            refer_audio_16k.append(payload["gpt_sovits_refer_audio_16k"].to(dtype=torch.float32))
-            raw_audio.append(payload["gpt_sovits_raw_audio"].to(dtype=torch.float32))
-            raw_sr.append(payload["gpt_sovits_raw_sr"])
+            semantic_tokens.append(payload.semantic_tokens.to(dtype=torch.long))
+            phones.append(payload.phones.to(dtype=torch.long))
+            prompt_phones.append(payload.prompt_phones.to(dtype=torch.long))
+            prompt_semantic.append(payload.prompt_semantic.to(dtype=torch.long))
+            refer_audio_spec.append(payload.refer_audio_spec.to(dtype=torch.float32))
+            refer_audio_16k.append(payload.refer_audio_16k.to(dtype=torch.float32))
+            raw_audio.append(payload.raw_audio.to(dtype=torch.float32))
+            raw_sr.append(torch.tensor(int(payload.raw_sr), dtype=torch.int32))
 
             if session is None and not info.get("skip_synthesis"):
                 logger.warning("GPT-SoVITS v2 AR request %s has no active session", self._request_id_from_info(info, index))

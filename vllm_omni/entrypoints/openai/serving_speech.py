@@ -769,7 +769,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request.text_lang = text_lang or "auto"
         request.prompt_lang = prompt_lang or request.text_lang
         if request.text_split_method is None:
-            request.text_split_method = "cut4" if request.text_lang == "en" else "cut5"
+            request.text_split_method = "cut1"
         if request.parallel_infer is None:
             request.parallel_infer = True
         if request.batch_size is None:
@@ -1151,7 +1151,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "ref_audio_path": ref_audio_path,
             "prompt_text": request.ref_text,
             "prompt_lang": request.prompt_lang or request.text_lang or "auto",
-            "text_split_method": request.text_split_method or ("cut4" if request.text_lang == "en" else "cut5"),
+            "text_split_method": request.text_split_method or "cut1",
             "batch_size": request.batch_size if request.batch_size is not None else 4,
             "batch_threshold": request.batch_threshold if request.batch_threshold is not None else 0.75,
             "split_bucket": True if request.split_bucket is None else request.split_bucket,

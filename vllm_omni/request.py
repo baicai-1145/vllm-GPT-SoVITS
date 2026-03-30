@@ -23,6 +23,8 @@ class OmniRequest(Request):
             Used for direct transfer of embeddings between stages.
         additional_information: Optional additional information payload
             containing tensors or lists to be passed along with the request.
+        model_intermediate_buffer: Optional serialized runtime buffer
+            payload used for native stage-to-stage handoff.
     """
 
     def __init__(
@@ -31,6 +33,7 @@ class OmniRequest(Request):
         # Optional external request ID for tracking
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
+        model_intermediate_buffer: AdditionalInformationPayload | None = None,
         *args,
         **kwargs,
     ):
@@ -44,6 +47,8 @@ class OmniRequest(Request):
         self.external_req_id: str | None = external_req_id
         # Serialized additional information payload (optional)
         self.additional_information: AdditionalInformationPayload | None = additional_information
+        # Serialized runtime buffer payload (optional)
+        self.model_intermediate_buffer: AdditionalInformationPayload | None = model_intermediate_buffer
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -89,6 +94,7 @@ class OmniRequest(Request):
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             additional_information=request.additional_information,
+            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
         )

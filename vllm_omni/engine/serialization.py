@@ -15,6 +15,10 @@ from vllm_omni.engine import (
 
 logger = init_logger(__name__)
 
+_TENSOR_MARKER = "__additional_information_tensor__"
+_NDARRAY_MARKER = "__additional_information_ndarray__"
+_TUPLE_MARKER = "__additional_information_tuple__"
+
 
 def dtype_to_name(dtype: torch.dtype) -> str:
     """Convert torch dtype to a stable string name for serialization."""
@@ -37,6 +41,63 @@ def dtype_to_name(dtype: torch.dtype) -> str:
         torch.bool: "bool",
     }
     return mapping.get(dtype, str(dtype).replace("torch.", ""))
+
+
+def _encode_nested_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        value_cpu = value.detach().to("cpu").contiguous()
+        return {
+            _TENSOR_MARKER: True,
+            "dtype": dtype_to_name(value_cpu.dtype),
+            "shape": list(value_cpu.shape),
+            "data": value_cpu.numpy().tobytes(),
+        }
+
+    if isinstance(value, np.ndarray):
+        value_cpu = np.ascontiguousarray(value)
+        return {
+            _NDARRAY_MARKER: True,
+            "dtype": value_cpu.dtype.str,
+            "shape": list(value_cpu.shape),
+            "data": value_cpu.tobytes(),
+        }
+
+    if isinstance(value, dict):
+        return {str(key): _encode_nested_value(item) for key, item in value.items()}
+
+    if isinstance(value, list):
+        return [_encode_nested_value(item) for item in value]
+
+    if isinstance(value, tuple):
+        return {
+            _TUPLE_MARKER: [_encode_nested_value(item) for item in value],
+        }
+
+    return value
+
+
+def _decode_nested_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        if value.get(_TENSOR_MARKER):
+            dt = np.dtype(value.get("dtype", "float32"))
+            arr = np.frombuffer(value["data"], dtype=dt).reshape(value.get("shape", ()))
+            return torch.from_numpy(arr.copy())
+
+        if value.get(_NDARRAY_MARKER):
+            dt = np.dtype(value.get("dtype", "<f4"))
+            return np.frombuffer(value["data"], dtype=dt).reshape(value.get("shape", ())).copy()
+
+        if _TUPLE_MARKER in value:
+            items = value[_TUPLE_MARKER]
+            if isinstance(items, list):
+                return tuple(_decode_nested_value(item) for item in items)
+
+        return {key: _decode_nested_value(item) for key, item in value.items()}
+
+    if isinstance(value, list):
+        return [_decode_nested_value(item) for item in value]
+
+    return value
 
 
 def serialize_additional_information(
@@ -62,10 +123,14 @@ def serialize_additional_information(
             continue
 
         if isinstance(value, list):
-            entries[key] = AdditionalInformationEntry(list_data=value)
+            entries[key] = AdditionalInformationEntry(
+                list_data=_encode_nested_value(value),
+            )
             continue
 
-        entries[key] = AdditionalInformationEntry(scalar_data=value)
+        entries[key] = AdditionalInformationEntry(
+            scalar_data=_encode_nested_value(value),
+        )
 
     return AdditionalInformationPayload(entries=entries) if entries else None
 
@@ -101,9 +166,9 @@ def deserialize_additional_information(
                 arr = arr.reshape(getattr(entry, "tensor_shape", ()))
                 info[k] = torch.from_numpy(arr.copy())
             elif getattr(entry, "list_data", None) is not None:
-                info[k] = entry.list_data
+                info[k] = _decode_nested_value(entry.list_data)
             elif getattr(entry, "scalar_data", None) is not None:
-                info[k] = entry.scalar_data
+                info[k] = _decode_nested_value(entry.scalar_data)
             else:
                 info[k] = None
         return info

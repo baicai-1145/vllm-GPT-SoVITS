@@ -9,7 +9,10 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
-from vllm_omni.model_executor.models.gpt_sovits.runtime import get_gpt_sovits_runtime
+from vllm_omni.model_executor.models.gpt_sovits.runtime import (
+    GPTSoVITSStageTransport,
+    get_gpt_sovits_runtime,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -57,6 +60,9 @@ class GPTSoVITSV2Decode(nn.Module):
 
     @staticmethod
     def _semantic_tokens_from_info(info: dict[str, Any]) -> torch.Tensor:
+        transport = GPTSoVITSStageTransport.from_info(info)
+        if transport.semantic_tokens.numel() > 0:
+            return transport.semantic_tokens.detach().reshape(-1).to(dtype=torch.long).cpu().contiguous()
         value = info.get("gpt_sovits_semantic_tokens")
         if isinstance(value, torch.Tensor):
             return value.detach().reshape(-1).to(dtype=torch.long).cpu().contiguous()
@@ -64,28 +70,36 @@ class GPTSoVITSV2Decode(nn.Module):
             return torch.zeros((0,), dtype=torch.long)
         return torch.as_tensor(value, dtype=torch.long).reshape(-1).cpu().contiguous()
 
-    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, Any]]:
-        empty_long = torch.zeros((0,), dtype=torch.long)
-        empty_float = torch.zeros((0,), dtype=torch.float32)
+    @staticmethod
+    def _request_infos_from_buffers(
+        model_intermediate_buffer: list[dict[str, Any]] | None,
+        runtime_additional_information: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        if model_intermediate_buffer is not None:
+            return model_intermediate_buffer
+        if runtime_additional_information is not None:
+            logger.warning_once("GPT-SoVITS v2 decode received legacy runtime_additional_information")
+            return runtime_additional_information
+        return []
+
+    def get_dummy_model_intermediate_buffer(self, num_reqs: int) -> list[dict[str, Any]]:
         return [
             {
-                "gpt_sovits_request_id": "",
-                "gpt_sovits_semantic_tokens": empty_long,
-                "gpt_sovits_phones": empty_long,
-                "gpt_sovits_prompt_phones": empty_long,
-                "gpt_sovits_prompt_semantic": empty_long,
-                "gpt_sovits_refer_audio_spec": empty_float,
-                "gpt_sovits_refer_audio_16k": empty_float,
-                "gpt_sovits_raw_audio": empty_float,
-                "gpt_sovits_raw_sr": 0,
-                "gpt_sovits_semantic_token_count": 0,
+                "skip_synthesis": True,
+                **GPTSoVITSStageTransport.empty().to_model_intermediate_buffer(),
             }
             for _ in range(max(1, num_reqs))
         ]
 
+    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, Any]]:
+        return self.get_dummy_model_intermediate_buffer(num_reqs)
+
     @staticmethod
     def _has_decode_conditioning(info: dict[str, Any]) -> bool:
         if info.get(GPTSoVITSV2Decode._PREPARED_KEY) is not None:
+            return True
+        transport = GPTSoVITSStageTransport.from_info(info)
+        if transport.has_decode_conditioning():
             return True
         required_keys = (
             "gpt_sovits_semantic_tokens",
@@ -93,7 +107,6 @@ class GPTSoVITSV2Decode(nn.Module):
             "gpt_sovits_prompt_phones",
             "gpt_sovits_prompt_semantic",
             "gpt_sovits_refer_audio_spec",
-            "gpt_sovits_refer_audio_16k",
             "gpt_sovits_raw_audio",
         )
         for key in required_keys:
@@ -133,10 +146,13 @@ class GPTSoVITSV2Decode(nn.Module):
         if total == 0:
             return [ids]
         if runtime_additional_information and all(
-            isinstance(info.get("gpt_sovits_semantic_token_count"), int) and int(info["gpt_sovits_semantic_token_count"]) > 0
+            int(GPTSoVITSStageTransport.from_info(info).semantic_token_count or info.get("gpt_sovits_semantic_token_count", 0)) > 0
             for info in runtime_additional_information
         ):
-            sizes = [int(info["gpt_sovits_semantic_token_count"]) for info in runtime_additional_information]
+            sizes = [
+                int(GPTSoVITSStageTransport.from_info(info).semantic_token_count or info.get("gpt_sovits_semantic_token_count", 0))
+                for info in runtime_additional_information
+            ]
             if sum(sizes) == total:
                 parts: list[torch.Tensor] = []
                 offset = 0
@@ -173,7 +189,10 @@ class GPTSoVITSV2Decode(nn.Module):
         empty = torch.zeros((0,), dtype=torch.float32)
         default_sr = torch.tensor(32000, dtype=torch.int32)
 
-        request_infos = model_intermediate_buffer or runtime_additional_information or []
+        request_infos = self._request_infos_from_buffers(
+            model_intermediate_buffer,
+            runtime_additional_information,
+        )
         if not request_infos and (input_ids is None or input_ids.numel() == 0):
             return OmniOutput(
                 text_hidden_states=None,
@@ -199,6 +218,8 @@ class GPTSoVITSV2Decode(nn.Module):
 
         for index, semantic_ids in enumerate(request_ids_list):
             info = request_infos[index] if index < len(request_infos) else {}
+            if info.get("skip_synthesis"):
+                continue
             if not self._has_decode_conditioning(info):
                 logger.warning(
                     "GPT-SoVITS decode request %s is missing conditioning; semantic_tokens=%d keys=%s",
@@ -239,7 +260,7 @@ class GPTSoVITSV2Decode(nn.Module):
             for index, result in zip(runnable_indices, finalized_items):
                 audio_outputs[index] = torch.from_numpy(result.audio).to(dtype=torch.float32)
                 sample_rates[index] = torch.tensor(int(result.sample_rate), dtype=torch.int32)
-        else:
+        elif any(not info.get("skip_synthesis") for info in request_infos):
             logger.warning("GPT-SoVITS decode had no runnable prepared requests")
 
         return OmniOutput(

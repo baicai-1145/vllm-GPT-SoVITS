@@ -708,11 +708,37 @@ class TestTTSMethods:
         )
         assert speech_server._validate_tts_request(req) is None
 
+    def test_validate_gpt_sovits_request_defaults_to_cut1(self, speech_server):
+        req = OpenAICreateSpeechRequest(
+            input="你好",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="你好",
+        )
+
+        assert speech_server._validate_gpt_sovits_request(req) is None
+        assert req.text_lang == "auto"
+        assert req.prompt_lang == "auto"
+        assert req.text_split_method == "cut1"
+
     def test_validate_tts_request_customvoice_no_speakers(self, speech_server):
         """CustomVoice on a model with no speakers returns 400 instead of crashing engine."""
         req = OpenAICreateSpeechRequest(input="Hello", task_type="CustomVoice")
         result = speech_server._validate_tts_request(req)
         assert "does not support CustomVoice" in result
+
+    @pytest.mark.asyncio
+    async def test_build_gpt_sovits_prompt_uses_cut1_default(self, speech_server):
+        speech_server._resolve_gpt_sovits_ref_audio_path = AsyncMock(return_value="/tmp/ref.wav")
+        req = OpenAICreateSpeechRequest(
+            input="你好",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="你好",
+        )
+
+        prompt = await speech_server._build_gpt_sovits_prompt(req)
+
+        assert prompt["additional_information"]["text_split_method"] == "cut1"
+        assert prompt["additional_information"]["ref_audio_path"] == "/tmp/ref.wav"
 
     # ── speaker_embedding validation ──
 

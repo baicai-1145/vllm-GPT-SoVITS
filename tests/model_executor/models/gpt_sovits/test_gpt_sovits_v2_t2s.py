@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.gpt_sovits.gpt_sovits_v2_t2s import GPTSoVITSV2T2S
+from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSStageTransport
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -24,15 +25,20 @@ def _minimal_model() -> GPTSoVITSV2T2S:
 
 def _session() -> SimpleNamespace:
     return SimpleNamespace(
-        transport_info={
-            "gpt_sovits_phones": torch.tensor([1, 2], dtype=torch.int16),
-            "gpt_sovits_prompt_phones": torch.tensor([3], dtype=torch.int32),
-            "gpt_sovits_prompt_semantic": torch.tensor([4, 5], dtype=torch.int64),
-            "gpt_sovits_refer_audio_spec": torch.randn(3, dtype=torch.float16),
-            "gpt_sovits_refer_audio_16k": torch.randn(4, dtype=torch.float16),
-            "gpt_sovits_raw_audio": torch.randn(8, dtype=torch.float64),
-            "gpt_sovits_raw_sr": 32000,
-        }
+        transport_info=GPTSoVITSStageTransport(
+            request_id="req-1",
+            semantic_tokens=torch.zeros((0,), dtype=torch.long),
+            phones=torch.tensor([1, 2], dtype=torch.int16),
+            prompt_phones=torch.tensor([3], dtype=torch.int32),
+            prompt_semantic=torch.tensor([4, 5], dtype=torch.int64),
+            refer_audio_spec=torch.randn(3, dtype=torch.float16),
+            refer_audio_16k=torch.randn(4, dtype=torch.float16),
+            raw_audio=torch.randn(8, dtype=torch.float64),
+            raw_sr=32000,
+            speed_factor=1.0,
+            sample_steps=32,
+            super_sampling=False,
+        ),
     )
 
 

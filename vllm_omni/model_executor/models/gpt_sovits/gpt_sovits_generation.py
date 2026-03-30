@@ -44,8 +44,23 @@ class GPTSoVITSGeneration(nn.Module):
         del hidden_states, sampling_metadata
         return None
 
-    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, Any]]:
+    @staticmethod
+    def _request_infos_from_buffers(
+        model_intermediate_buffer: list[dict[str, Any]] | None,
+        runtime_additional_information: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        if model_intermediate_buffer is not None:
+            return model_intermediate_buffer
+        if runtime_additional_information is not None:
+            logger.warning_once("GPT-SoVITS generation received legacy runtime_additional_information")
+            return runtime_additional_information
+        return [{"skip_synthesis": True}]
+
+    def get_dummy_model_intermediate_buffer(self, num_reqs: int) -> list[dict[str, Any]]:
         return [{"skip_synthesis": True} for _ in range(max(1, num_reqs))]
+
+    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, Any]]:
+        return self.get_dummy_model_intermediate_buffer(num_reqs)
 
     @torch.inference_mode()
     def forward(
@@ -54,12 +69,16 @@ class GPTSoVITSGeneration(nn.Module):
         positions: torch.Tensor | None = None,
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
+        model_intermediate_buffer: list[dict[str, Any]] | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         del input_ids, positions, intermediate_tensors, inputs_embeds, kwargs
 
-        request_infos = runtime_additional_information or [{"skip_synthesis": True}]
+        request_infos = self._request_infos_from_buffers(
+            model_intermediate_buffer,
+            runtime_additional_information,
+        )
         audio_outputs: list[torch.Tensor] = []
         sample_rates: list[torch.Tensor] = []
 

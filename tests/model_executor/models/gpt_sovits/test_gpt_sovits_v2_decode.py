@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.gpt_sovits.gpt_sovits_v2_decode import GPTSoVITSV2Decode
+from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSStageTransport
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -21,17 +22,21 @@ def _minimal_model() -> GPTSoVITSV2Decode:
 
 
 def _conditioning_info(*, semantic_count: int) -> dict[str, object]:
-    return {
-        "gpt_sovits_semantic_tokens": torch.arange(semantic_count, dtype=torch.long) + 100,
-        "gpt_sovits_phones": torch.tensor([1, 2], dtype=torch.long),
-        "gpt_sovits_prompt_phones": torch.tensor([3], dtype=torch.long),
-        "gpt_sovits_prompt_semantic": torch.tensor([4], dtype=torch.long),
-        "gpt_sovits_refer_audio_spec": torch.randn(2, dtype=torch.float32),
-        "gpt_sovits_refer_audio_16k": torch.randn(2, dtype=torch.float32),
-        "gpt_sovits_raw_audio": torch.randn(4, dtype=torch.float32),
-        "gpt_sovits_raw_sr": 32000,
-        "gpt_sovits_semantic_token_count": semantic_count,
-    }
+    transport = GPTSoVITSStageTransport(
+        request_id="req",
+        semantic_tokens=torch.arange(semantic_count, dtype=torch.long) + 100,
+        phones=torch.tensor([1, 2], dtype=torch.long),
+        prompt_phones=torch.tensor([3], dtype=torch.long),
+        prompt_semantic=torch.tensor([4], dtype=torch.long),
+        refer_audio_spec=torch.randn(2, dtype=torch.float32),
+        refer_audio_16k=torch.randn(2, dtype=torch.float32),
+        raw_audio=torch.randn(4, dtype=torch.float32),
+        raw_sr=32000,
+        speed_factor=1.0,
+        sample_steps=32,
+        super_sampling=False,
+    )
+    return transport.to_additional_information()
 
 
 def test_split_request_ids_prefers_runtime_semantic_token_counts():
@@ -68,10 +73,17 @@ def test_forward_decodes_each_request_using_runtime_split_contract():
     result = model.forward(
         input_ids=torch.tensor([0, 0], dtype=torch.long),
         runtime_additional_information=[
-            {**_conditioning_info(semantic_count=2), "gpt_sovits_semantic_tokens": torch.tensor([10, 11], dtype=torch.long)},
+            {
+                **_conditioning_info(semantic_count=2),
+                "gpt_sovits_transport": GPTSoVITSStageTransport.from_info(_conditioning_info(semantic_count=2))
+                .with_semantic_tokens(torch.tensor([10, 11], dtype=torch.long))
+                .to_transport_dict(),
+            },
             {
                 **_conditioning_info(semantic_count=3),
-                "gpt_sovits_semantic_tokens": torch.tensor([20, 21, 22], dtype=torch.long),
+                "gpt_sovits_transport": GPTSoVITSStageTransport.from_info(_conditioning_info(semantic_count=3))
+                .with_semantic_tokens(torch.tensor([20, 21, 22], dtype=torch.long))
+                .to_transport_dict(),
             },
         ],
         seq_token_counts=[1, 1],
@@ -96,6 +108,7 @@ def test_dummy_runtime_information_and_missing_conditioning_return_silence():
 
     assert len(dummy_infos) == 2
     assert all(info["gpt_sovits_semantic_token_count"] == 0 for info in dummy_infos)
+    assert all(info["skip_synthesis"] is True for info in dummy_infos)
 
     result = model.forward(
         input_ids=torch.tensor([1, 2, 3], dtype=torch.long),
@@ -112,6 +125,28 @@ def test_dummy_runtime_information_and_missing_conditioning_return_silence():
     assert len(audios) == 2
     assert all(audio.numel() == 0 for audio in audios)
     assert [int(sr.item()) for sr in sample_rates] == [32000, 32000]
+
+
+def test_has_decode_conditioning_allows_empty_refer_audio_16k_for_non_v2pro():
+    model = _minimal_model()
+    info = _conditioning_info(semantic_count=2)
+    transport = GPTSoVITSStageTransport.from_info(info)
+    info["gpt_sovits_transport"] = GPTSoVITSStageTransport(
+        request_id=transport.request_id,
+        semantic_tokens=transport.semantic_tokens,
+        phones=transport.phones,
+        prompt_phones=transport.prompt_phones,
+        prompt_semantic=transport.prompt_semantic,
+        refer_audio_spec=transport.refer_audio_spec,
+        refer_audio_16k=torch.zeros((0,), dtype=torch.float32),
+        raw_audio=transport.raw_audio,
+        raw_sr=transport.raw_sr,
+        speed_factor=transport.speed_factor,
+        sample_steps=transport.sample_steps,
+        super_sampling=transport.super_sampling,
+    ).to_transport_dict()
+
+    assert model._has_decode_conditioning(info) is True
 
 
 def test_preprocess_builds_and_reuses_prepared_decode_request():
