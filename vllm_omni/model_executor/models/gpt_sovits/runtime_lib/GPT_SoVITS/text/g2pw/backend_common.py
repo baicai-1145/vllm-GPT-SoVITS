@@ -166,6 +166,15 @@ class _G2PWBaseOnnxConverter:
             "on",
         }
         self.polyphonic_context_chars = max(0, int(os.getenv("g2pw_polyphonic_context_chars", "16")))
+        raw_window_size = os.getenv("g2pw_window_size", "").strip()
+        if raw_window_size:
+            try:
+                parsed_window_size = int(raw_window_size)
+            except ValueError:
+                parsed_window_size = int(getattr(self.config, "window_size", 0) or 0)
+        else:
+            parsed_window_size = int(getattr(self.config, "window_size", 0) or 0)
+        self.window_size = parsed_window_size if parsed_window_size > 0 else None
 
     def _convert_bopomofo_to_pinyin(self, bopomofo: str) -> str:
         tone = bopomofo[-1]
@@ -204,7 +213,7 @@ class _G2PWBaseOnnxConverter:
             texts=texts,
             query_ids=model_query_ids,
             use_mask=self.config.use_mask,
-            window_size=None,
+            window_size=self.window_size,
             char2id=self.char2id,
             char_phoneme_masks=self.char_phoneme_masks,
         )

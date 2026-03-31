@@ -2,6 +2,7 @@ import pickle
 import os
 import re
 from functools import lru_cache
+import nltk
 import wordsegment
 from g2p_en import G2p
 
@@ -23,6 +24,31 @@ CMU_DICT_FAST_PATH = os.path.join(current_file_path, "cmudict-fast.rep")
 CMU_DICT_HOT_PATH = os.path.join(current_file_path, "engdict-hot.rep")
 CACHE_PATH = os.path.join(current_file_path, "engdict_cache.pickle")
 NAMECACHE_PATH = os.path.join(current_file_path, "namedict_cache.pickle")
+
+
+def _ensure_nltk_data_paths() -> None:
+    candidate_roots: list[str] = []
+    env_value = str(os.environ.get("GPTSOVITS_NLTK_DATA_DIRS", os.environ.get("NLTK_DATA", ""))).strip()
+    if env_value:
+        candidate_roots.extend([item.strip() for item in env_value.split(os.pathsep) if item and item.strip()])
+    candidate_roots.extend(
+        [
+            "/root/miniconda3/envs/GPTSoVits/nltk_data",
+            os.path.join(os.path.dirname(current_file_path), "nltk_data"),
+            os.path.join(os.path.dirname(os.path.dirname(current_file_path)), "nltk_data"),
+        ]
+    )
+    seen: set[str] = set()
+    for candidate in candidate_roots:
+        resolved = os.path.abspath(os.path.expanduser(candidate))
+        if resolved in seen or not os.path.isdir(resolved):
+            continue
+        seen.add(resolved)
+        if resolved not in nltk.data.path:
+            nltk.data.path.insert(0, resolved)
+
+
+_ensure_nltk_data_paths()
 
 
 # 适配中文及 g2p_en 标点

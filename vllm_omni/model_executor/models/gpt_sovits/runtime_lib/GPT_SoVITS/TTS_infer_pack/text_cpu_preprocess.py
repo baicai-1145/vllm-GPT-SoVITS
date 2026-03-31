@@ -17,6 +17,7 @@ from text.cleaner import clean_text, clean_text_batch
 
 PreparedTextSegmentPayload = Dict[str, object]
 PreparedTextSegmentBatchItem = Tuple[str, str, str, bool]
+_PayloadCacheKey = Tuple[str, str, str, bool, str]
 _SegmentJob = Tuple[int, str, str, str]
 _MULTISPACE_PATTERN = re.compile(r" {2,}")
 _AUTO_ZH_FASTPATH_ALLOWED_PATTERN = re.compile(r"^[\u4e00-\u9fff0-9\s、，。！？,.!?…：；\-—~～/·]+$")
@@ -43,7 +44,7 @@ _TRIVIAL_BRIDGE_PATTERN = re.compile(r"^[0-9\s、，。！？,.!?…：；\-—~
 _ASCII_TRIVIAL_BRIDGE_CHARS = frozenset(",.!?-/~")
 _UNICODE_TRIVIAL_BRIDGE_CHARS = frozenset("、，。！？…：；—～/·")
 _PAYLOAD_CACHE_LOCK = threading.Lock()
-_PAYLOAD_CACHE: "OrderedDict[PreparedTextSegmentBatchItem, List[PreparedTextSegmentPayload]]" = OrderedDict()
+_PAYLOAD_CACHE: "OrderedDict[_PayloadCacheKey, List[PreparedTextSegmentPayload]]" = OrderedDict()
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -67,6 +68,37 @@ def _normalize_spaces(text: str) -> str:
 
 def _is_direct_zh_fast_path(language: str) -> bool:
     return _env_flag("GPTSOVITS_PREPARE_TEXT_CPU_ZH_FASTPATH", True) and str(language) in {"zh", "all_zh"}
+
+
+def _use_auto_langsegment_compat(language: str) -> bool:
+    return str(language) in {"auto", "auto_yue"} and _env_flag(
+        "GPTSOVITS_PREPARE_TEXT_CPU_AUTO_LANGSEG_COMPAT",
+        False,
+    )
+
+
+def _payload_cache_mode_tag(language: str) -> str:
+    return "|".join(
+        (
+            f"compat={int(_use_auto_langsegment_compat(language))}",
+            f"zh={int(_env_flag('GPTSOVITS_PREPARE_TEXT_CPU_ZH_FASTPATH', True))}",
+            f"yue={int(_env_flag('GPTSOVITS_PREPARE_TEXT_CPU_YUE_FASTPATH', True))}",
+            f"ja={int(_env_flag('GPTSOVITS_PREPARE_TEXT_CPU_JA_FASTPATH', True))}",
+            f"ko={int(_env_flag('GPTSOVITS_PREPARE_TEXT_CPU_KO_FASTPATH', True))}",
+            f"auto_zh={int(_env_flag('GPTSOVITS_PREPARE_TEXT_CPU_AUTO_ZH_FASTPATH', False))}",
+            f"auto={int(_env_flag('GPTSOVITS_PREPARE_TEXT_CPU_AUTO_FASTPATH', True))}",
+        )
+    )
+
+
+def _payload_cache_key(text: str, language: str, version: str, final: bool) -> _PayloadCacheKey:
+    return (
+        _normalize_spaces(str(text)),
+        str(language),
+        str(version),
+        bool(final),
+        _payload_cache_mode_tag(str(language)),
+    )
 
 
 def _get_direct_language_fast_path(language: str) -> str | None:
@@ -102,6 +134,8 @@ def _can_use_direct_language_fast_path(text: str, language: str) -> str | None:
 def _is_auto_zh_fast_path(text: str, language: str) -> bool:
     if str(language) not in {"auto", "auto_yue"}:
         return False
+    if _use_auto_langsegment_compat(language):
+        return False
     if not _env_flag("GPTSOVITS_PREPARE_TEXT_CPU_AUTO_ZH_FASTPATH", False):
         return False
     if not text or not _AUTO_ZH_FASTPATH_ALLOWED_PATTERN.fullmatch(text):
@@ -115,6 +149,8 @@ def _is_auto_zh_fast_path(text: str, language: str) -> bool:
 def _get_auto_single_language_fast_path(text: str, language: str) -> str | None:
     normalized = str(language)
     if normalized not in {"auto", "auto_yue"}:
+        return None
+    if _use_auto_langsegment_compat(language):
         return None
     if not _env_flag("GPTSOVITS_PREPARE_TEXT_CPU_AUTO_FASTPATH", True):
         return None
@@ -731,11 +767,12 @@ def _clone_payloads(payloads: Sequence[PreparedTextSegmentPayload]) -> List[Prep
 def _cache_get_payloads(item: PreparedTextSegmentBatchItem) -> List[PreparedTextSegmentPayload] | None:
     if not _PAYLOAD_CACHE_ENABLED:
         return None
+    cache_key = _payload_cache_key(*item)
     with _PAYLOAD_CACHE_LOCK:
-        cached = _PAYLOAD_CACHE.get(item)
+        cached = _PAYLOAD_CACHE.get(cache_key)
         if cached is None:
             return None
-        _PAYLOAD_CACHE.move_to_end(item)
+        _PAYLOAD_CACHE.move_to_end(cache_key)
         return _clone_payloads(cached)
 
 
@@ -746,9 +783,10 @@ def _cache_store_payloads(
     if not _PAYLOAD_CACHE_ENABLED:
         return
     cached_payloads = _clone_payloads(payloads)
+    cache_key = _payload_cache_key(*item)
     with _PAYLOAD_CACHE_LOCK:
-        _PAYLOAD_CACHE[item] = cached_payloads
-        _PAYLOAD_CACHE.move_to_end(item)
+        _PAYLOAD_CACHE[cache_key] = cached_payloads
+        _PAYLOAD_CACHE.move_to_end(cache_key)
         while len(_PAYLOAD_CACHE) > _PAYLOAD_CACHE_MAX_ITEMS:
             _PAYLOAD_CACHE.popitem(last=False)
 
@@ -805,6 +843,8 @@ def _build_segment_payloads_batch(
 
 
 def split_text_by_language(text: str, language: str) -> Tuple[List[str], List[str]]:
+    if _use_auto_langsegment_compat(language):
+        return _langsegmenter_items_to_segment_lists(LangSegmenter.getTexts(text), str(language))
     if _should_use_zh_fast_path(text, language):
         return [text], ["zh"]
     auto_language = _get_auto_single_language_fast_path(text, language)
@@ -877,6 +917,11 @@ def split_texts_by_language_batch(
     normalized_language = str(language)
     if not texts:
         return []
+    if _use_auto_langsegment_compat(normalized_language):
+        return [
+            _langsegmenter_items_to_segment_lists(items, normalized_language)
+            for items in LangSegmenter.getTextsBatch(texts)
+        ]
     if normalized_language in {"auto", "auto_yue"}:
         selective_direct_results = _split_texts_by_language_batch_selective_direct_runs(texts, normalized_language)
         if selective_direct_results is not None:

@@ -240,6 +240,21 @@ class G2PWRuntimeWrapper:
             batch_size=max(1, _env_int("GPTSOVITS_G2PW_CUDA_MAX_BATCH_SIZE", 256)),
             seq_len=max(1, _env_int("GPTSOVITS_G2PW_CUDA_MAX_SEQ_LEN", 128)),
         )
+        self.direct_max_rows = max(
+            1,
+            _env_int("GPTSOVITS_G2PW_CUDA_DIRECT_MAX_ROWS", min(int(self.max_batch_size), int(self.batch_max_rows))),
+        )
+        self.direct_max_sequences = max(
+            1,
+            _env_int(
+                "GPTSOVITS_G2PW_CUDA_DIRECT_MAX_SEQUENCES",
+                min(int(self.max_batch_size), int(self.batch_max_rows)),
+            ),
+        )
+        self.direct_max_tokens = max(
+            1,
+            _env_int("GPTSOVITS_G2PW_CUDA_DIRECT_MAX_TOKENS", max(int(self.batch_max_tokens), int(self.max_seq_len))),
+        )
         self.batch_worker = None
         if self.batch_enabled:
             self.batch_worker = threading.Thread(
@@ -404,6 +419,103 @@ class G2PWRuntimeWrapper:
                 raise G2PWCudaError(f"g2pw-cu inference failed: {self._last_error()}")
         return probs
 
+    def _split_model_input_for_direct_run(self, model_input: Dict[str, np.ndarray]) -> List[Dict[str, np.ndarray]]:
+        normalized = self._normalize_model_input(model_input)
+        query_rows = int(normalized["char_ids"].shape[0])
+        sequence_rows = int(normalized["input_ids"].shape[0])
+        seq_len = int(normalized["input_ids"].shape[1])
+        max_rows = max(1, int(self.direct_max_rows))
+        max_sequences = max(1, int(self.direct_max_sequences))
+        max_tokens = max(max(1, int(self.direct_max_tokens)), seq_len)
+        if (
+            query_rows <= max_rows
+            and sequence_rows <= max_sequences
+            and (sequence_rows * seq_len) <= max_tokens
+        ):
+            return [normalized]
+
+        sequence_ids = normalized["sequence_ids"]
+        chunks: List[Dict[str, np.ndarray]] = []
+        query_start = 0
+        while query_start < query_rows:
+            query_end = query_start
+            chunk_sequence_ids: List[int] = []
+            sequence_map: Dict[int, int] = {}
+            while query_end < query_rows:
+                source_sequence_id = int(sequence_ids[query_end])
+                if source_sequence_id not in sequence_map:
+                    proposed_sequence_count = len(chunk_sequence_ids) + 1
+                    proposed_tokens = proposed_sequence_count * seq_len
+                    if chunk_sequence_ids and (
+                        proposed_sequence_count > max_sequences or proposed_tokens > max_tokens
+                    ):
+                        break
+                    sequence_map[source_sequence_id] = len(chunk_sequence_ids)
+                    chunk_sequence_ids.append(source_sequence_id)
+                if (query_end - query_start + 1) > max_rows and query_end > query_start:
+                    break
+                query_end += 1
+                if (query_end - query_start) >= max_rows:
+                    break
+
+            if query_end <= query_start:
+                query_end = query_start + 1
+                source_sequence_id = int(sequence_ids[query_start])
+                sequence_map = {source_sequence_id: 0}
+                chunk_sequence_ids = [source_sequence_id]
+
+            local_query_slice = slice(query_start, query_end)
+            local_sequence_indices = np.asarray(chunk_sequence_ids, dtype=np.int64)
+            local_sequence_ids = np.asarray(
+                [sequence_map[int(value)] for value in sequence_ids[local_query_slice]],
+                dtype=np.int64,
+            )
+            chunks.append(
+                {
+                    "input_ids": np.ascontiguousarray(normalized["input_ids"][local_sequence_indices]),
+                    "token_type_ids": np.ascontiguousarray(normalized["token_type_ids"][local_sequence_indices]),
+                    "attention_masks": np.ascontiguousarray(normalized["attention_masks"][local_sequence_indices]),
+                    "phoneme_masks": np.ascontiguousarray(normalized["phoneme_masks"][local_query_slice]),
+                    "char_ids": np.ascontiguousarray(normalized["char_ids"][local_query_slice]),
+                    "position_ids": np.ascontiguousarray(normalized["position_ids"][local_query_slice]),
+                    "sequence_ids": np.ascontiguousarray(local_sequence_ids),
+                }
+            )
+            query_start = query_end
+        return chunks
+
+    def _run_chunked_direct_with_profile(
+        self,
+        model_inputs: List[Dict[str, np.ndarray]],
+    ) -> tuple[np.ndarray, Dict[str, float]]:
+        outputs: List[np.ndarray] = []
+        total_run_ms = 0.0
+        max_chunk_rows = 0
+        max_chunk_sequences = 0
+        max_chunk_seq_len = 0
+        for chunk in model_inputs:
+            started = time.perf_counter()
+            outputs.append(self._run_direct(chunk))
+            total_run_ms += float((time.perf_counter() - started) * 1000.0)
+            max_chunk_rows = max(max_chunk_rows, int(chunk["char_ids"].shape[0]))
+            max_chunk_sequences = max(max_chunk_sequences, int(chunk["input_ids"].shape[0]))
+            max_chunk_seq_len = max(max_chunk_seq_len, int(chunk["input_ids"].shape[1]))
+        merged_output = np.ascontiguousarray(np.concatenate(outputs, axis=0)) if outputs else np.zeros((0, 0), dtype=np.float32)
+        total_rows = sum(int(chunk["char_ids"].shape[0]) for chunk in model_inputs)
+        return merged_output, {
+            "g2pw_runtime_queue_wait_ms": 0.0,
+            "g2pw_runtime_collect_wait_ms": 0.0,
+            "g2pw_runtime_run_ms": float(total_run_ms),
+            "g2pw_runtime_batch_rows": float(total_rows),
+            "g2pw_runtime_batch_requests": float(len(model_inputs)),
+            "g2pw_runtime_task_rows": float(total_rows),
+            "g2pw_runtime_task_seq_len": float(max_chunk_seq_len),
+            "g2pw_runtime_chunk_count": float(len(model_inputs)),
+            "g2pw_runtime_chunk_rows_peak": float(max_chunk_rows),
+            "g2pw_runtime_chunk_sequences_peak": float(max_chunk_sequences),
+            "g2pw_runtime_shard_index": float(self.shard_index),
+        }
+
     def _can_append_task(self, tasks: List[G2PWBatchTask], candidate: G2PWBatchTask) -> bool:
         request_count = len(tasks) + 1
         if request_count > self.batch_max_requests:
@@ -512,25 +624,40 @@ class G2PWRuntimeWrapper:
                 batch_sequence_rows = int(merged_input["input_ids"].shape[0])
                 batch_max_seq_len = int(merged_input["input_ids"].shape[1])
                 run_started = time.perf_counter()
-                merged_output = self._run_direct(merged_input)
+                merged_chunks = self._split_model_input_for_direct_run(merged_input)
+                if len(merged_chunks) > 1:
+                    merged_output, merged_profile = self._run_chunked_direct_with_profile(merged_chunks)
+                else:
+                    merged_output = self._run_direct(merged_input)
+                    merged_profile = {}
                 run_finished = time.perf_counter()
-                run_ms = max(0.0, (run_finished - run_started) * 1000.0)
+                run_ms = float(
+                    merged_profile.get("g2pw_runtime_run_ms", max(0.0, (run_finished - run_started) * 1000.0))
+                )
                 for task, (start, end) in zip(batch_tasks, row_slices):
                     task_rows = int(task.model_input["char_ids"].shape[0])
                     task_seq_len = int(task.model_input["input_ids"].shape[1])
+                    task_profile = {
+                        "g2pw_runtime_queue_wait_ms": float(max(0.0, (run_started - task.enqueued_at) * 1000.0)),
+                        "g2pw_runtime_collect_wait_ms": float(collect_wait_ms),
+                        "g2pw_runtime_run_ms": float(run_ms),
+                        "g2pw_runtime_batch_rows": float(sum(int(item.model_input["char_ids"].shape[0]) for item in batch_tasks)),
+                        "g2pw_runtime_batch_requests": float(len(batch_tasks)),
+                        "g2pw_runtime_task_rows": float(task_rows),
+                        "g2pw_runtime_task_seq_len": float(task_seq_len),
+                        "g2pw_runtime_shard_index": float(self.shard_index),
+                    }
+                    for key in (
+                        "g2pw_runtime_chunk_count",
+                        "g2pw_runtime_chunk_rows_peak",
+                        "g2pw_runtime_chunk_sequences_peak",
+                    ):
+                        if key in merged_profile:
+                            task_profile[key] = float(merged_profile[key])
                     self._finish_task(
                         task,
                         output=np.ascontiguousarray(merged_output[start:end]),
-                        profile={
-                            "g2pw_runtime_queue_wait_ms": float(max(0.0, (run_started - task.enqueued_at) * 1000.0)),
-                            "g2pw_runtime_collect_wait_ms": float(collect_wait_ms),
-                            "g2pw_runtime_run_ms": float(run_ms),
-                            "g2pw_runtime_batch_rows": float(sum(int(item.model_input["char_ids"].shape[0]) for item in batch_tasks)),
-                            "g2pw_runtime_batch_requests": float(len(batch_tasks)),
-                            "g2pw_runtime_task_rows": float(task_rows),
-                            "g2pw_runtime_task_seq_len": float(task_seq_len),
-                            "g2pw_runtime_shard_index": float(self.shard_index),
-                        },
+                        profile=task_profile,
                     )
             except Exception as exc:
                 run_ms = 0.0
@@ -645,6 +772,9 @@ class G2PWRuntimeWrapper:
             return int(len(self.pending_tasks))
 
     def run_with_profile(self, model_input: Dict[str, np.ndarray]) -> tuple[np.ndarray, Dict[str, float]]:
+        direct_chunks = self._split_model_input_for_direct_run(model_input)
+        if len(direct_chunks) > 1:
+            return self._run_chunked_direct_with_profile(direct_chunks)
         if not self.batch_enabled:
             started = time.perf_counter()
             output = self._run_direct(model_input)

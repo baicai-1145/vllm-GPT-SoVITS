@@ -259,8 +259,8 @@ def attach_t2s_kv_cache_pool(model: Any, device: Any) -> T2SKVCachePoolState:
 
     params = list(model.parameters())
     model_dtype = params[0].dtype if params else torch.float32
-    max_batch_size = max(1, int(os.environ.get("GPTSOVITS_ENGINE_KV_POOL_MAX_BATCH", "128")))
-    max_seq_len = max(1, int(os.environ.get("GPTSOVITS_ENGINE_KV_POOL_MAX_SEQ_LEN", "1024")))
+    max_batch_size = max(1, int(os.environ.get("GPTSOVITS_ENGINE_KV_POOL_MAX_BATCH", "1")))
+    max_seq_len = max(1, int(os.environ.get("GPTSOVITS_ENGINE_KV_POOL_MAX_SEQ_LEN", "8192")))
     pool = T2SKVCachePool(
         device=torch.device(device),
         dtype=model_dtype,

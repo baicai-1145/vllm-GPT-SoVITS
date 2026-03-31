@@ -248,6 +248,34 @@ def set_seed(seed: int):
     return seed
 
 
+def _normalize_precision_name(raw_precision, *, is_half: bool = False) -> str:
+    if raw_precision is None or str(raw_precision).strip() == "":
+        return "fp16" if bool(is_half) else "fp32"
+    value = str(raw_precision).strip().lower()
+    aliases = {
+        "fp32": "fp32",
+        "float32": "fp32",
+        "f32": "fp32",
+        "fp16": "fp16",
+        "float16": "fp16",
+        "half": "fp16",
+        "f16": "fp16",
+        "bf16": "bf16",
+        "bfloat16": "bf16",
+    }
+    if value not in aliases:
+        raise ValueError(f"Unsupported precision config: {raw_precision}")
+    return aliases[value]
+
+
+def _precision_name_to_dtype(name: str) -> torch.dtype:
+    if name == "fp16":
+        return torch.float16
+    if name == "bf16":
+        return torch.bfloat16
+    return torch.float32
+
+
 class TTS_Config:
     default_configs = {
         "v1": {
@@ -369,10 +397,13 @@ class TTS_Config:
             print("Warning: CUDA is not available, set device to CPU.")
             self.device = torch.device("cpu")
 
-        self.is_half = self.configs.get("is_half", False)
-        if str(self.device) == "cpu" and self.is_half:
-            print(f"Warning: Half precision is not supported on CPU, set is_half to False.")
-            self.is_half = False
+        requested_is_half = bool(self.configs.get("is_half", False))
+        self.precision_name = _normalize_precision_name(self.configs.get("precision", None), is_half=requested_is_half)
+        if str(self.device) == "cpu" and self.precision_name != "fp32":
+            print(f"Warning: Reduced precision is not supported on CPU, set precision to fp32.")
+            self.precision_name = "fp32"
+        self.precision = _precision_name_to_dtype(self.precision_name)
+        self.is_half = self.precision == torch.float16
 
         version = self.configs.get("version", None)
         self.version = version
@@ -442,6 +473,7 @@ class TTS_Config:
         self.config = {
             "device": str(self.device),
             "is_half": self.is_half,
+            "precision": self.precision_name,
             "version": self.version,
             "t2s_weights_path": self.t2s_weights_path,
             "vits_weights_path": self.vits_weights_path,
@@ -545,6 +577,7 @@ class TTS:
             int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_WORKERS", "1")),
         )
         self.prepare_text_cpu_executor = None
+        self.precision: torch.dtype = self.configs.precision
 
         self._init_models()
         self.runtime_prepare_components_deferred = (
@@ -553,6 +586,29 @@ class TTS:
         )
         if not self.runtime_prepare_components_deferred:
             self.refresh_runtime_components()
+
+    def _runtime_compute_dtype(self) -> torch.dtype:
+        return getattr(self.configs, "precision", torch.float32)
+
+    def _cast_module_to_runtime_precision(self, module):
+        if module is None:
+            return None
+        target_dtype = self._runtime_compute_dtype()
+        module = module.to(self.configs.device)
+        if str(self.configs.device) == "cpu":
+            return module.float()
+        if target_dtype == torch.float16:
+            return module.half()
+        if target_dtype == torch.bfloat16:
+            return module.to(dtype=torch.bfloat16)
+        return module.float()
+
+    def _cast_tensor_to_runtime_precision(self, tensor: torch.Tensor) -> torch.Tensor:
+        target_dtype = self._runtime_compute_dtype()
+        tensor = tensor.to(self.configs.device)
+        if str(self.configs.device) == "cpu" or target_dtype == torch.float32:
+            return tensor.float()
+        return tensor.to(dtype=target_dtype)
 
         self.prompt_cache: dict = {
             "ref_audio_path": None,
@@ -567,7 +623,7 @@ class TTS:
         }
 
         self.stop_flag: bool = False
-        self.precision: torch.dtype = torch.float16 if self.configs.is_half else torch.float32
+        self.precision: torch.dtype = self.configs.precision
 
     def refresh_runtime_components(self):
         runtime_refresh = getattr(self, "_vllm_runtime_refresh_prepare_components", None)
@@ -624,6 +680,7 @@ class TTS:
                 ssl_model=self.cnhuhbert_model,
                 vits_model=self.vits_model,
                 device=self.configs.device,
+                precision=self._runtime_compute_dtype(),
                 is_half=self.configs.is_half,
                 zero_wav_samples=int(self.configs.sampling_rate * 0.3),
                 stage_limiter=self.prepare_ref_semantic_stage_limiter,
@@ -999,18 +1056,14 @@ class TTS:
             os.environ["GPTSOVITS_CNHUBERT_DISABLE_CUDNN_LAYER_INDICES"] = disable_cudnn_layers
         self.cnhuhbert_model = CNHubert(base_path)
         self.cnhuhbert_model = self.cnhuhbert_model.eval()
-        self.cnhuhbert_model = self.cnhuhbert_model.to(self.configs.device)
-        if self.configs.is_half and str(self.configs.device) != "cpu":
-            self.cnhuhbert_model = self.cnhuhbert_model.half()
+        self.cnhuhbert_model = self._cast_module_to_runtime_precision(self.cnhuhbert_model)
 
     def init_bert_weights(self, base_path: str):
         print(f"Loading BERT weights from {base_path}")
         self.bert_tokenizer = AutoTokenizer.from_pretrained(base_path)
         self.bert_model = AutoModelForMaskedLM.from_pretrained(base_path)
         self.bert_model = self.bert_model.eval()
-        self.bert_model = self.bert_model.to(self.configs.device)
-        if self.configs.is_half and str(self.configs.device) != "cpu":
-            self.bert_model = self.bert_model.half()
+        self.bert_model = self._cast_module_to_runtime_precision(self.bert_model)
 
     def _maybe_compile_vits_decoder(self) -> None:
         if self.configs.use_vocoder or not _compile_vits_dec_enabled():
@@ -1077,7 +1130,7 @@ class TTS:
             "off",
             "",
         }
-        capture_scalar_outputs = os.environ.get("GPTSOVITS_COMPILE_T2S_PREALLOC_CAPTURE_SCALAR_OUTPUTS", "0").strip().lower() not in {
+        capture_scalar_outputs = os.environ.get("GPTSOVITS_COMPILE_T2S_PREALLOC_CAPTURE_SCALAR_OUTPUTS", "1").strip().lower() not in {
             "0",
             "false",
             "no",
@@ -1217,12 +1270,8 @@ class TTS:
         if not self.configs.use_vocoder and hasattr(vits_model, "dec") and hasattr(vits_model.dec, "remove_weight_norm"):
             vits_model.dec.remove_weight_norm()
 
-        vits_model = vits_model.to(self.configs.device)
         vits_model = vits_model.eval()
-
-        self.vits_model = vits_model
-        if self.configs.is_half and str(self.configs.device) != "cpu":
-            self.vits_model = self.vits_model.half()
+        self.vits_model = self._cast_module_to_runtime_precision(vits_model)
         self._maybe_compile_vits_decoder()
 
         self.configs.save_configs()
@@ -1239,11 +1288,8 @@ class TTS:
         self.configs.max_sec = config["data"]["max_sec"]
         t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
         t2s_model.load_state_dict(dict_s1["weight"])
-        t2s_model = t2s_model.to(self.configs.device)
         t2s_model = t2s_model.eval()
-        self.t2s_model = t2s_model
-        if self.configs.is_half and str(self.configs.device) != "cpu":
-            self.t2s_model = self.t2s_model.half()
+        self.t2s_model = self._cast_module_to_runtime_precision(t2s_model)
         self._maybe_compile_t2s_prealloc_decoder()
 
         codebook = t2s_model.model.ar_audio_embedding.weight.clone()
@@ -1306,11 +1352,7 @@ class TTS:
             self.vocoder_configs["upsample_rate"] = 480
             self.vocoder_configs["overlapped_len"] = 12
 
-        self.vocoder = self.vocoder.eval()
-        if self.configs.is_half == True:
-            self.vocoder = self.vocoder.half().to(self.configs.device)
-        else:
-            self.vocoder = self.vocoder.to(self.configs.device)
+        self.vocoder = self._cast_module_to_runtime_precision(self.vocoder.eval())
 
     def init_sr_model(self):
         if self.sr_model is not None:
@@ -1325,7 +1367,7 @@ class TTS:
     def init_sv_model(self):
         if self.sv_model is not None:
             return
-        self.sv_model = SV(self.configs.device, self.configs.is_half)
+        self.sv_model = SV(self.configs.device, precision=self._runtime_compute_dtype())
 
     def enable_half_precision(self, enable: bool = True, save: bool = True):
         """
@@ -1339,7 +1381,9 @@ class TTS:
             return
 
         self.configs.is_half = enable
-        self.precision = torch.float16 if enable else torch.float32
+        self.configs.precision_name = "fp16" if enable else "fp32"
+        self.configs.precision = _precision_name_to_dtype(self.configs.precision_name)
+        self.precision = self.configs.precision
         if save:
             self.configs.save_configs()
         if enable:
@@ -1364,6 +1408,22 @@ class TTS:
                 self.cnhuhbert_model = self.cnhuhbert_model.float()
             if self.vocoder is not None:
                 self.vocoder = self.vocoder.float()
+
+    def enable_precision(self, precision: str = "fp32", save: bool = True):
+        precision_name = _normalize_precision_name(precision)
+        if str(self.configs.device) == "cpu" and precision_name != "fp32":
+            print("Reduced precision is not supported on CPU.")
+            return
+        self.configs.precision_name = precision_name
+        self.configs.precision = _precision_name_to_dtype(precision_name)
+        self.configs.is_half = precision_name == "fp16"
+        self.precision = self.configs.precision
+        if save:
+            self.configs.save_configs()
+        for attr_name in ("t2s_model", "vits_model", "bert_model", "cnhuhbert_model", "vocoder"):
+            module = getattr(self, attr_name, None)
+            if module is not None:
+                setattr(self, attr_name, self._cast_module_to_runtime_precision(module))
 
     def set_device(self, device: torch.device, save: bool = True):
         """
@@ -1410,9 +1470,7 @@ class TTS:
 
     @torch.inference_mode()
     def _extract_prompt_semantic_from_prepared_wav16k(self, wav16k: torch.Tensor):
-        wav16k = wav16k.to(self.configs.device)
-        if self.configs.is_half:
-            wav16k = wav16k.half()
+        wav16k = self._cast_tensor_to_runtime_precision(wav16k)
         hubert_feature = self.cnhuhbert_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
         codes = self.vits_model.extract_latent(hubert_feature)
         return codes[0, 0].to(self.configs.device)
@@ -1420,9 +1478,7 @@ class TTS:
     @torch.inference_mode()
     def _extract_prompt_semantic_profile_from_prepared_wav16k(self, wav16k: torch.Tensor):
         h2d_start = time.perf_counter()
-        wav16k = wav16k.to(self.configs.device)
-        if self.configs.is_half:
-            wav16k = wav16k.half()
+        wav16k = self._cast_tensor_to_runtime_precision(wav16k)
         h2d_ms = (time.perf_counter() - h2d_start) * 1000.0
 
         ssl_start = time.perf_counter()
@@ -1548,14 +1604,14 @@ class TTS:
             center=False,
         )
         profile["ref_spec_spectrogram_ms"] = (time.perf_counter() - spec_start) * 1000.0
-        if self.configs.is_half:
-            spec = spec.half()
+        if self._runtime_compute_dtype() != torch.float32:
+            spec = spec.to(dtype=self._runtime_compute_dtype())
         if self.is_v2pro == True:
             post_resample_start = time.perf_counter()
             audio = resample(audio, self.configs.sampling_rate, 16000, self.configs.device)
             profile["ref_spec_post_resample_ms"] = (time.perf_counter() - post_resample_start) * 1000.0
-            if self.configs.is_half:
-                audio = audio.half()
+            if self._runtime_compute_dtype() != torch.float32:
+                audio = audio.to(dtype=self._runtime_compute_dtype())
         else:
             audio = None
         return spec, audio, raw_audio, raw_sr, profile

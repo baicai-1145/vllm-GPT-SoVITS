@@ -11,6 +11,7 @@ from typing import Any, Callable, Deque, Dict, List, Sequence, Tuple
 class TextCpuTask:
     text: str
     language: str
+    text_split_method: str = "cut1"
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     created_at: float = field(default_factory=time.perf_counter)
     enqueued_at: float = 0.0
@@ -30,8 +31,8 @@ class TextCpuTask:
 class PrepareTextCpuWorker:
     def __init__(
         self,
-        process_fn: Callable[[str, str], Any] | None = None,
-        batch_process_fn: Callable[[Sequence[Tuple[str, str]]], Sequence[Any]] | None = None,
+        process_fn: Callable[[str, str, str], Any] | None = None,
+        batch_process_fn: Callable[[Sequence[Tuple[str, str, str]]], Sequence[Any]] | None = None,
         worker_count: int = 1,
         batch_window_ms: int = 0,
         max_batch_items: int = 1,
@@ -193,37 +194,52 @@ class PrepareTextCpuWorker:
     async def _enqueue_task_async(self, task: TextCpuTask) -> None:
         await self._enqueue_tasks_async([task])
 
-    def submit(self, text: str, language: str) -> Tuple[Any, Dict[str, float]]:
-        task = TextCpuTask(text=str(text), language=str(language))
+    def submit(self, text: str, language: str, text_split_method: str = "cut1") -> Tuple[Any, Dict[str, float]]:
+        task = TextCpuTask(text=str(text), language=str(language), text_split_method=str(text_split_method))
         asyncio.run(self._enqueue_task_async(task))
         task.done_event.wait()
         if task.error is not None:
             raise task.error
         return task.result, dict(task.profile)
 
-    async def submit_async(self, text: str, language: str) -> Tuple[Any, Dict[str, float]]:
+    async def submit_async(
+        self,
+        text: str,
+        language: str,
+        text_split_method: str = "cut1",
+    ) -> Tuple[Any, Dict[str, float]]:
         loop = asyncio.get_running_loop()
         task = TextCpuTask(
             text=str(text),
             language=str(language),
+            text_split_method=str(text_split_method),
             done_loop=loop,
             done_future=loop.create_future(),
         )
         await self._enqueue_task_async(task)
         return await task.done_future
 
-    async def submit_many_async(self, items: Sequence[Tuple[str, str]]) -> List[Tuple[Any, Dict[str, float]]]:
+    async def submit_many_async(self, items: Sequence[Tuple[str, str] | Tuple[str, str, str]]) -> List[Tuple[Any, Dict[str, float]]]:
         if not items:
             return []
         loop = asyncio.get_running_loop()
+        normalized_items: List[Tuple[str, str, str]] = []
+        for item in items:
+            if len(item) == 2:
+                text, language = item
+                text_split_method = "cut1"
+            else:
+                text, language, text_split_method = item
+            normalized_items.append((str(text), str(language), str(text_split_method)))
         tasks = [
             TextCpuTask(
-                text=str(text),
-                language=str(language),
+                text=text,
+                language=language,
+                text_split_method=text_split_method,
                 done_loop=loop,
                 done_future=loop.create_future(),
             )
-            for text, language in items
+            for text, language, text_split_method in normalized_items
         ]
         await self._enqueue_tasks_async(tasks)
         return list(await asyncio.gather(*[task.done_future for task in tasks]))
@@ -345,10 +361,17 @@ class PrepareTextCpuWorker:
         batch_started = time.perf_counter()
         try:
             if self.batch_process_fn is not None:
-                results = list(self.batch_process_fn([(task.text, task.language) for task in batch]))
+                batch_items_3 = [(task.text, task.language, task.text_split_method) for task in batch]
+                try:
+                    results = list(self.batch_process_fn(batch_items_3))
+                except TypeError:
+                    results = list(self.batch_process_fn([(task.text, task.language) for task in batch]))  # type: ignore[arg-type]
             else:
                 assert self.process_fn is not None
-                results = [self.process_fn(task.text, task.language) for task in batch]
+                try:
+                    results = [self.process_fn(task.text, task.language, task.text_split_method) for task in batch]
+                except TypeError:
+                    results = [self.process_fn(task.text, task.language) for task in batch]  # type: ignore[misc]
             if len(results) != len(batch):
                 raise RuntimeError(
                     f"text cpu batch 结果数量不匹配: expected={len(batch)} actual={len(results)}"

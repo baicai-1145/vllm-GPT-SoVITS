@@ -153,8 +153,9 @@ class PrepareRefSemanticBatchWorker:
         ssl_model,
         vits_model,
         device,
-        is_half: bool,
-        zero_wav_samples: int,
+        precision=None,
+        is_half: bool = False,
+        zero_wav_samples: int = 0,
         stage_limiter=None,
         batch_window_ms: int = 5,
         max_batch_items: int = 8,
@@ -164,7 +165,19 @@ class PrepareRefSemanticBatchWorker:
         self.ssl_model = ssl_model
         self.vits_model = vits_model
         self.device = device
-        self.is_half = bool(is_half)
+        if precision is None:
+            self.compute_dtype = torch.float16 if bool(is_half) else torch.float32
+        elif isinstance(precision, torch.dtype):
+            self.compute_dtype = precision
+        else:
+            raw = str(precision).strip().lower()
+            if raw in {"torch.float16", "float16", "fp16", "half"}:
+                self.compute_dtype = torch.float16
+            elif raw in {"torch.bfloat16", "bfloat16", "bf16"}:
+                self.compute_dtype = torch.bfloat16
+            else:
+                self.compute_dtype = torch.float32
+        self.is_half = self.compute_dtype == torch.float16
         self.zero_wav_samples = max(0, int(zero_wav_samples))
         self.stage_limiter = stage_limiter
         self.batch_window_s = max(0.0, float(batch_window_ms) / 1000.0)
@@ -615,8 +628,8 @@ class PrepareRefSemanticBatchWorker:
             attention_mask = None
             if attention_mask_cpu is not None:
                 attention_mask = attention_mask_cpu.to(self.device, non_blocking=pin_memory)
-            if self.is_half:
-                input_values = input_values.half()
+            if self.compute_dtype != torch.float32:
+                input_values = input_values.to(dtype=self.compute_dtype)
             h2d_end_ts = time.perf_counter()
             h2d_ms = (h2d_end_ts - h2d_start) * 1000.0
             gpu_acquired_ts = h2d_start_ts
@@ -656,8 +669,8 @@ class PrepareRefSemanticBatchWorker:
                 attention_mask = None
                 if attention_mask_cpu is not None:
                     attention_mask = attention_mask_cpu.to(self.device, non_blocking=pin_memory)
-                if self.is_half:
-                    input_values = input_values.half()
+                if self.compute_dtype != torch.float32:
+                    input_values = input_values.to(dtype=self.compute_dtype)
                 h2d_end_ts = time.perf_counter()
                 h2d_ms = (h2d_end_ts - h2d_start) * 1000.0
                 with torch.inference_mode():
@@ -797,8 +810,9 @@ class PrepareRefSemanticBatchWorkerPool:
         ssl_model,
         vits_model,
         device,
-        is_half: bool,
-        zero_wav_samples: int,
+        precision=None,
+        is_half: bool = False,
+        zero_wav_samples: int = 0,
         stage_limiter=None,
         batch_window_ms: int = 5,
         max_batch_items: int = 8,
@@ -852,6 +866,7 @@ class PrepareRefSemanticBatchWorkerPool:
                 ssl_model=ssl_model,
                 vits_model=vits_model,
                 device=device,
+                precision=precision,
                 is_half=is_half,
                 zero_wav_samples=zero_wav_samples,
                 stage_limiter=stage_limiter,

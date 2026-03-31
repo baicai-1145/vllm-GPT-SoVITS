@@ -260,26 +260,67 @@ class TextPreprocessor:
         prepared_segments = self.preprocess_text_segments(text, language, version, final=final)
         return self.build_phones_and_bert_from_segments(prepared_segments, profile=profile)
 
+    def _split_texts_for_runtime(
+        self,
+        text: str,
+        language: str,
+        text_split_method: str | None,
+    ) -> List[str]:
+        raw_text = str(text).strip("\n")
+        if not raw_text:
+            return []
+        if not text_split_method:
+            return [raw_text]
+        normalized_text = self.replace_consecutive_punctuation(raw_text)
+        return self.pre_seg_text(normalized_text, language, text_split_method)
+
     def preprocess_text_segments(
         self,
         text: str,
         language: str,
         version: str,
+        text_split_method: str | None = None,
         final: bool = False,
     ) -> List[PreparedTextSegment]:
-        payloads = preprocess_text_segments_payload(text, language, version, final=final)
-        return self._payloads_to_prepared_segments(payloads)
+        split_texts = self._split_texts_for_runtime(text, language, text_split_method)
+        if not split_texts:
+            return []
+        if len(split_texts) == 1 and text_split_method is None:
+            payloads = preprocess_text_segments_payload(split_texts[0], language, version, final=final)
+            return self._payloads_to_prepared_segments(payloads)
+        payload_batches = preprocess_text_segments_payload_batch(
+            [(item_text, language, version, final) for item_text in split_texts]
+        )
+        prepared_segments: List[PreparedTextSegment] = []
+        for payloads in payload_batches:
+            prepared_segments.extend(self._payloads_to_prepared_segments(payloads))
+        return prepared_segments
 
     def preprocess_text_segments_batch(
         self,
-        items: List[Tuple[str, str]],
+        items: List[Tuple[str, str] | Tuple[str, str, str]],
         version: str,
         final: bool = False,
     ) -> List[List[PreparedTextSegment]]:
-        payload_batches = preprocess_text_segments_payload_batch(
-            [(text, language, version, final) for text, language in items]
-        )
-        return [self._payloads_to_prepared_segments(payloads) for payloads in payload_batches]
+        expanded_items: List[Tuple[str, str, str, bool]] = []
+        root_indices: List[int] = []
+        results: List[List[PreparedTextSegment]] = [[] for _ in items]
+        for index, item in enumerate(items):
+            if len(item) == 2:
+                text, language = item
+                text_split_method = None
+            else:
+                text, language, text_split_method = item
+            split_texts = self._split_texts_for_runtime(text, language, text_split_method)
+            for item_text in split_texts:
+                expanded_items.append((item_text, language, version, final))
+                root_indices.append(index)
+        if not expanded_items:
+            return results
+        payload_batches = preprocess_text_segments_payload_batch(expanded_items)
+        for index, payloads in zip(root_indices, payload_batches):
+            results[index].extend(self._payloads_to_prepared_segments(payloads))
+        return results
 
     @staticmethod
     def _payloads_to_prepared_segments(

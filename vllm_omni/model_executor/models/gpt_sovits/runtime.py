@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import math
 import os
 import sys
 import threading
@@ -10,7 +11,7 @@ import types
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence, cast
 
 import numpy as np
 import torch
@@ -481,6 +482,7 @@ class GPTSoVITSRequestSpec:
     prompt_lang: str
     text: str
     text_lang: str
+    text_split_method: str
     top_k: int
     top_p: float
     temperature: float
@@ -1408,6 +1410,8 @@ class GPTSoVITSRuntime:
         self._runtime_prepare_text_cpu_executor: Any | None = None
         self._runtime_prepare_bert_stage_limiter: Any | None = None
         self._runtime_prepare_ref_semantic_stage_limiter: Any | None = None
+        self._last_t2s_scheduler_stats: dict[str, Any] = {}
+        self._sampling_ops_cache: tuple[Any, Any] | None = None
 
     def _resolve_path(self, maybe_relative_path: str) -> str:
         if os.path.isabs(maybe_relative_path):
@@ -1516,6 +1520,7 @@ class GPTSoVITSRuntime:
                 setattr(pipeline, "runtime_prepare_components_deferred", True)
             self._install_ref_audio_loader_fallback(pipeline)
             self._install_sv_half_safe_patch(pipeline)
+            self._refresh_runtime_t2s_kv_cache_pool_state(pipeline)
             self._install_runtime_prepare_components(pipeline)
             self._bind_pipeline_components(pipeline)
             self._config = config
@@ -1591,6 +1596,7 @@ class GPTSoVITSRuntime:
             ssl_model=getattr(pipeline, "cnhuhbert_model", None),
             vits_model=getattr(pipeline, "vits_model", None),
             device=getattr(getattr(pipeline, "configs", None), "device", "cpu"),
+            precision=getattr(pipeline, "precision", torch.float32),
             is_half=bool(getattr(getattr(pipeline, "configs", None), "is_half", False)),
             zero_wav_samples=int(getattr(getattr(pipeline, "configs", None), "sampling_rate", 32000) * 0.3),
             stage_limiter=getattr(pipeline, "prepare_ref_semantic_stage_limiter", None),
@@ -1661,10 +1667,11 @@ class GPTSoVITSRuntime:
             from TTS_infer_pack.prepare_text_cpu_worker import PrepareTextCpuWorker
 
         return PrepareTextCpuWorker(
-            process_fn=lambda text, language: text_preprocessor.preprocess_text_segments(
+            process_fn=lambda text, language, text_split_method: text_preprocessor.preprocess_text_segments(
                 text,
                 language,
                 getattr(getattr(pipeline, "configs", None), "version", ""),
+                text_split_method=text_split_method,
             ),
             batch_process_fn=lambda items: text_preprocessor.preprocess_text_segments_batch(
                 list(items),
@@ -1898,6 +1905,9 @@ class GPTSoVITSRuntime:
 
     def get_t2s_model(self) -> Any:
         return self._get_runtime_t2s_model()
+
+    def get_last_t2s_scheduler_stats(self) -> dict[str, Any]:
+        return dict(self._last_t2s_scheduler_stats)
 
     def get_semantic_eos_id(self) -> int:
         model = self.get_t2s_model()
@@ -2283,12 +2293,83 @@ class GPTSoVITSRuntime:
         self._set_kv_pool_active_rows(model, 0)
 
     def _get_sampling_ops(self) -> tuple[Any, Any]:
+        if self._sampling_ops_cache is not None:
+            return self._sampling_ops_cache
         self._ensure_import_path()
         self._ensure_native_runtime_deps()
         with self._project_root_cwd():
             from AR.models.utils import logits_to_probs, multinomial_sample_one_no_sync
 
-        return logits_to_probs, multinomial_sample_one_no_sync
+        self._sampling_ops_cache = (logits_to_probs, multinomial_sample_one_no_sync)
+        return self._sampling_ops_cache
+
+    @staticmethod
+    def _accumulate_t2s_stat(stats: dict[str, Any] | None, key: str, elapsed_ms: float) -> None:
+        if stats is None:
+            return
+        stats[key] = float(stats.get(key, 0.0)) + float(elapsed_ms)
+
+    @staticmethod
+    def _increment_t2s_stat(stats: dict[str, Any] | None, key: str, delta: int = 1) -> None:
+        if stats is None:
+            return
+        stats[key] = int(stats.get(key, 0)) + int(delta)
+
+    @staticmethod
+    def _time_t2s_call(
+        fn: Callable[[], Any],
+        *,
+        pending_cuda_timings: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] | None,
+        stat_key: str,
+        device: torch.device | None,
+    ) -> Any:
+        if pending_cuda_timings is not None and device is not None and device.type == "cuda" and torch.cuda.is_available():
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            result = fn()
+            end_event.record()
+            pending_cuda_timings.append((stat_key, start_event, end_event))
+            return result
+
+        started = time.perf_counter()
+        result = fn()
+        if pending_cuda_timings is not None:
+            pending_cuda_timings.append((stat_key, None, (time.perf_counter() - started) * 1000.0))
+        return result
+
+    @staticmethod
+    def _flush_t2s_timing_records(
+        stats: dict[str, Any] | None,
+        pending_cuda_timings: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]],
+        *,
+        device: torch.device | None,
+    ) -> None:
+        if stats is None or not pending_cuda_timings:
+            return
+        if device is not None and device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.current_stream(device).synchronize()
+        for stat_key, start_event, end_event_or_elapsed in pending_cuda_timings:
+            if start_event is None:
+                elapsed_ms = float(end_event_or_elapsed)
+            else:
+                elapsed_ms = float(start_event.elapsed_time(cast(torch.cuda.Event, end_event_or_elapsed)))
+            stats[stat_key] = float(stats.get(stat_key, 0.0)) + elapsed_ms
+        pending_cuda_timings.clear()
+
+    @staticmethod
+    def _merge_numeric_t2s_stats(stats: dict[str, Any] | None, delta: dict[str, Any] | None) -> None:
+        if stats is None or not delta:
+            return
+        for key, value in delta.items():
+            if isinstance(value, bool):
+                stats[key] = bool(value)
+            elif isinstance(value, int):
+                stats[key] = int(stats.get(key, 0)) + int(value)
+            elif isinstance(value, float):
+                stats[key] = float(stats.get(key, 0.0)) + float(value)
+            else:
+                stats[key] = value
 
     @staticmethod
     def _stack_token_sequences_if_same_length(
@@ -2369,25 +2450,57 @@ class GPTSoVITSRuntime:
         logits: torch.Tensor,
         histories: Sequence[torch.LongTensor],
         sampling_key: tuple[int, float, float, float, bool],
+        *,
+        stats: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         logits_to_probs, multinomial_sample_one_no_sync = self._get_sampling_ops()
         top_k, top_p, temperature, repetition_penalty, trim_eos = sampling_key
         sample_logits = logits[:, :-1] if trim_eos else logits
-        padded_histories = self._stack_token_sequences_if_same_length(histories)
+        pending_cuda_timings: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] | None = (
+            [] if stats is not None else None
+        )
+        padded_histories = self._time_t2s_call(
+            lambda: self._stack_token_sequences_if_same_length(histories),
+            pending_cuda_timings=pending_cuda_timings,
+            stat_key="sampling_history_stack_pad_ms",
+            device=sample_logits.device,
+        )
         history_mask = None
         if padded_histories is None:
-            padded_histories, history_mask = _pad_token_sequences(histories)
-        probs = logits_to_probs(
-            logits=sample_logits,
-            previous_tokens=padded_histories,
-            previous_token_mask=history_mask,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            temperature=temperature,
+            padded_histories, history_mask = self._time_t2s_call(
+                lambda: _pad_token_sequences(histories),
+                pending_cuda_timings=pending_cuda_timings,
+                stat_key="sampling_history_stack_pad_ms",
+                device=sample_logits.device,
+            )
+        probs = self._time_t2s_call(
+            lambda: logits_to_probs(
+                logits=sample_logits,
+                previous_tokens=padded_histories,
+                previous_token_mask=history_mask,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                temperature=temperature,
+            ),
+            pending_cuda_timings=pending_cuda_timings,
+            stat_key="sampling_logits_to_probs_ms",
+            device=sample_logits.device,
         )
-        sampled = multinomial_sample_one_no_sync(probs)
-        argmax_tokens = torch.argmax(sample_logits, dim=-1)
+        sampled = self._time_t2s_call(
+            lambda: multinomial_sample_one_no_sync(probs),
+            pending_cuda_timings=pending_cuda_timings,
+            stat_key="sampling_multinomial_ms",
+            device=probs.device,
+        )
+        argmax_tokens = self._time_t2s_call(
+            lambda: torch.argmax(sample_logits, dim=-1),
+            pending_cuda_timings=pending_cuda_timings,
+            stat_key="sampling_argmax_ms",
+            device=sample_logits.device,
+        )
+        if pending_cuda_timings is not None:
+            self._flush_t2s_timing_records(stats, pending_cuda_timings, device=sample_logits.device)
         return sampled, argmax_tokens
 
     def _batched_sample_by_group(
@@ -2395,35 +2508,76 @@ class GPTSoVITSRuntime:
         logits: torch.Tensor,
         histories: Sequence[torch.LongTensor],
         sampling_keys: Sequence[tuple[int, float, float, float, bool]],
+        *,
+        stats: dict[str, Any] | None = None,
     ) -> tuple[list[torch.Tensor], list[int]]:
         logits_to_probs, multinomial_sample_one_no_sync = self._get_sampling_ops()
         sampled_list: list[torch.Tensor | None] = [None] * len(histories)
         argmax_list: list[int | None] = [None] * len(histories)
+        pending_cuda_timings: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] | None = (
+            [] if stats is not None else None
+        )
         for group_key, group_indices in self._iter_contiguous_sampling_groups(sampling_keys):
             top_k, top_p, temperature, repetition_penalty, trim_eos = group_key
-            index_tensor = torch.tensor(group_indices, dtype=torch.long, device=logits.device)
-            group_logits = torch.index_select(logits, dim=0, index=index_tensor)
+            index_tensor = self._time_t2s_call(
+                lambda: torch.tensor(group_indices, dtype=torch.long, device=logits.device),
+                pending_cuda_timings=pending_cuda_timings,
+                stat_key="sampling_group_select_ms",
+                device=logits.device,
+            )
+            group_logits = self._time_t2s_call(
+                lambda: torch.index_select(logits, dim=0, index=index_tensor),
+                pending_cuda_timings=pending_cuda_timings,
+                stat_key="sampling_group_select_ms",
+                device=logits.device,
+            )
             if trim_eos:
                 group_logits = group_logits[:, :-1]
             group_histories = [histories[index] for index in group_indices]
-            padded_histories = self._stack_token_sequences_if_same_length(group_histories)
+            padded_histories = self._time_t2s_call(
+                lambda: self._stack_token_sequences_if_same_length(group_histories),
+                pending_cuda_timings=pending_cuda_timings,
+                stat_key="sampling_history_stack_pad_ms",
+                device=group_logits.device,
+            )
             history_mask = None
             if padded_histories is None:
-                padded_histories, history_mask = _pad_token_sequences(group_histories)
-            probs = logits_to_probs(
-                logits=group_logits,
-                previous_tokens=padded_histories,
-                previous_token_mask=history_mask,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                temperature=temperature,
+                padded_histories, history_mask = self._time_t2s_call(
+                    lambda: _pad_token_sequences(group_histories),
+                    pending_cuda_timings=pending_cuda_timings,
+                    stat_key="sampling_history_stack_pad_ms",
+                    device=group_logits.device,
+                )
+            probs = self._time_t2s_call(
+                lambda: logits_to_probs(
+                    logits=group_logits,
+                    previous_tokens=padded_histories,
+                    previous_token_mask=history_mask,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    temperature=temperature,
+                ),
+                pending_cuda_timings=pending_cuda_timings,
+                stat_key="sampling_logits_to_probs_ms",
+                device=group_logits.device,
             )
-            argmax_tokens = torch.argmax(group_logits, dim=-1)
+            argmax_tokens = self._time_t2s_call(
+                lambda: torch.argmax(group_logits, dim=-1),
+                pending_cuda_timings=pending_cuda_timings,
+                stat_key="sampling_argmax_ms",
+                device=group_logits.device,
+            )
             for local_index, global_index in enumerate(group_indices):
-                sampled_list[global_index] = multinomial_sample_one_no_sync(probs[local_index : local_index + 1])
+                sampled_list[global_index] = self._time_t2s_call(
+                    lambda current_index=local_index: multinomial_sample_one_no_sync(probs[current_index : current_index + 1]),
+                    pending_cuda_timings=pending_cuda_timings,
+                    stat_key="sampling_multinomial_ms",
+                    device=probs.device,
+                )
                 argmax_list[global_index] = int(argmax_tokens[local_index].item())
-
+        if pending_cuda_timings is not None:
+            self._flush_t2s_timing_records(stats, pending_cuda_timings, device=logits.device)
         return [item for item in sampled_list if item is not None], [int(item) for item in argmax_list if item is not None]
 
     def _sample_active_batch_requests(
@@ -2433,10 +2587,72 @@ class GPTSoVITSRuntime:
         logits: torch.Tensor,
         *,
         max_steps: int,
+        stats: dict[str, Any] | None = None,
     ) -> tuple[list[GPTSoVITSARFinishedItem], list[int], list[torch.LongTensor]]:
+        sampling_started = time.perf_counter()
         finished_items: list[GPTSoVITSARFinishedItem] = []
         keep_indices: list[int] = []
         updated_sequences: list[torch.LongTensor] = []
+
+        if len(active_batch.states) == 1:
+            self._increment_t2s_stat(stats, "sampling_single_request_calls")
+            state = active_batch.states[0]
+            step_index = int(active_batch.step_indices[0].item())
+            sampling_key = self._sampling_group_key(
+                top_k=state.top_k,
+                top_p=state.top_p,
+                temperature=state.temperature,
+                repetition_penalty=state.repetition_penalty,
+                trim_eos=step_index < 11,
+            )
+            sampled_tensor, argmax_tensor = self._batched_sample_uniform(
+                logits=logits,
+                histories=active_batch.y_sequences,
+                sampling_key=sampling_key,
+                stats=stats,
+            )
+            finish_scan_started = time.perf_counter()
+            sampled_token = int(sampled_tensor[0].item())
+            argmax_token = int(argmax_tensor[0].item())
+            current_history = active_batch.y_sequences[0]
+            new_history = torch.cat([current_history, sampled_tensor.view(-1)], dim=0)
+            prefix_len = int(active_batch.prefix_lens[0].item())
+
+            if (
+                state.early_stop_num == -1
+                and step_index + 1 < max_steps
+                and sampled_token != model.EOS
+                and argmax_token != model.EOS
+            ):
+                self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+                self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
+                return [], [0], [new_history]
+
+            finish_reason: str | None = None
+            if state.early_stop_num != -1 and (new_history.shape[0] - prefix_len) > state.early_stop_num:
+                finish_reason = "early_stop"
+            elif step_index + 1 >= max_steps:
+                finish_reason = "max_step"
+            elif sampled_token == model.EOS:
+                finish_reason = "eos_sample"
+            elif argmax_token == model.EOS:
+                finish_reason = "eos_argmax"
+
+            if finish_reason is not None:
+                finished_items.append(
+                    GPTSoVITSARFinishedItem(
+                        request_id=str(state.request_id),
+                        semantic_tokens=new_history[prefix_len:-1].clone(),
+                        finish_idx=step_index,
+                        finish_reason=finish_reason,
+                    )
+                )
+                self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+                self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
+                return finished_items, [], []
+            self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+            self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
+            return [], [0], [new_history]
 
         uniform_sampling_key = self._uniform_sampling_group_key(active_batch)
         sampled_items: list[torch.Tensor]
@@ -2444,13 +2660,16 @@ class GPTSoVITSRuntime:
         sampled_token_tensor: torch.Tensor | None = None
         argmax_token_tensor: torch.Tensor | None = None
         if uniform_sampling_key is not None:
+            self._increment_t2s_stat(stats, "sampling_uniform_calls")
             sampled_tensor, argmax_tensor = self._batched_sample_uniform(
                 logits=logits,
                 histories=active_batch.y_sequences,
                 sampling_key=uniform_sampling_key,
+                stats=stats,
             )
             sampled_token_tensor = sampled_tensor.view(-1)
             argmax_token_tensor = argmax_tensor.view(-1)
+            finish_scan_started = time.perf_counter()
             stacked_histories = self._stack_token_sequences_if_same_length(active_batch.y_sequences)
             if (
                 all(state.early_stop_num == -1 for state in active_batch.states)
@@ -2458,6 +2677,8 @@ class GPTSoVITSRuntime:
                 and not bool(sampled_token_tensor.eq(model.EOS).any().item())
                 and not bool(argmax_token_tensor.eq(model.EOS).any().item())
             ):
+                self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+                self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
                 return (
                     [],
                     list(range(len(active_batch.states))),
@@ -2468,9 +2689,11 @@ class GPTSoVITSRuntime:
                         for index, history in enumerate(active_batch.y_sequences)
                     ],
                 )
+            self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
             sampled_items = [sampled_tensor[index : index + 1] for index in range(sampled_tensor.shape[0])]
             argmax_tokens = [int(item) for item in argmax_tensor.tolist()]
         else:
+            self._increment_t2s_stat(stats, "sampling_grouped_calls")
             sampling_keys = [
                 self._sampling_group_key(
                     top_k=state.top_k,
@@ -2485,8 +2708,10 @@ class GPTSoVITSRuntime:
                 logits=logits,
                 histories=active_batch.y_sequences,
                 sampling_keys=sampling_keys,
+                stats=stats,
             )
 
+        finish_scan_started = time.perf_counter()
         for batch_index, state in enumerate(active_batch.states):
             step_index = int(active_batch.step_indices[batch_index].item())
             current_history = active_batch.y_sequences[batch_index]
@@ -2525,6 +2750,8 @@ class GPTSoVITSRuntime:
             else:
                 keep_indices.append(batch_index)
                 updated_sequences.append(new_history)
+        self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+        self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
         return finished_items, keep_indices, updated_sequences
 
     def _decode_active_batch_one_step(
@@ -2533,15 +2760,55 @@ class GPTSoVITSRuntime:
         active_batch: Any,
         *,
         max_steps: int,
+        stats: dict[str, Any] | None = None,
     ) -> tuple[Any | None, list[GPTSoVITSARFinishedItem]]:
         was_prefill = not active_batch.prefill_done
+        stage_started = time.perf_counter()
+        timing_device = active_batch.xy_pos.device if isinstance(getattr(active_batch, "xy_pos", None), torch.Tensor) else None
+        pending_cuda_timings: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] | None = (
+            [] if stats is not None else None
+        )
+
+        def _record_stage(path: str, current_active_batch: Any | None) -> None:
+            if stats is None:
+                return
+            elapsed_ms = (time.perf_counter() - stage_started) * 1000.0
+            if was_prefill:
+                stats["prefill_calls"] = int(stats.get("prefill_calls", 0)) + 1
+                stats["prefill_wall_ms"] = float(stats.get("prefill_wall_ms", 0.0)) + float(elapsed_ms)
+            else:
+                stats["decode_calls"] = int(stats.get("decode_calls", 0)) + 1
+                stats["decode_wall_ms"] = float(stats.get("decode_wall_ms", 0.0)) + float(elapsed_ms)
+                if path == "pooled":
+                    stats["pooled_decode_calls"] = int(stats.get("pooled_decode_calls", 0)) + 1
+                    stats["pooled_decode_wall_ms"] = float(stats.get("pooled_decode_wall_ms", 0.0)) + float(elapsed_ms)
+                else:
+                    stats["dynamic_decode_calls"] = int(stats.get("dynamic_decode_calls", 0)) + 1
+                    stats["dynamic_decode_wall_ms"] = float(stats.get("dynamic_decode_wall_ms", 0.0)) + float(elapsed_ms)
+            if current_active_batch is not None:
+                stats["max_batch_size_seen"] = max(
+                    int(stats.get("max_batch_size_seen", 0)),
+                    int(len(getattr(current_active_batch, "request_ids", []) or [])),
+                )
+                kv_lens = getattr(current_active_batch, "kv_lens", None)
+                if kv_lens is not None and getattr(kv_lens, "numel", lambda: 0)() > 0:
+                    stats["max_kv_len_seen"] = max(
+                        int(stats.get("max_kv_len_seen", 0)),
+                        int(kv_lens.max().item()),
+                    )
+
         if was_prefill:
             if active_batch.prefill_attn_mask is None or active_batch.key_padding_mask is None:
                 raise ValueError("GPT-SoVITS AR prefill stage is missing masks")
-            xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.process_prompt(
-                active_batch.xy_pos,
-                active_batch.prefill_attn_mask,
-                None,
+            xy_dec, active_batch.k_cache, active_batch.v_cache = self._time_t2s_call(
+                lambda: model.t2s_transformer.process_prompt(
+                    active_batch.xy_pos,
+                    active_batch.prefill_attn_mask,
+                    None,
+                ),
+                pending_cuda_timings=pending_cuda_timings,
+                stat_key="prefill_transformer_ms",
+                device=timing_device,
             )
             active_batch.kv_lens = active_batch.x_lens + active_batch.prefix_lens
             if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
@@ -2586,29 +2853,55 @@ class GPTSoVITSRuntime:
                         ),
                     )
                 else:
-                    batched_decode_attn_mask = pool.build_decode_mask(next_kv_lens)
-                    xy_dec, active_batch.k_cache, active_batch.v_cache = model.decode_next_token_prealloc_runtime(
-                        active_batch.xy_pos,
-                        active_batch.k_cache,
-                        active_batch.v_cache,
-                        active_batch.kv_lens,
-                        batched_decode_attn_mask,
+                    batched_decode_attn_mask = self._time_t2s_call(
+                        lambda: pool.build_decode_mask(next_kv_lens),
+                        pending_cuda_timings=pending_cuda_timings,
+                        stat_key="pooled_build_decode_mask_ms",
+                        device=timing_device,
                     )
-                    logits = model.ar_predict_layer(xy_dec[:, -1])
+                    xy_dec, active_batch.k_cache, active_batch.v_cache = self._time_t2s_call(
+                        lambda: model.decode_next_token_prealloc_runtime(
+                            active_batch.xy_pos,
+                            active_batch.k_cache,
+                            active_batch.v_cache,
+                            active_batch.kv_lens,
+                            batched_decode_attn_mask,
+                        ),
+                        pending_cuda_timings=pending_cuda_timings,
+                        stat_key="pooled_prealloc_decode_kernel_ms",
+                        device=timing_device,
+                    )
+                    logits = self._time_t2s_call(
+                        lambda: model.ar_predict_layer(xy_dec[:, -1]),
+                        pending_cuda_timings=pending_cuda_timings,
+                        stat_key="ar_predict_layer_ms",
+                        device=xy_dec.device,
+                    )
+                    self._merge_numeric_t2s_stats(
+                        stats,
+                        getattr(model, "get_last_prealloc_decode_profile", lambda: {})(),
+                    )
+                    if pending_cuda_timings is not None:
+                        self._flush_t2s_timing_records(stats, pending_cuda_timings, device=xy_dec.device)
                     finished_items, keep_indices, updated_sequences = self._sample_active_batch_requests(
                         model,
                         active_batch,
                         logits,
                         max_steps=max_steps,
+                        stats=stats,
                     )
                     if len(keep_indices) == 0:
                         self._set_kv_pool_active_rows(model, 0)
+                        _record_stage("pooled", None)
                         return None, finished_items
                     if len(keep_indices) == len(active_batch.request_ids):
                         active_batch.y_sequences = updated_sequences
                         active_batch.step_indices = active_batch.step_indices + 1
                         active_batch.kv_lens = active_batch.kv_lens + 1
+                        xy_pos_started = time.perf_counter()
                         active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+                        self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
+                        _record_stage("pooled", active_batch)
                         return active_batch, finished_items
                     device = logits.device
                     keep_tensor = torch.tensor(keep_indices, dtype=torch.long, device=device)
@@ -2645,32 +2938,59 @@ class GPTSoVITSRuntime:
                             active_batch.kv_lens,
                             device=active_batch.k_cache[0].device,
                         )
+                    xy_pos_started = time.perf_counter()
                     active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+                    self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
+                    _record_stage("pooled", active_batch)
                     return active_batch, finished_items
             batched_decode_attn_mask = None
             if active_batch.decode_attn_mask is not None:
-                batched_decode_attn_mask = self._materialize_decode_mask_for_active_batch(active_batch)
+                batched_decode_attn_mask = self._time_t2s_call(
+                    lambda: self._materialize_decode_mask_for_active_batch(active_batch),
+                    pending_cuda_timings=pending_cuda_timings,
+                    stat_key="dynamic_materialize_decode_mask_ms",
+                    device=timing_device,
+                )
                 if not batched_decode_attn_mask.any().item():
                     batched_decode_attn_mask = None
-            xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.decode_next_token(
-                active_batch.xy_pos,
-                active_batch.k_cache,
-                active_batch.v_cache,
-                batched_decode_attn_mask,
+            xy_dec, active_batch.k_cache, active_batch.v_cache = self._time_t2s_call(
+                lambda: model.t2s_transformer.decode_next_token(
+                    active_batch.xy_pos,
+                    active_batch.k_cache,
+                    active_batch.v_cache,
+                    batched_decode_attn_mask,
+                ),
+                pending_cuda_timings=pending_cuda_timings,
+                stat_key="dynamic_decode_kernel_ms",
+                device=timing_device,
             )
-            active_batch.decode_attn_mask = self._advance_decode_mask(active_batch.decode_attn_mask, active_batch.kv_lens)
+            active_batch.decode_attn_mask = self._time_t2s_call(
+                lambda: self._advance_decode_mask(active_batch.decode_attn_mask, active_batch.kv_lens),
+                pending_cuda_timings=pending_cuda_timings,
+                stat_key="dynamic_advance_decode_mask_ms",
+                device=timing_device,
+            )
 
-        logits = model.ar_predict_layer(xy_dec[:, -1])
+        logits = self._time_t2s_call(
+            lambda: model.ar_predict_layer(xy_dec[:, -1]),
+            pending_cuda_timings=pending_cuda_timings,
+            stat_key="ar_predict_layer_ms",
+            device=xy_dec.device,
+        )
+        if pending_cuda_timings is not None:
+            self._flush_t2s_timing_records(stats, pending_cuda_timings, device=xy_dec.device)
         finished_items, keep_indices, updated_sequences = self._sample_active_batch_requests(
             model,
             active_batch,
             logits,
             max_steps=max_steps,
+            stats=stats,
         )
 
         if len(keep_indices) == 0:
             if active_batch.kv_cache_pooled:
                 self._set_kv_pool_active_rows(model, 0)
+            _record_stage("prefill" if was_prefill else "dynamic", None)
             return None, finished_items
 
         if len(keep_indices) == len(active_batch.request_ids):
@@ -2678,7 +2998,10 @@ class GPTSoVITSRuntime:
             active_batch.step_indices = active_batch.step_indices + 1
             if not was_prefill and active_batch.kv_lens is not None:
                 active_batch.kv_lens = active_batch.kv_lens + 1
+            xy_pos_started = time.perf_counter()
             active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+            self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
+            _record_stage("prefill" if was_prefill else "dynamic", active_batch)
             return active_batch, finished_items
 
         device = logits.device
@@ -2716,7 +3039,10 @@ class GPTSoVITSRuntime:
                     active_batch.kv_lens,
                 )
 
+        xy_pos_started = time.perf_counter()
         active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+        self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
+        _record_stage("prefill" if was_prefill else "dynamic", active_batch)
         return active_batch, finished_items
 
     def _run_prefill_active_batch(
@@ -2725,11 +3051,12 @@ class GPTSoVITSRuntime:
         states: Sequence[Any],
         *,
         max_steps: int,
+        stats: dict[str, Any] | None = None,
     ) -> tuple[Any | None, list[GPTSoVITSARFinishedItem]]:
         if not states:
             return None, []
         active_batch = self._build_prefill_active_batch(model, states)
-        return self._decode_active_batch_one_step(model, active_batch, max_steps=max_steps)
+        return self._decode_active_batch_one_step(model, active_batch, max_steps=max_steps, stats=stats)
 
     def _merge_active_batches(
         self,
@@ -2840,12 +3167,60 @@ class GPTSoVITSRuntime:
         *,
         max_steps: int,
     ) -> list[GPTSoVITSARFinishedItem]:
+        pool = self._get_kv_pool(model)
+        pool_snapshot_start = None if pool is None else dict(pool.snapshot())
+        stats: dict[str, Any] = {
+            "request_count": int(len(states)),
+            "max_steps_limit": int(max_steps),
+            "scheduler_ticks": 0,
+            "prefill_calls": 0,
+            "prefill_wall_ms": 0.0,
+            "decode_calls": 0,
+            "decode_wall_ms": 0.0,
+            "pooled_decode_calls": 0,
+            "pooled_decode_wall_ms": 0.0,
+            "dynamic_decode_calls": 0,
+            "dynamic_decode_wall_ms": 0.0,
+            "max_batch_size_seen": 0,
+            "max_kv_len_seen": 0,
+            "pool_snapshot_start": pool_snapshot_start,
+            "prefill_transformer_ms": 0.0,
+            "pooled_build_decode_mask_ms": 0.0,
+            "pooled_prealloc_decode_kernel_ms": 0.0,
+            "pooled_prealloc_profiled_decode_calls": 0,
+            "pooled_prealloc_profiled_layer_calls": 0,
+            "pooled_prealloc_qkv_linear_ms": 0.0,
+            "pooled_prealloc_kv_write_ms": 0.0,
+            "pooled_prealloc_kv_context_ms": 0.0,
+            "pooled_prealloc_sdpa_ms": 0.0,
+            "pooled_prealloc_out_proj_ms": 0.0,
+            "pooled_prealloc_norm1_ms": 0.0,
+            "pooled_prealloc_ffn_ms": 0.0,
+            "pooled_prealloc_norm2_ms": 0.0,
+            "pooled_prealloc_layer_total_ms": 0.0,
+            "dynamic_materialize_decode_mask_ms": 0.0,
+            "dynamic_decode_kernel_ms": 0.0,
+            "dynamic_advance_decode_mask_ms": 0.0,
+            "ar_predict_layer_ms": 0.0,
+            "sampling_total_ms": 0.0,
+            "sampling_history_stack_pad_ms": 0.0,
+            "sampling_logits_to_probs_ms": 0.0,
+            "sampling_multinomial_ms": 0.0,
+            "sampling_argmax_ms": 0.0,
+            "sampling_group_select_ms": 0.0,
+            "sampling_finish_scan_ms": 0.0,
+            "sampling_single_request_calls": 0,
+            "sampling_uniform_calls": 0,
+            "sampling_grouped_calls": 0,
+            "xy_pos_update_ms": 0.0,
+        }
         pending = sorted(states, key=lambda item: (item.ready_step, item.request_id))
         active_batch: Any | None = None
         finished: list[GPTSoVITSARFinishedItem] = []
         current_tick = 0
 
         while pending or active_batch is not None:
+            stats["scheduler_ticks"] = int(stats["scheduler_ticks"]) + 1
             admitted: list[Any] = []
             while pending and pending[0].ready_step <= current_tick:
                 admitted.append(pending.pop(0))
@@ -2854,15 +3229,26 @@ class GPTSoVITSRuntime:
                 model,
                 admitted,
                 max_steps=max_steps,
+                stats=stats,
             )
             finished.extend(admitted_finished)
             active_batch = self._merge_active_batches(model, active_batch, admitted_active_batch)
 
             if active_batch is not None:
+                if active_batch.kv_lens is not None and active_batch.kv_lens.numel() > 0:
+                    stats["max_kv_len_seen"] = max(
+                        int(stats["max_kv_len_seen"]),
+                        int(active_batch.kv_lens.max().item()),
+                    )
+                stats["max_batch_size_seen"] = max(
+                    int(stats["max_batch_size_seen"]),
+                    int(len(active_batch.request_ids)),
+                )
                 active_batch, step_finished = self._decode_active_batch_one_step(
                     model,
                     active_batch,
                     max_steps=max_steps,
+                    stats=stats,
                 )
                 finished.extend(step_finished)
 
@@ -2873,6 +3259,16 @@ class GPTSoVITSRuntime:
             current_tick += 1
 
         finished.sort(key=lambda item: item.request_id)
+        pool = self._get_kv_pool(model)
+        pool_snapshot_end = None if pool is None else dict(pool.snapshot())
+        stats["pool_snapshot_end"] = pool_snapshot_end
+        if isinstance(pool_snapshot_start, dict) and isinstance(pool_snapshot_end, dict):
+            stats["pool_pack_hits_delta"] = int(pool_snapshot_end.get("pack_hits", 0)) - int(pool_snapshot_start.get("pack_hits", 0))
+            stats["pool_fallback_count_delta"] = int(pool_snapshot_end.get("fallback_count", 0)) - int(
+                pool_snapshot_start.get("fallback_count", 0)
+            )
+            stats["pool_last_fallback_reason"] = str(pool_snapshot_end.get("last_fallback_reason", ""))
+        self._last_t2s_scheduler_stats = stats
         return finished
 
     @staticmethod
@@ -2974,10 +3370,9 @@ class GPTSoVITSRuntime:
                         for wav0 in wav
                     ]
                 )
-                model_device = next(sv_self.embedding_model.parameters()).device
-                feat = feat.to(device=model_device)
-                if getattr(sv_self, "is_half", False):
-                    feat = feat.half()
+                model_param = next(sv_self.embedding_model.parameters())
+                model_device = model_param.device
+                feat = feat.to(device=model_device, dtype=model_param.dtype)
                 return sv_self.embedding_model.forward3(feat)
 
         sv_model.compute_embedding3 = types.MethodType(_compute_embedding3_float32_fbank, sv_model)
@@ -2997,6 +3392,7 @@ class GPTSoVITSRuntime:
             prompt_lang=str(inputs["prompt_lang"]),
             text=str(inputs["text"]),
             text_lang=str(inputs["text_lang"]),
+            text_split_method=str(inputs["text_split_method"]),
             top_k=int(inputs["top_k"]),
             top_p=float(inputs["top_p"]),
             temperature=float(inputs["temperature"]),
@@ -3094,8 +3490,17 @@ class GPTSoVITSRuntime:
             for payload in payloads
         ]
 
-    def _prepare_text_cpu(self, text: str, language: str) -> Any:
+    def _prepare_text_cpu(self, text: str, language: str, text_split_method: str = "cut1") -> Any:
         version = self._current_text_frontend_version()
+        pipeline = self._ensure_pipeline()
+        text_preprocessor = getattr(pipeline, "text_preprocessor", None)
+        if text_preprocessor is not None:
+            return text_preprocessor.preprocess_text_segments(
+                text,
+                language,
+                version,
+                text_split_method=text_split_method,
+            )
         payloads = self._preprocess_text_segments_payload(text, language, version)
         return self._payloads_to_prepared_text_segments(payloads)
 
@@ -3839,7 +4244,13 @@ class GPTSoVITSRuntime:
             profile["bert_stage_slots"] = float(limiter_stats.get("slots", 0.0))
         if len(word2ph) != len(text):
             raise ValueError("中文文本 word2ph 与文本长度不一致，无法提取 BERT 特征")
-        phone_level_feature = [hidden[index].repeat(int(phone_count), 1) for index, phone_count in enumerate(word2ph)]
+        phone_level_feature = [
+            hidden[index].repeat(int(phone_count), 1)
+            for index, phone_count in enumerate(word2ph)
+            if int(phone_count) > 0
+        ]
+        if not phone_level_feature:
+            return self._empty_bert_feature(0, device)
         return torch.cat(phone_level_feature, dim=0).T.to(device)
 
     def _build_segment_bert_feature(
@@ -4261,6 +4672,7 @@ class GPTSoVITSRuntime:
         coordinator: Any,
         text: str,
         language: str,
+        text_split_method: str = "cut1",
     ) -> GPTSoVITSPrepareProfiledResult:
         coordinator = self._coerce_prepare_coordinator(coordinator)
         await coordinator.text_cpu_gate.acquire()
@@ -4282,12 +4694,18 @@ class GPTSoVITSRuntime:
         try:
             if text_cpu_worker is not None:
                 submit_at = time.perf_counter()
-                result, worker_profile = await text_cpu_worker.submit_async(text, language)
+                result, worker_profile = await text_cpu_worker.submit_async(text, language, text_split_method)
                 return self._build_text_cpu_profiled_result(submit_at, result, dict(worker_profile))
             if executor is None:
                 submit_at = time.perf_counter()
-                return self._prepare_run_profiled(self._prepare_text_cpu, submit_at, text, language)
-            return await self._prepare_run_on_executor(executor, self._prepare_text_cpu, text, language)
+                return self._prepare_run_profiled(self._prepare_text_cpu, submit_at, text, language, text_split_method)
+            return await self._prepare_run_on_executor(
+                executor,
+                self._prepare_text_cpu,
+                text,
+                language,
+                text_split_method,
+            )
         finally:
             coordinator.text_cpu_gate.release()
 
@@ -4298,6 +4716,7 @@ class GPTSoVITSRuntime:
         prompt_lang: str,
         text: str,
         text_lang: str,
+        text_split_method: str = "cut1",
     ) -> tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult]:
         coordinator = self._coerce_prepare_coordinator(coordinator)
         self._ensure_pipeline()
@@ -4307,8 +4726,12 @@ class GPTSoVITSRuntime:
             or not hasattr(text_cpu_worker, "submit_many_async")
             or int(getattr(coordinator.text_cpu_gate, "max_inflight", 0)) > 0
         ):
-            prompt_cpu_task = asyncio.create_task(self._run_text_cpu_stage(coordinator, prompt_text, prompt_lang))
-            target_cpu_task = asyncio.create_task(self._run_text_cpu_stage(coordinator, text, text_lang))
+            prompt_cpu_task = asyncio.create_task(
+                self._run_text_cpu_stage(coordinator, prompt_text, prompt_lang, text_split_method)
+            )
+            target_cpu_task = asyncio.create_task(
+                self._run_text_cpu_stage(coordinator, text, text_lang, text_split_method)
+            )
             return await asyncio.gather(prompt_cpu_task, target_cpu_task)
 
         items = []
@@ -4324,7 +4747,7 @@ class GPTSoVITSRuntime:
                     finished_at=submit_at,
                 )
                 continue
-            items.append((item_text, item_lang))
+            items.append((item_text, item_lang, text_split_method))
             item_indices.append(index)
 
         if items:
@@ -4366,6 +4789,7 @@ class GPTSoVITSRuntime:
                 spec.prompt_lang,
                 text,
                 spec.text_lang,
+                spec.text_split_method,
             )
             return GPTSoVITSNativePreparedCpuStage(
                 spec=spec,
@@ -4403,7 +4827,12 @@ class GPTSoVITSRuntime:
         prepare_start = time.perf_counter()
         text = spec.text.strip("\n")
         try:
-            target_cpu_profiled = await self._run_text_cpu_stage(coordinator, text, spec.text_lang)
+            target_cpu_profiled = await self._run_text_cpu_stage(
+                coordinator,
+                text,
+                spec.text_lang,
+                spec.text_split_method,
+            )
             return GPTSoVITSNativePreparedCpuStage(
                 spec=spec,
                 prepare_submit_at=float(prepare_submit_at),
@@ -7366,6 +7795,329 @@ class GPTSoVITSRuntime:
         return audio, y_mask
 
     @staticmethod
+    def _get_vits_streaming_chunk_tokens() -> int:
+        raw_value = str(os.environ.get("GPTSOVITS_VITS_STREAMING_CHUNK_TOKENS", "128")).strip()
+        try:
+            return max(0, int(raw_value))
+        except Exception:
+            return 128
+
+    @staticmethod
+    def _get_vits_streaming_overlap_tokens() -> int:
+        raw_value = str(os.environ.get("GPTSOVITS_VITS_STREAMING_OVERLAP_TOKENS", "2")).strip()
+        try:
+            return max(0, int(raw_value))
+        except Exception:
+            return 2
+
+    @staticmethod
+    def _get_vits_streaming_alignment_mode() -> str:
+        return str(os.environ.get("GPTSOVITS_VITS_STREAMING_ALIGNMENT_MODE", "local_window")).strip().lower()
+
+    def _run_vits_non_vocoder_streaming_chunk(
+        self,
+        vits_model: Any,
+        *,
+        codes: torch.Tensor,
+        text: torch.Tensor,
+        ge: torch.Tensor,
+        speed: float,
+        result_length: int | None,
+        overlap_frames: torch.Tensor | None,
+        padding_length: int | None = 0,
+        noise_scale: float = 0.5,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        quantized = vits_model.quantizer.decode(codes)
+        if getattr(vits_model, "semantic_frame_rate", "") == "25hz":
+            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+            result_length = (2 * int(result_length)) if result_length is not None else None
+            padding_length = (2 * int(padding_length)) if padding_length is not None else None
+        y_lengths = torch.LongTensor([int(codes.size(2) * 2)]).to(codes.device)
+        text_lengths = torch.LongTensor([int(text.size(-1))]).to(text.device)
+        x, m_p, logs_p, y_mask, latent, latent_mask = vits_model.enc_p(
+            quantized,
+            y_lengths,
+            text,
+            text_lengths,
+            vits_model.ge_to512(ge.transpose(2, 1)).transpose(2, 1)
+            if bool(getattr(vits_model, "is_v2pro", False))
+            else ge,
+            speed,
+            result_length=result_length,
+            overlap_frames=overlap_frames,
+            padding_length=padding_length,
+        )
+        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * float(noise_scale)
+        z = vits_model.flow(z_p, y_mask, g=ge, reverse=True)
+        decoder_input = (z * y_mask)[:, :, :]
+        use_compiled_decoder = str(os.environ.get("GPTSOVITS_VITS_STREAMING_USE_COMPILED_DEC", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        audio = (
+            vits_model._decode_audio_runtime(decoder_input, g=ge)
+            if use_compiled_decoder
+            else vits_model.dec(decoder_input, g=ge)
+        )
+        return audio, latent, latent_mask
+
+    def _run_vits_non_vocoder_streaming_decode(
+        self,
+        pipeline: Any,
+        vits_model: Any,
+        *,
+        semantic_tokens: torch.Tensor,
+        phones: torch.Tensor,
+        ge: torch.Tensor,
+        speed: float,
+        chunk_tokens: int,
+        overlap_tokens: int,
+    ) -> torch.Tensor:
+        min_chunk_tokens_raw = str(os.environ.get("GPTSOVITS_VITS_STREAMING_MIN_CHUNK_TOKENS", "32")).strip()
+        try:
+            min_chunk_tokens = max(8, int(min_chunk_tokens_raw))
+        except Exception:
+            min_chunk_tokens = 32
+        current_chunk_tokens = max(chunk_tokens, min_chunk_tokens)
+        while True:
+            try:
+                return self._run_vits_non_vocoder_streaming_decode_impl(
+                    pipeline,
+                    vits_model,
+                    semantic_tokens=semantic_tokens,
+                    phones=phones,
+                    ge=ge,
+                    speed=speed,
+                    chunk_tokens=current_chunk_tokens,
+                    overlap_tokens=overlap_tokens,
+                )
+            except torch.OutOfMemoryError:
+                if current_chunk_tokens <= min_chunk_tokens:
+                    raise
+                next_chunk_tokens = max(min_chunk_tokens, current_chunk_tokens // 2)
+                if next_chunk_tokens >= current_chunk_tokens:
+                    raise
+                logger.warning(
+                    "GPT-SoVITS chunked VITS decode OOM at chunk=%d; retrying with chunk=%d",
+                    int(current_chunk_tokens),
+                    int(next_chunk_tokens),
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                current_chunk_tokens = next_chunk_tokens
+
+    def _run_vits_non_vocoder_streaming_decode_local_window_impl(
+        self,
+        pipeline: Any,
+        vits_model: Any,
+        *,
+        semantic_tokens: torch.Tensor,
+        phones: torch.Tensor,
+        ge: torch.Tensor,
+        speed: float,
+        chunk_tokens: int,
+        overlap_tokens: int,
+    ) -> torch.Tensor:
+        total_tokens = int(semantic_tokens.shape[-1])
+        if total_tokens == 0:
+            return torch.zeros((0,), dtype=ge.dtype, device=ge.device)
+        if chunk_tokens <= 0 or total_tokens <= chunk_tokens:
+            raise ValueError("streaming decode helper expects semantic length above chunk threshold")
+
+        upsample_factor = 1
+        for up_layer in getattr(getattr(vits_model, "dec", None), "ups", []):
+            stride = up_layer.stride[0] if isinstance(up_layer.stride, tuple) else int(up_layer.stride)
+            upsample_factor *= int(stride)
+        semantic_rate_scale = 2 if getattr(vits_model, "semantic_frame_rate", "") == "25hz" else 1
+        speed_value = max(float(speed), 1e-6)
+        upsample_rate = float(upsample_factor) * (float(semantic_rate_scale) / speed_value)
+        overlap_size = int(math.ceil(float(overlap_tokens) * upsample_rate))
+
+        audio_fragments: list[torch.Tensor] = []
+        last_audio_chunk: torch.Tensor | None = None
+        last_latent: torch.Tensor | None = None
+        chunk_start = 0
+        total_phones = int(phones.shape[-1])
+        phone_overlap = 0
+        if total_tokens > 0 and overlap_tokens > 0 and total_phones > 0:
+            phone_overlap = max(1, int(math.ceil(float(overlap_tokens) * float(total_phones) / float(total_tokens))))
+
+        while chunk_start < total_tokens:
+            chunk_end = min(total_tokens, chunk_start + chunk_tokens)
+            new_chunk_tokens = int(chunk_end - chunk_start)
+            semantic_chunk = semantic_tokens[chunk_start:chunk_end]
+            is_first_chunk = chunk_start == 0
+            is_final_chunk = chunk_end >= total_tokens
+            overlap_len = min(int(overlap_tokens), max(0, new_chunk_tokens - 1))
+
+            phone_start = 0 if total_phones <= 0 else int((chunk_start * total_phones) // total_tokens)
+            phone_end = total_phones if total_phones <= 0 else int(math.ceil((chunk_end * total_phones) / total_tokens))
+            if not is_first_chunk:
+                phone_start = max(0, phone_start - phone_overlap)
+            phone_end = max(phone_start + 1, min(total_phones, phone_end))
+            phone_chunk = phones[phone_start:phone_end]
+
+            overlap_frames = None
+            if last_latent is not None and overlap_len > 0:
+                overlap_frames = last_latent[
+                    :,
+                    :,
+                    -overlap_len * semantic_rate_scale :,
+                ]
+
+            audio_chunk, latent, _latent_mask = self._run_vits_non_vocoder_streaming_chunk(
+                vits_model,
+                codes=semantic_chunk.unsqueeze(0).unsqueeze(0).to(device=semantic_tokens.device, dtype=torch.long),
+                text=phone_chunk.unsqueeze(0).to(device=phones.device, dtype=torch.long),
+                ge=ge,
+                speed=speed_value,
+                result_length=None,
+                overlap_frames=overlap_frames,
+                padding_length=0,
+            )
+            audio_chunk = audio_chunk.detach()[0, 0, :]
+
+            if is_first_chunk:
+                if is_final_chunk:
+                    audio_fragment = audio_chunk
+                elif overlap_size > 0:
+                    audio_fragment = audio_chunk[:-overlap_size]
+                else:
+                    audio_fragment = audio_chunk
+            elif last_audio_chunk is None:
+                audio_fragment = audio_chunk
+            elif overlap_size > 0:
+                merged_audio = pipeline.sola_algorithm([last_audio_chunk, audio_chunk], overlap_size)
+                start_index = int(last_audio_chunk.shape[0] - overlap_size)
+                audio_fragment = merged_audio[start_index:] if is_final_chunk else merged_audio[start_index:-overlap_size]
+            else:
+                audio_fragment = audio_chunk
+
+            audio_fragments.append(audio_fragment)
+            last_audio_chunk = audio_chunk
+            last_latent = latent
+            chunk_start = chunk_end
+
+        return torch.cat(audio_fragments, dim=0)
+
+    def _run_vits_non_vocoder_streaming_decode_impl(
+        self,
+        pipeline: Any,
+        vits_model: Any,
+        *,
+        semantic_tokens: torch.Tensor,
+        phones: torch.Tensor,
+        ge: torch.Tensor,
+        speed: float,
+        chunk_tokens: int,
+        overlap_tokens: int,
+    ) -> torch.Tensor:
+        alignment_mode = self._get_vits_streaming_alignment_mode()
+        if alignment_mode not in {"prefix_full_text", "prefix_full_phones", "quality"}:
+            return self._run_vits_non_vocoder_streaming_decode_local_window_impl(
+                pipeline,
+                vits_model,
+                semantic_tokens=semantic_tokens,
+                phones=phones,
+                ge=ge,
+                speed=speed,
+                chunk_tokens=chunk_tokens,
+                overlap_tokens=overlap_tokens,
+            )
+
+        total_tokens = int(semantic_tokens.shape[-1])
+        if total_tokens == 0:
+            return torch.zeros((0,), dtype=ge.dtype, device=ge.device)
+        if chunk_tokens <= 0 or total_tokens <= chunk_tokens:
+            raise ValueError("streaming decode helper expects semantic length above chunk threshold")
+
+        upsample_factor = 1
+        for up_layer in getattr(getattr(vits_model, "dec", None), "ups", []):
+            stride = up_layer.stride[0] if isinstance(up_layer.stride, tuple) else int(up_layer.stride)
+            upsample_factor *= int(stride)
+        semantic_rate_scale = 2 if getattr(vits_model, "semantic_frame_rate", "") == "25hz" else 1
+        speed_value = max(float(speed), 1e-6)
+        overlap_size = int(math.ceil(float(overlap_tokens) * float(upsample_factor) * (float(semantic_rate_scale) / speed_value)))
+
+        audio_fragments: list[torch.Tensor] = []
+        last_audio_chunk: torch.Tensor | None = None
+        last_latent: torch.Tensor | None = None
+        chunk_start = 0
+
+        try:
+            while chunk_start < total_tokens:
+                chunk_end = min(total_tokens, chunk_start + chunk_tokens)
+                new_chunk_tokens = int(chunk_end - chunk_start)
+                prefix_semantic = semantic_tokens[:chunk_end]
+                is_first_chunk = chunk_start == 0
+                is_final_chunk = chunk_end >= total_tokens
+                overlap_len = min(int(overlap_tokens), max(0, new_chunk_tokens - 1))
+                if not is_first_chunk and new_chunk_tokens < 10:
+                    overlap_len = min(int(chunk_end), int(overlap_tokens) + int(10 - new_chunk_tokens))
+
+                overlap_frames = None
+                if last_latent is not None and overlap_len > 0:
+                    overlap_frames = last_latent[:, :, -overlap_len * semantic_rate_scale :]
+
+                result_length = None if is_first_chunk else int(new_chunk_tokens + overlap_len)
+                audio_chunk, latent, _latent_mask = self._run_vits_non_vocoder_streaming_chunk(
+                    vits_model,
+                    codes=prefix_semantic.unsqueeze(0).unsqueeze(0).to(device=semantic_tokens.device, dtype=torch.long),
+                    text=phones.unsqueeze(0).to(device=phones.device, dtype=torch.long),
+                    ge=ge,
+                    speed=speed_value,
+                    result_length=result_length,
+                    overlap_frames=overlap_frames,
+                    padding_length=0,
+                )
+                audio_chunk = audio_chunk.detach()[0, 0, :]
+
+                if overlap_len > overlap_tokens:
+                    audio_chunk = audio_chunk[-int((int(overlap_tokens) + int(new_chunk_tokens)) * float(upsample_factor) * (float(semantic_rate_scale) / speed_value)) :]
+
+                if is_first_chunk:
+                    if is_final_chunk:
+                        audio_fragment = audio_chunk
+                    elif overlap_size > 0:
+                        audio_fragment = audio_chunk[:-overlap_size]
+                    else:
+                        audio_fragment = audio_chunk
+                elif last_audio_chunk is None:
+                    audio_fragment = audio_chunk
+                elif overlap_size > 0:
+                    merged_audio = pipeline.sola_algorithm([last_audio_chunk, audio_chunk], overlap_size)
+                    start_index = int(last_audio_chunk.shape[0] - overlap_size)
+                    audio_fragment = merged_audio[start_index:] if is_final_chunk else merged_audio[start_index:-overlap_size]
+                else:
+                    audio_fragment = audio_chunk
+
+                audio_fragments.append(audio_fragment)
+                last_audio_chunk = audio_chunk
+                last_latent = latent
+                chunk_start = chunk_end
+        except torch.OutOfMemoryError:
+            logger.warning(
+                "GPT-SoVITS prefix/full-phone chunked VITS decode OOM at chunk=%d; falling back to local-window decode",
+                int(chunk_tokens),
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return self._run_vits_non_vocoder_streaming_decode_local_window_impl(
+                pipeline,
+                vits_model,
+                semantic_tokens=semantic_tokens,
+                phones=phones,
+                ge=ge,
+                speed=speed,
+                chunk_tokens=chunk_tokens,
+                overlap_tokens=overlap_tokens,
+            )
+
+        return torch.cat(audio_fragments, dim=0)
+
+    @staticmethod
     def _measure_vits_audio_lengths(vits_model: Any, y_mask: torch.Tensor) -> torch.Tensor:
         upsample_factor = 1
         for up_layer in getattr(getattr(vits_model, "dec", None), "ups", []):
@@ -7440,6 +8192,29 @@ class GPTSoVITSRuntime:
             refer_audio_spec,
             sv_emb=sv_emb,
         )
+        chunk_tokens = self._get_vits_streaming_chunk_tokens()
+        if (
+            chunk_tokens > 0
+            and int(prepared.semantic_tokens.shape[-1]) > chunk_tokens
+            and hasattr(pipeline, "sola_algorithm")
+        ):
+            logger.info(
+                "GPT-SoVITS using chunked non-vocoder VITS decode: tokens=%d chunk=%d overlap=%d",
+                int(prepared.semantic_tokens.shape[-1]),
+                int(chunk_tokens),
+                int(self._get_vits_streaming_overlap_tokens()),
+            )
+            audio_fragment = self._run_vits_non_vocoder_streaming_decode(
+                pipeline,
+                vits_model,
+                semantic_tokens=prepared.semantic_tokens,
+                phones=prepared.phones,
+                ge=ge,
+                speed=float(prepared.speed_factor),
+                chunk_tokens=chunk_tokens,
+                overlap_tokens=self._get_vits_streaming_overlap_tokens(),
+            )
+            return audio_fragment, int(self._get_runtime_configs().sampling_rate)
         audio_batch, y_mask = self._run_vits_non_vocoder_decode(
             vits_model,
             codes=prepared.semantic_tokens.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.long),

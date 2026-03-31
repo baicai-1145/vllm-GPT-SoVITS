@@ -331,11 +331,18 @@ class PrepareBertBatchWorker:
                     )
                 phone_level_feature = []
                 for char_index, repeat_count in enumerate(task.word2ph):
+                    repeat_count = int(repeat_count)
+                    if repeat_count <= 0:
+                        continue
                     phone_level_feature.append(char_features[char_index].repeat(repeat_count, 1))
                 worker_queue_wait_ms = max(0.0, (float(task.batch_popped_at) - float(task.enqueued_at)) * 1000.0)
                 batch_collect_wait_ms = max(0.0, (float(batch_collected_ts) - float(task.batch_popped_at)) * 1000.0)
                 batch_dispatch_delay_ms = max(0.0, (float(batch_started) - float(batch_collected_ts)) * 1000.0)
-                task.result_feature = torch.cat(phone_level_feature, dim=0).T
+                task.result_feature = (
+                    torch.cat(phone_level_feature, dim=0).T
+                    if phone_level_feature
+                    else char_features.new_zeros((char_features.shape[-1], 0))
+                )
                 task.profile = {
                     "bert_wait_ms": (batch_started - task.created_at) * 1000.0 + float(limiter_stats["wait_ms"]),
                     "bert_shard_index": float(self.shard_index),
