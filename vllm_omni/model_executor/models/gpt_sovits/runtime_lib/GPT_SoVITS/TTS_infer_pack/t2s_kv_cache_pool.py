@@ -220,6 +220,11 @@ class T2SKVCachePool:
         if next_kv_lens.numel() <= 0:
             return None
         batch_size = int(next_kv_lens.shape[0])
+        if batch_size == 1:
+            next_kv_len = int(next_kv_lens[0].item())
+            if not self.can_handle(batch_size, next_kv_len):
+                self.record_fallback(f"mask_overflow(batch={batch_size},seq={next_kv_len})")
+            return None
         max_kv_len = int(next_kv_lens.max().item())
         if not self.can_handle(batch_size, max_kv_len):
             self.record_fallback(f"mask_overflow(batch={batch_size},seq={max_kv_len})")

@@ -841,9 +841,21 @@ def build_prefill_batch(model: Any, states: Sequence[T2SRequestState]) -> T2SAct
 
 
 def build_next_xy_pos(model: Any, y_sequences: Sequence[torch.LongTensor]) -> torch.Tensor:
+    if not y_sequences:
+        raise ValueError("y_sequences 不能为空")
+    if len(y_sequences) == 1:
+        sequence = y_sequences[0]
+        last_tokens = sequence[-1:].unsqueeze(0)
+        y_emb = model.ar_audio_embedding(last_tokens)
+        position_id = int(sequence.shape[0] - 1)
+        _ensure_audio_pe(model, position_id, y_emb.dtype, y_emb.device)
+        pos_emb = model.ar_audio_position.pe.narrow(1, position_id, 1)
+        return y_emb * model.ar_audio_position.x_scale + model.ar_audio_position.alpha * pos_emb.to(
+            dtype=y_emb.dtype, device=y_emb.device
+        )
     last_tokens = torch.stack([seq[-1:] for seq in y_sequences], dim=0)
     y_emb = model.ar_audio_embedding(last_tokens)
-    position_ids = torch.LongTensor([int(seq.shape[0] - 1) for seq in y_sequences]).to(y_emb.device)
+    position_ids = torch.tensor([int(seq.shape[0] - 1) for seq in y_sequences], dtype=torch.long, device=y_emb.device)
     _ensure_audio_pe(model, int(position_ids.max().item()), y_emb.dtype, y_emb.device)
     pos_emb = model.ar_audio_position.pe[0].index_select(0, position_ids).unsqueeze(1)
     return y_emb * model.ar_audio_position.x_scale + model.ar_audio_position.alpha * pos_emb.to(

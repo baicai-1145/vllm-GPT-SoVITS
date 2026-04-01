@@ -893,7 +893,7 @@ def test_sample_active_batch_requests_uses_runtime_native_uniform_fast_path(tmp_
 
 def test_sample_active_batch_requests_records_single_request_sampling_stats(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
-    runtime._batched_sample_uniform = Mock(  # type: ignore[method-assign]
+    runtime._sample_single_request = Mock(  # type: ignore[method-assign]
         return_value=(
             torch.tensor([[7]], dtype=torch.long),
             torch.tensor([7], dtype=torch.long),
@@ -924,6 +924,38 @@ def test_sample_active_batch_requests_records_single_request_sampling_stats(tmp_
     assert int(stats["sampling_single_request_calls"]) == 1
     assert float(stats["sampling_finish_scan_ms"]) >= 0.0
     assert float(stats["sampling_total_ms"]) >= float(stats["sampling_finish_scan_ms"])
+
+
+def test_sample_single_request_records_sampling_stats(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+
+    def fake_logits_to_probs(**kwargs):
+        logits = kwargs["logits"]
+        return torch.softmax(logits.float(), dim=-1)
+
+    def fake_multinomial_sample_one_no_sync(probs):
+        return torch.argmax(probs, dim=-1, keepdim=True)
+
+    runtime._get_sampling_ops = Mock(return_value=(fake_logits_to_probs, fake_multinomial_sample_one_no_sync))  # type: ignore[method-assign]
+
+    stats: dict[str, float] = {}
+    sampled, argmax_tokens = runtime._sample_single_request(
+        logits=torch.tensor([[0.1, 0.2, 0.9, 0.0]], dtype=torch.float32),
+        history=torch.tensor([1, 2], dtype=torch.long),
+        sampling_key=(5, 0.8, 1.0, 1.1, True),
+        stats=stats,
+    )
+
+    assert sampled.shape == (1, 1)
+    assert argmax_tokens.shape == (1,)
+    assert float(stats["sampling_history_stack_pad_ms"]) == 0.0
+    for key in (
+        "sampling_logits_to_probs_ms",
+        "sampling_multinomial_ms",
+        "sampling_argmax_ms",
+    ):
+        assert key in stats
+        assert stats[key] >= 0.0
 
 
 def test_prepare_decode_request_moves_transport_to_pipeline_device(tmp_path):
@@ -3929,6 +3961,108 @@ def test_decode_active_batch_merges_profiled_prealloc_decode_stats(tmp_path):
     assert float(stats["pooled_prealloc_qkv_linear_ms"]) == 12.5
     assert float(stats["pooled_prealloc_sdpa_ms"]) == 34.0
     assert float(stats["pooled_prealloc_layer_total_ms"]) == 56.0
+
+
+def test_runtime_build_next_xy_pos_single_request_fast_path_matches_expected(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    embedding = nn.Embedding(16, 4)
+    with torch.no_grad():
+        embedding.weight.copy_(torch.arange(64, dtype=torch.float32).reshape(16, 4))
+    audio_position = SimpleNamespace(
+        pe=torch.arange(32, dtype=torch.float32).reshape(1, 8, 4),
+        x_scale=2.0,
+        alpha=0.5,
+        embedding_dim=4,
+        extend_pe=Mock(side_effect=AssertionError("unexpected extend_pe call")),
+    )
+    fake_model = SimpleNamespace(
+        ar_audio_embedding=embedding,
+        ar_audio_position=audio_position,
+    )
+    y_sequences = [torch.tensor([1, 4, 7], dtype=torch.long)]
+
+    xy_pos = runtime._build_next_xy_pos(fake_model, y_sequences)
+
+    expected = embedding(torch.tensor([[7]], dtype=torch.long)) * 2.0 + 0.5 * audio_position.pe[:, 2:3, :]
+    assert torch.allclose(xy_pos, expected)
+
+
+def test_scheduler_build_next_xy_pos_single_request_fast_path_matches_expected():
+    _ensure_vendored_gpt_sovits_import_path()
+    from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.TTS_infer_pack.t2s_scheduler import (
+        build_next_xy_pos,
+    )
+
+    embedding = nn.Embedding(16, 4)
+    with torch.no_grad():
+        embedding.weight.copy_(torch.arange(64, dtype=torch.float32).reshape(16, 4))
+    audio_position = SimpleNamespace(
+        pe=torch.arange(32, dtype=torch.float32).reshape(1, 8, 4),
+        x_scale=2.0,
+        alpha=0.5,
+        embedding_dim=4,
+        extend_pe=Mock(side_effect=AssertionError("unexpected extend_pe call")),
+    )
+    fake_model = SimpleNamespace(
+        ar_audio_embedding=embedding,
+        ar_audio_position=audio_position,
+    )
+    y_sequences = [torch.tensor([2, 5, 9], dtype=torch.long)]
+
+    xy_pos = build_next_xy_pos(fake_model, y_sequences)
+
+    expected = embedding(torch.tensor([[9]], dtype=torch.long)) * 2.0 + 0.5 * audio_position.pe[:, 2:3, :]
+    assert torch.allclose(xy_pos, expected)
+
+
+def test_t2s_kv_cache_pool_build_decode_mask_skips_single_request_padding():
+    _ensure_vendored_gpt_sovits_import_path()
+    from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.TTS_infer_pack.t2s_kv_cache_pool import (
+        T2SKVCachePool,
+    )
+
+    pool = T2SKVCachePool(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        num_layers=1,
+        hidden_dim=2,
+        max_batch_size=2,
+        max_seq_len=8,
+    )
+
+    assert pool.build_decode_mask(torch.tensor([3], dtype=torch.long)) is None
+
+    mask = pool.build_decode_mask(torch.tensor([2, 3], dtype=torch.long))
+
+    assert mask is not None
+    assert torch.equal(mask[0, 0, 0], torch.tensor([False, False, True], dtype=torch.bool))
+    assert torch.equal(mask[1, 0, 0], torch.tensor([False, False, False], dtype=torch.bool))
+
+
+def test_t2s_prepare_prealloc_decode_inputs_clones_x_and_hoists_metadata():
+    _ensure_vendored_gpt_sovits_import_path()
+    from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.AR.models.t2s_model import (
+        Text2SemanticDecoder,
+    )
+
+    base = torch.arange(16, dtype=torch.float32).reshape(1, 2, 8)
+    x = base[:, 1:, :]
+    kv_lens = torch.tensor([5], dtype=torch.long)
+    attn_mask = torch.tensor([[[[False, False, False, True, True, True]]]], dtype=torch.bool)
+
+    stable_x, batch_index, max_kv_index, next_max_kv_len, sdpa_attn_mask = Text2SemanticDecoder._prepare_prealloc_decode_inputs(
+        x,
+        kv_lens,
+        attn_mask,
+    )
+
+    assert stable_x.data_ptr() != x.data_ptr()
+    assert torch.equal(stable_x, x)
+    assert stable_x.is_contiguous()
+    assert torch.equal(batch_index, torch.tensor([0], dtype=torch.long))
+    assert max_kv_index == 5
+    assert next_max_kv_len == 6
+    assert torch.equal(sdpa_attn_mask, torch.tensor([[[[True, True, True, False, False, False]]]], dtype=torch.bool))
 
 
 def test_generate_semantic_tokens_uses_runtime_native_batch_scheduler(tmp_path):

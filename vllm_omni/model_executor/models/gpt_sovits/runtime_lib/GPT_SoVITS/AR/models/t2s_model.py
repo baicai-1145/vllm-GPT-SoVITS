@@ -417,23 +417,50 @@ class Text2SemanticDecoder(nn.Module):
         fn: Callable[[], Any],
         *,
         records: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] | None,
-        stat_key: str,
+        stat_key: str | list[str] | tuple[str, ...],
         device: torch.device | None,
     ) -> Any:
+        stat_keys = [stat_key] if isinstance(stat_key, str) else list(stat_key)
         if records is not None and device is not None and device.type == "cuda" and torch.cuda.is_available():
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
             result = fn()
             end_event.record()
-            records.append((stat_key, start_event, end_event))
+            for key in stat_keys:
+                records.append((key, start_event, end_event))
             return result
 
         started = time.perf_counter()
         result = fn()
         if records is not None:
-            records.append((stat_key, None, (time.perf_counter() - started) * 1000.0))
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            for key in stat_keys:
+                records.append((key, None, elapsed_ms))
         return result
+
+    @staticmethod
+    def _prepare_prealloc_decode_inputs(
+        x: torch.Tensor,
+        kv_lens: torch.LongTensor,
+        attn_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.LongTensor, int, int, Optional[torch.Tensor]]:
+        stable_x = x.clone(memory_format=torch.contiguous_format)
+        batch_index = torch.arange(stable_x.shape[0], device=stable_x.device, dtype=torch.long)
+        max_kv_index = int(kv_lens.max().item())
+        next_max_kv_len = max_kv_index + 1
+        sdpa_attn_mask = None if attn_mask is None else ~attn_mask
+        return stable_x, batch_index, max_kv_index, next_max_kv_len, sdpa_attn_mask
+
+    @staticmethod
+    def _prealloc_kv_bucket_label(next_max_kv_len: int) -> str:
+        boundaries = (1024, 2048, 3072, 4096, 5120)
+        lower = 1
+        for upper in boundaries:
+            if next_max_kv_len <= upper:
+                return f"kv_{lower}_{upper}"
+            lower = upper + 1
+        return f"kv_{boundaries[-1] + 1}_plus"
 
     @staticmethod
     def _flush_t2s_profile_records(
@@ -512,6 +539,32 @@ class Text2SemanticDecoder(nn.Module):
         )
         return x
 
+    @torch.inference_mode()
+    def _decode_next_token_prealloc_with_metadata(
+        self,
+        x: torch.Tensor,
+        k_cache: List[torch.Tensor],
+        v_cache: List[torch.Tensor],
+        kv_lens: torch.LongTensor,
+        batch_index: torch.LongTensor,
+        max_kv_index: int,
+        next_max_kv_len: int,
+        sdpa_attn_mask: Optional[torch.Tensor],
+    ):
+        for layer_index in range(self.num_layers):
+            x = self._decode_block_next_token_prealloc(
+                self.h.layers[layer_index],
+                x,
+                k_cache[layer_index],
+                v_cache[layer_index],
+                kv_lens,
+                sdpa_attn_mask,
+                batch_index,
+                max_kv_index,
+                next_max_kv_len,
+            )
+        return x, k_cache, v_cache
+
     def _decode_block_next_token_prealloc_profiled(
         self,
         layer: nn.Module,
@@ -528,6 +581,7 @@ class Text2SemanticDecoder(nn.Module):
         records: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]],
     ) -> torch.Tensor:
         device = x.device
+        kv_bucket = self._prealloc_kv_bucket_label(next_max_kv_len)
         q, k, v = self._profile_t2s_call(
             lambda: F.linear(x, layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias).chunk(3, dim=-1),
             records=records,
@@ -569,21 +623,38 @@ class Text2SemanticDecoder(nn.Module):
         attn = self._profile_t2s_call(
             lambda: F.scaled_dot_product_attention(q, k_context, v_context, sdpa_attn_mask),
             records=records,
-            stat_key="pooled_prealloc_sdpa_ms",
+            stat_key=(
+                "pooled_prealloc_sdpa_ms",
+                f"pooled_prealloc_sdpa_{kv_bucket}_ms",
+            ),
+            device=device,
+        )
+        stats[f"pooled_prealloc_sdpa_{kv_bucket}_calls"] = int(
+            stats.get(f"pooled_prealloc_sdpa_{kv_bucket}_calls", 0)
+        ) + 1
+        attn = self._profile_t2s_call(
+            lambda: attn.transpose(1, 2).reshape(batch_size, 1, -1),
+            records=records,
+            stat_key=("pooled_prealloc_out_proj_ms", "pooled_prealloc_out_proj_prep_ms"),
             device=device,
         )
         attn = self._profile_t2s_call(
             lambda: F.linear(
-                attn.transpose(1, 2).reshape(batch_size, 1, -1),
+                attn,
                 layer.self_attn.out_proj.weight,
                 layer.self_attn.out_proj.bias,
             ),
             records=records,
-            stat_key="pooled_prealloc_out_proj_ms",
+            stat_key=("pooled_prealloc_out_proj_ms", "pooled_prealloc_out_proj_linear_ms"),
             device=device,
         )
 
-        x = x + attn
+        x = self._profile_t2s_call(
+            lambda: x + attn,
+            records=records,
+            stat_key="pooled_prealloc_attn_residual_ms",
+            device=device,
+        )
         x = self._profile_t2s_call(
             lambda: F.layer_norm(
                 x,
@@ -596,14 +667,26 @@ class Text2SemanticDecoder(nn.Module):
             stat_key="pooled_prealloc_norm1_ms",
             device=device,
         )
-        x = self._profile_t2s_call(
-            lambda: x + F.linear(
-                F.relu(F.linear(x, layer.linear1.weight, layer.linear1.bias)),
+        ffn_hidden = self._profile_t2s_call(
+            lambda: F.relu(F.linear(x, layer.linear1.weight, layer.linear1.bias)),
+            records=records,
+            stat_key=("pooled_prealloc_ffn_ms", "pooled_prealloc_ffn_up_ms"),
+            device=device,
+        )
+        ffn_out = self._profile_t2s_call(
+            lambda: F.linear(
+                ffn_hidden,
                 layer.linear2.weight,
                 layer.linear2.bias,
             ),
             records=records,
-            stat_key="pooled_prealloc_ffn_ms",
+            stat_key=("pooled_prealloc_ffn_ms", "pooled_prealloc_ffn_down_ms"),
+            device=device,
+        )
+        x = self._profile_t2s_call(
+            lambda: x + ffn_out,
+            records=records,
+            stat_key=("pooled_prealloc_ffn_ms", "pooled_prealloc_ffn_residual_ms"),
             device=device,
         )
         x = self._profile_t2s_call(
@@ -630,27 +713,20 @@ class Text2SemanticDecoder(nn.Module):
         kv_lens: torch.LongTensor,
         attn_mask: Optional[torch.Tensor] = None,
     ):
-        batch_size = x.shape[0]
-        max_kv_index = int(kv_lens.max().item())
-        next_max_kv_len = max_kv_index + 1
-        batch_index = torch.arange(batch_size, device=x.device, dtype=torch.long)
-        sdpa_attn_mask = None if attn_mask is None else ~attn_mask
-        for layer_index in range(self.num_layers):
-            x = self._decode_block_next_token_prealloc(
-                self.h.layers[layer_index],
-                x,
-                k_cache[layer_index],
-                v_cache[layer_index],
-                kv_lens,
-                sdpa_attn_mask,
-                batch_index,
-                max_kv_index,
-                next_max_kv_len,
-            )
-        return (
+        prepared_x, batch_index, max_kv_index, next_max_kv_len, sdpa_attn_mask = self._prepare_prealloc_decode_inputs(
             x,
-            [layer[:batch_size, :, :] for layer in k_cache],
-            [layer[:batch_size, :, :] for layer in v_cache],
+            kv_lens,
+            attn_mask,
+        )
+        return self._decode_next_token_prealloc_with_metadata(
+            prepared_x,
+            k_cache,
+            v_cache,
+            kv_lens,
+            batch_index,
+            max_kv_index,
+            next_max_kv_len,
+            sdpa_attn_mask,
         )
 
     @torch.inference_mode()
@@ -662,11 +738,12 @@ class Text2SemanticDecoder(nn.Module):
         kv_lens: torch.LongTensor,
         attn_mask: Optional[torch.Tensor] = None,
     ):
-        batch_size = x.shape[0]
-        max_kv_index = int(kv_lens.max().item())
-        next_max_kv_len = max_kv_index + 1
-        batch_index = torch.arange(batch_size, device=x.device, dtype=torch.long)
-        sdpa_attn_mask = None if attn_mask is None else ~attn_mask
+        x, batch_index, max_kv_index, next_max_kv_len, sdpa_attn_mask = self._prepare_prealloc_decode_inputs(
+            x,
+            kv_lens,
+            attn_mask,
+        )
+        batch_size = int(batch_index.shape[0])
         stats: dict[str, float | int] = {
             "pooled_prealloc_profiled_decode_calls": 1,
             "pooled_prealloc_profiled_layer_calls": 0,
@@ -675,25 +752,40 @@ class Text2SemanticDecoder(nn.Module):
             "pooled_prealloc_kv_context_ms": 0.0,
             "pooled_prealloc_sdpa_ms": 0.0,
             "pooled_prealloc_out_proj_ms": 0.0,
+            "pooled_prealloc_out_proj_prep_ms": 0.0,
+            "pooled_prealloc_out_proj_linear_ms": 0.0,
+            "pooled_prealloc_attn_residual_ms": 0.0,
             "pooled_prealloc_norm1_ms": 0.0,
             "pooled_prealloc_ffn_ms": 0.0,
+            "pooled_prealloc_ffn_up_ms": 0.0,
+            "pooled_prealloc_ffn_down_ms": 0.0,
+            "pooled_prealloc_ffn_residual_ms": 0.0,
             "pooled_prealloc_norm2_ms": 0.0,
         }
         records: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] = []
         layer_loop_started = time.perf_counter()
+        kv_bucket = self._prealloc_kv_bucket_label(next_max_kv_len)
         for layer_index in range(self.num_layers):
-            x = self._decode_block_next_token_prealloc_profiled(
-                self.h.layers[layer_index],
-                x,
-                k_cache[layer_index],
-                v_cache[layer_index],
-                kv_lens,
-                sdpa_attn_mask,
-                batch_index,
-                max_kv_index,
-                next_max_kv_len,
-                stats=stats,
+            stats[f"pooled_prealloc_layer_total_{kv_bucket}_calls"] = int(
+                stats.get(f"pooled_prealloc_layer_total_{kv_bucket}_calls", 0)
+            ) + 1
+            x = self._profile_t2s_call(
+                lambda: self._decode_block_next_token_prealloc_profiled(
+                    self.h.layers[layer_index],
+                    x,
+                    k_cache[layer_index],
+                    v_cache[layer_index],
+                    kv_lens,
+                    sdpa_attn_mask,
+                    batch_index,
+                    max_kv_index,
+                    next_max_kv_len,
+                    stats=stats,
+                    records=records,
+                ),
                 records=records,
+                stat_key=f"pooled_prealloc_layer_total_{kv_bucket}_ms",
+                device=x.device,
             )
         self._flush_t2s_profile_records(stats, records, device=x.device)
         stats["pooled_prealloc_layer_total_ms"] = float((time.perf_counter() - layer_loop_started) * 1000.0)

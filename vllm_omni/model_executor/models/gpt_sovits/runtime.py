@@ -2022,6 +2022,17 @@ class GPTSoVITSRuntime:
     ) -> torch.Tensor:
         if not y_sequences:
             raise ValueError("GPT-SoVITS AR decode requires at least one semantic history")
+        if len(y_sequences) == 1:
+            sequence = y_sequences[0]
+            last_tokens = sequence[-1:].unsqueeze(0)
+            y_emb = model.ar_audio_embedding(last_tokens)
+            position_id = int(sequence.shape[0] - 1)
+            self._ensure_audio_position_encoding(model, position_id, y_emb.dtype, y_emb.device)
+            pos_emb = model.ar_audio_position.pe.narrow(1, position_id, 1)
+            return y_emb * model.ar_audio_position.x_scale + model.ar_audio_position.alpha * pos_emb.to(
+                dtype=y_emb.dtype,
+                device=y_emb.device,
+            )
         last_tokens = torch.stack([seq[-1:] for seq in y_sequences], dim=0)
         y_emb = model.ar_audio_embedding(last_tokens)
         position_ids = torch.tensor([int(seq.shape[0] - 1) for seq in y_sequences], dtype=torch.long, device=y_emb.device)
@@ -2503,6 +2514,52 @@ class GPTSoVITSRuntime:
             self._flush_t2s_timing_records(stats, pending_cuda_timings, device=sample_logits.device)
         return sampled, argmax_tokens
 
+    def _sample_single_request(
+        self,
+        logits: torch.Tensor,
+        history: torch.LongTensor,
+        sampling_key: tuple[int, float, float, float, bool],
+        *,
+        stats: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits_to_probs, multinomial_sample_one_no_sync = self._get_sampling_ops()
+        top_k, top_p, temperature, repetition_penalty, trim_eos = sampling_key
+        sample_logits = logits[:, :-1] if trim_eos else logits
+        pending_cuda_timings: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] | None = (
+            [] if stats is not None else None
+        )
+        if stats is not None:
+            self._accumulate_t2s_stat(stats, "sampling_history_stack_pad_ms", 0.0)
+        probs = self._time_t2s_call(
+            lambda: logits_to_probs(
+                logits=sample_logits,
+                previous_tokens=history.unsqueeze(0),
+                previous_token_mask=None,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                temperature=temperature,
+            ),
+            pending_cuda_timings=pending_cuda_timings,
+            stat_key="sampling_logits_to_probs_ms",
+            device=sample_logits.device,
+        )
+        sampled = self._time_t2s_call(
+            lambda: multinomial_sample_one_no_sync(probs),
+            pending_cuda_timings=pending_cuda_timings,
+            stat_key="sampling_multinomial_ms",
+            device=probs.device,
+        )
+        argmax_tokens = self._time_t2s_call(
+            lambda: torch.argmax(sample_logits, dim=-1),
+            pending_cuda_timings=pending_cuda_timings,
+            stat_key="sampling_argmax_ms",
+            device=sample_logits.device,
+        )
+        if pending_cuda_timings is not None:
+            self._flush_t2s_timing_records(stats, pending_cuda_timings, device=sample_logits.device)
+        return sampled, argmax_tokens
+
     def _batched_sample_by_group(
         self,
         logits: torch.Tensor,
@@ -2605,9 +2662,9 @@ class GPTSoVITSRuntime:
                 repetition_penalty=state.repetition_penalty,
                 trim_eos=step_index < 11,
             )
-            sampled_tensor, argmax_tensor = self._batched_sample_uniform(
+            sampled_tensor, argmax_tensor = self._sample_single_request(
                 logits=logits,
-                histories=active_batch.y_sequences,
+                history=active_batch.y_sequences[0],
                 sampling_key=sampling_key,
                 stats=stats,
             )
