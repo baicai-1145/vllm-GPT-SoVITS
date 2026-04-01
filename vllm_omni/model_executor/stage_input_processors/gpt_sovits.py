@@ -56,7 +56,9 @@ def t2s2decode(
         transport = GPTSoVITSStageTransport(
             request_id=request_id,
             semantic_tokens=semantic_tokens,
+            semantic_token_segments=(),
             phones=output.multimodal_output["gpt_sovits_phones"].to(torch.long).cpu().contiguous(),
+            segment_phones=(),
             prompt_phones=output.multimodal_output["gpt_sovits_prompt_phones"].to(torch.long).cpu().contiguous(),
             prompt_semantic=output.multimodal_output["gpt_sovits_prompt_semantic"].to(torch.long).cpu().contiguous(),
             refer_audio_spec=output.multimodal_output["gpt_sovits_refer_audio_spec"].to(torch.float32).cpu().contiguous(),
@@ -64,6 +66,7 @@ def t2s2decode(
             raw_audio=output.multimodal_output["gpt_sovits_raw_audio"].to(torch.float32).cpu().contiguous(),
             raw_sr=int(raw_sr),
             speed_factor=float(_as_scalar(prompt_info.get("speed_factor", prompt_info.get("speed")), 1.0)),
+            fragment_interval=float(_as_scalar(prompt_info.get("fragment_interval"), 0.3)),
             sample_steps=int(_as_scalar(prompt_info.get("sample_steps"), 32)),
             super_sampling=bool(_as_scalar(prompt_info.get("super_sampling"), False)),
         )

@@ -4,7 +4,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Tuple
+from typing import Deque, Dict, List, Sequence, Tuple
 
 import torch
 
@@ -130,6 +130,25 @@ class PrepareBertBatchWorker:
             self.pending_peak = len(self.pending_tasks)
         self.condition.notify_all()
 
+    def _record_enqueue_many_locked(self, tasks: Sequence[BertFeatureTask], admission_started: float) -> None:
+        if not tasks:
+            return
+        enqueued_at = time.perf_counter()
+        pending_depth = int(len(self.pending_tasks))
+        peak_pending = pending_depth
+        for task in tasks:
+            task.admission_wait_ms = float(max(0.0, (enqueued_at - admission_started) * 1000.0))
+            task.enqueued_at = enqueued_at
+            task.pending_depth_on_enqueue = pending_depth
+            self.pending_tasks.append(task)
+            pending_depth += 1
+            self.total_submitted += 1
+            self.admission_wait_total_ms += task.admission_wait_ms
+            self.admission_wait_peak_ms = max(self.admission_wait_peak_ms, task.admission_wait_ms)
+            peak_pending = max(peak_pending, pending_depth)
+        self.pending_peak = max(self.pending_peak, peak_pending)
+        self.condition.notify_all()
+
     def _enqueue_task(self, task: BertFeatureTask) -> None:
         admission_started = time.perf_counter()
         with self.condition:
@@ -165,6 +184,41 @@ class PrepareBertBatchWorker:
         )
         await self._enqueue_task_async(task)
         return await task.done_future
+
+    async def _enqueue_tasks_async(self, tasks: Sequence[BertFeatureTask]) -> None:
+        if not tasks:
+            return
+        remaining = deque(tasks)
+        admission_started = time.perf_counter()
+        while remaining:
+            with self.condition:
+                accepted: list[BertFeatureTask] = []
+                while remaining and self._can_enqueue_locked():
+                    accepted.append(remaining.popleft())
+                if accepted:
+                    self._record_enqueue_many_locked(accepted, admission_started)
+                if not remaining:
+                    return
+            await asyncio.sleep(self.admission_poll_s)
+
+    async def submit_many_async(
+        self,
+        items: Sequence[Tuple[str, List[int]]],
+    ) -> List[Tuple[torch.Tensor, Dict[str, float]]]:
+        if not items:
+            return []
+        loop = asyncio.get_running_loop()
+        tasks = [
+            BertFeatureTask(
+                norm_text=str(norm_text),
+                word2ph=list(word2ph),
+                done_loop=loop,
+                done_future=loop.create_future(),
+            )
+            for norm_text, word2ph in items
+        ]
+        await self._enqueue_tasks_async(tasks)
+        return list(await asyncio.gather(*[task.done_future for task in tasks]))
 
     def snapshot(self) -> Dict[str, int]:
         with self.condition:
@@ -517,6 +571,54 @@ class PrepareBertBatchWorkerPool:
         result, profile = await shard.submit_async(norm_text, word2ph)
         profile["bert_pool_workers"] = float(self.worker_count)
         return result, profile
+
+    async def submit_many_async(
+        self,
+        items: Sequence[Tuple[str, List[int]]],
+    ) -> List[Tuple[torch.Tensor, Dict[str, float]]]:
+        if not items:
+            return []
+        if self.worker_count == 1:
+            results = await self.shards[0].submit_many_async(items)
+            for _result, profile in results:
+                profile["bert_pool_workers"] = float(self.worker_count)
+            return results
+
+        shard_items: list[list[tuple[int, str, List[int]]]] = [[] for _ in range(self.worker_count)]
+        shard_token_loads: list[int] = [0] * self.worker_count
+        for item_index, (norm_text, word2ph) in enumerate(items):
+            with self.lock:
+                shard_scores = [
+                    (
+                        shard.outstanding_count(),
+                        shard.outstanding_tokens() + shard_token_loads[shard_index],
+                        shard_index,
+                    )
+                    for shard_index, shard in enumerate(self.shards)
+                ]
+            shard_index = min(shard_scores)[2]
+            shard_items[shard_index].append((item_index, str(norm_text), list(word2ph)))
+            shard_token_loads[shard_index] += max(1, len(str(norm_text)) + 2)
+
+        shard_tasks = []
+        shard_metas: list[list[tuple[int, str, List[int]]]] = []
+        for shard_index, batch in enumerate(shard_items):
+            if not batch:
+                continue
+            shard_metas.append(batch)
+            shard_tasks.append(
+                self.shards[shard_index].submit_many_async(
+                    [(norm_text, word2ph) for _, norm_text, word2ph in batch]
+                )
+            )
+
+        gathered = await asyncio.gather(*shard_tasks)
+        ordered_results: list[Tuple[torch.Tensor, Dict[str, float]] | None] = [None] * len(items)
+        for batch_meta, batch_results in zip(shard_metas, gathered):
+            for (item_index, _norm_text, _word2ph), (result, profile) in zip(batch_meta, batch_results):
+                profile["bert_pool_workers"] = float(self.worker_count)
+                ordered_results[item_index] = (result, profile)
+        return [item for item in ordered_results if item is not None]
 
     def snapshot(self) -> Dict[str, int | List[Dict[str, int]]]:
         shard_snapshots = [dict(shard.snapshot()) for shard in self.shards]

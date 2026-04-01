@@ -80,6 +80,14 @@ def _to_serializable(value: Any) -> Any:
     return value
 
 
+def _semantic_token_count(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.numel())
+    if isinstance(value, (list, tuple)):
+        return sum(_semantic_token_count(item) for item in value)
+    return 0
+
+
 @dataclass
 class IterationMetrics:
     suite: str
@@ -203,7 +211,7 @@ def run_iteration(
         vits_ms=vits_ms,
         postprocess_ms=postprocess_ms,
         end_to_end_ms=end_to_end_ms,
-        semantic_token_count=int(semantic_tokens.numel()),
+        semantic_token_count=_semantic_token_count(semantic_tokens),
         output_samples=int(result.audio.shape[0]),
         sample_rate=int(result.sample_rate),
         prepare_profile={str(key): float(value) for key, value in prepared.state.prepare_profile.items()},

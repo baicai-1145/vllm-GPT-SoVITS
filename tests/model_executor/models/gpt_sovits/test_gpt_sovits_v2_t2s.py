@@ -28,7 +28,9 @@ def _session() -> SimpleNamespace:
         transport_info=GPTSoVITSStageTransport(
             request_id="req-1",
             semantic_tokens=torch.zeros((0,), dtype=torch.long),
+            semantic_token_segments=(),
             phones=torch.tensor([1, 2], dtype=torch.int16),
+            segment_phones=(),
             prompt_phones=torch.tensor([3], dtype=torch.int32),
             prompt_semantic=torch.tensor([4, 5], dtype=torch.int64),
             refer_audio_spec=torch.randn(3, dtype=torch.float16),
@@ -36,6 +38,7 @@ def _session() -> SimpleNamespace:
             raw_audio=torch.randn(8, dtype=torch.float64),
             raw_sr=32000,
             speed_factor=1.0,
+            fragment_interval=0.3,
             sample_steps=32,
             super_sampling=False,
         ),

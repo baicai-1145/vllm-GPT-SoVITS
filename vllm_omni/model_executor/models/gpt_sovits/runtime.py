@@ -295,11 +295,23 @@ def _clone_transport_tensor(value: Any, *, dtype: torch.dtype) -> torch.Tensor:
     return torch.as_tensor(value, dtype=dtype).detach().to("cpu").contiguous()
 
 
+def _clone_transport_tensor_list(value: Any, *, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+    if value in (None, ()):
+        return ()
+    if isinstance(value, torch.Tensor):
+        return (_clone_transport_tensor(value, dtype=dtype),)
+    if not isinstance(value, (list, tuple)):
+        return (_clone_transport_tensor(value, dtype=dtype),)
+    return tuple(_clone_transport_tensor(item, dtype=dtype) for item in value)
+
+
 @dataclass(slots=True)
 class GPTSoVITSStageTransport:
     request_id: str
     semantic_tokens: torch.Tensor
+    semantic_token_segments: tuple[torch.Tensor, ...]
     phones: torch.Tensor
+    segment_phones: tuple[torch.Tensor, ...]
     prompt_phones: torch.Tensor
     prompt_semantic: torch.Tensor
     refer_audio_spec: torch.Tensor
@@ -307,11 +319,14 @@ class GPTSoVITSStageTransport:
     raw_audio: torch.Tensor
     raw_sr: int
     speed_factor: float
+    fragment_interval: float
     sample_steps: int
     super_sampling: bool
 
     @property
     def semantic_token_count(self) -> int:
+        if self.semantic_token_segments:
+            return int(sum(int(item.numel()) for item in self.semantic_token_segments))
         return int(self.semantic_tokens.numel())
 
     @classmethod
@@ -320,13 +335,16 @@ class GPTSoVITSStageTransport:
         *,
         request_id: str = "",
         speed_factor: float = 1.0,
+        fragment_interval: float = 0.3,
         sample_steps: int = 32,
         super_sampling: bool = False,
     ) -> "GPTSoVITSStageTransport":
         return cls(
             request_id=str(request_id),
             semantic_tokens=torch.empty((0,), dtype=torch.long),
+            semantic_token_segments=(),
             phones=torch.empty((0,), dtype=torch.long),
+            segment_phones=(),
             prompt_phones=torch.empty((0,), dtype=torch.long),
             prompt_semantic=torch.empty((0,), dtype=torch.long),
             refer_audio_spec=torch.empty((0,), dtype=torch.float32),
@@ -334,6 +352,7 @@ class GPTSoVITSStageTransport:
             raw_audio=torch.empty((0,), dtype=torch.float32),
             raw_sr=0,
             speed_factor=float(speed_factor),
+            fragment_interval=float(fragment_interval),
             sample_steps=int(sample_steps),
             super_sampling=bool(super_sampling),
         )
@@ -343,10 +362,16 @@ class GPTSoVITSStageTransport:
         refer_spec = getattr(state, "refer_spec", None)
         refer_audio_spec = refer_spec.spec_audio if refer_spec is not None else None
         refer_audio_16k = refer_spec.audio_16k if refer_spec is not None else None
+        segment_states = list(getattr(state, "segment_states", []) or [])
         return cls(
             request_id=str(getattr(state, "request_id", spec.request_id)),
             semantic_tokens=torch.empty((0,), dtype=torch.long),
+            semantic_token_segments=(),
             phones=_clone_transport_tensor(getattr(state, "phones", None), dtype=torch.long),
+            segment_phones=tuple(
+                _clone_transport_tensor(getattr(segment_state, "phones", None), dtype=torch.long)
+                for segment_state in segment_states
+            ),
             prompt_phones=_clone_transport_tensor(getattr(state, "prompt_phones", None), dtype=torch.long),
             prompt_semantic=_clone_transport_tensor(getattr(state, "prompt_semantic", None), dtype=torch.long),
             refer_audio_spec=_clone_transport_tensor(refer_audio_spec, dtype=torch.float32),
@@ -354,6 +379,7 @@ class GPTSoVITSStageTransport:
             raw_audio=_clone_transport_tensor(getattr(state, "raw_audio", None), dtype=torch.float32),
             raw_sr=int(getattr(state, "raw_sr", 0)),
             speed_factor=float(spec.speed_factor),
+            fragment_interval=float(getattr(spec, "fragment_interval", 0.3)),
             sample_steps=int(spec.sample_steps),
             super_sampling=bool(spec.super_sampling),
         )
@@ -375,7 +401,12 @@ class GPTSoVITSStageTransport:
                 base = cls(
                     request_id=str(transport.get("request_id", "")),
                     semantic_tokens=_clone_transport_tensor(transport.get("semantic_tokens"), dtype=torch.long),
+                    semantic_token_segments=_clone_transport_tensor_list(
+                        transport.get("semantic_token_segments"),
+                        dtype=torch.long,
+                    ),
                     phones=_clone_transport_tensor(transport.get("phones"), dtype=torch.long),
+                    segment_phones=_clone_transport_tensor_list(transport.get("segment_phones"), dtype=torch.long),
                     prompt_phones=_clone_transport_tensor(transport.get("prompt_phones"), dtype=torch.long),
                     prompt_semantic=_clone_transport_tensor(transport.get("prompt_semantic"), dtype=torch.long),
                     refer_audio_spec=_clone_transport_tensor(transport.get("refer_audio_spec"), dtype=torch.float32),
@@ -383,6 +414,7 @@ class GPTSoVITSStageTransport:
                     raw_audio=_clone_transport_tensor(transport.get("raw_audio"), dtype=torch.float32),
                     raw_sr=int(transport.get("raw_sr", 0) or 0),
                     speed_factor=float(transport.get("speed_factor", 1.0)),
+                    fragment_interval=float(transport.get("fragment_interval", 0.3)),
                     sample_steps=int(transport.get("sample_steps", 32)),
                     super_sampling=bool(transport.get("super_sampling", False)),
                 )
@@ -396,7 +428,12 @@ class GPTSoVITSStageTransport:
                 base = cls(
                     request_id=request_id,
                     semantic_tokens=_clone_transport_tensor(info.get("gpt_sovits_semantic_tokens"), dtype=torch.long),
+                    semantic_token_segments=_clone_transport_tensor_list(
+                        info.get("gpt_sovits_semantic_token_segments"),
+                        dtype=torch.long,
+                    ),
                     phones=_clone_transport_tensor(info.get("gpt_sovits_phones"), dtype=torch.long),
+                    segment_phones=_clone_transport_tensor_list(info.get("gpt_sovits_segment_phones"), dtype=torch.long),
                     prompt_phones=_clone_transport_tensor(info.get("gpt_sovits_prompt_phones"), dtype=torch.long),
                     prompt_semantic=_clone_transport_tensor(info.get("gpt_sovits_prompt_semantic"), dtype=torch.long),
                     refer_audio_spec=_clone_transport_tensor(info.get("gpt_sovits_refer_audio_spec"), dtype=torch.float32),
@@ -404,6 +441,7 @@ class GPTSoVITSStageTransport:
                     raw_audio=_clone_transport_tensor(info.get("gpt_sovits_raw_audio"), dtype=torch.float32),
                     raw_sr=int(info.get("gpt_sovits_raw_sr", 0) or 0),
                     speed_factor=float(info.get("gpt_sovits_speed_factor", 1.0)),
+                    fragment_interval=float(info.get("gpt_sovits_fragment_interval", 0.3)),
                     sample_steps=int(info.get("gpt_sovits_sample_steps", 32)),
                     super_sampling=bool(info.get("gpt_sovits_super_sampling", False)),
                 )
@@ -413,11 +451,19 @@ class GPTSoVITSStageTransport:
             return base
         return base.with_semantic_tokens(semantic_tokens)
 
-    def with_semantic_tokens(self, semantic_tokens: torch.Tensor) -> "GPTSoVITSStageTransport":
+    def with_semantic_tokens(self, semantic_tokens: Any) -> "GPTSoVITSStageTransport":
+        if isinstance(semantic_tokens, (list, tuple)):
+            semantic_tensor = torch.empty((0,), dtype=torch.long)
+            semantic_segments = _clone_transport_tensor_list(semantic_tokens, dtype=torch.long)
+        else:
+            semantic_tensor = _clone_transport_tensor(semantic_tokens, dtype=torch.long)
+            semantic_segments = ()
         return GPTSoVITSStageTransport(
             request_id=self.request_id,
-            semantic_tokens=_clone_transport_tensor(semantic_tokens, dtype=torch.long),
+            semantic_tokens=semantic_tensor,
+            semantic_token_segments=semantic_segments,
             phones=self.phones,
+            segment_phones=self.segment_phones,
             prompt_phones=self.prompt_phones,
             prompt_semantic=self.prompt_semantic,
             refer_audio_spec=self.refer_audio_spec,
@@ -425,26 +471,35 @@ class GPTSoVITSStageTransport:
             raw_audio=self.raw_audio,
             raw_sr=int(self.raw_sr),
             speed_factor=float(self.speed_factor),
+            fragment_interval=float(self.fragment_interval),
             sample_steps=int(self.sample_steps),
             super_sampling=bool(self.super_sampling),
         )
 
     def has_decode_conditioning(self) -> bool:
+        semantic_ready = (
+            isinstance(self.semantic_tokens, torch.Tensor) and self.semantic_tokens.numel() > 0
+        ) or any(isinstance(value, torch.Tensor) and value.numel() > 0 for value in self.semantic_token_segments)
+        phone_ready = (
+            isinstance(self.phones, torch.Tensor) and self.phones.numel() > 0
+        ) or any(isinstance(value, torch.Tensor) and value.numel() > 0 for value in self.segment_phones)
         required = (
-            self.semantic_tokens,
-            self.phones,
             self.prompt_phones,
             self.prompt_semantic,
             self.refer_audio_spec,
             self.raw_audio,
         )
-        return all(isinstance(value, torch.Tensor) and value.numel() > 0 for value in required)
+        return semantic_ready and phone_ready and all(
+            isinstance(value, torch.Tensor) and value.numel() > 0 for value in required
+        )
 
     def to_transport_dict(self) -> dict[str, Any]:
         return {
             "request_id": self.request_id,
             "semantic_tokens": self.semantic_tokens,
+            "semantic_token_segments": list(self.semantic_token_segments),
             "phones": self.phones,
+            "segment_phones": list(self.segment_phones),
             "prompt_phones": self.prompt_phones,
             "prompt_semantic": self.prompt_semantic,
             "refer_audio_spec": self.refer_audio_spec,
@@ -452,6 +507,7 @@ class GPTSoVITSStageTransport:
             "raw_audio": self.raw_audio,
             "raw_sr": int(self.raw_sr),
             "speed_factor": float(self.speed_factor),
+            "fragment_interval": float(self.fragment_interval),
             "sample_steps": int(self.sample_steps),
             "super_sampling": bool(self.super_sampling),
         }
@@ -461,6 +517,9 @@ class GPTSoVITSStageTransport:
             "gpt_sovits_transport": self.to_transport_dict(),
             "gpt_sovits_request_id": self.request_id,
             "gpt_sovits_semantic_token_count": self.semantic_token_count,
+            "gpt_sovits_fragment_interval": float(self.fragment_interval),
+            "gpt_sovits_semantic_token_segments": list(self.semantic_token_segments),
+            "gpt_sovits_segment_phones": list(self.segment_phones),
         }
 
     def to_model_intermediate_buffer(self) -> dict[str, Any]:
@@ -490,6 +549,7 @@ class GPTSoVITSRequestSpec:
     early_stop_num: int
     aux_ref_audio_paths: list[str]
     speed_factor: float = 1.0
+    fragment_interval: float = 0.3
     sample_steps: int = 32
     super_sampling: bool = False
     ready_step: int = 0
@@ -579,6 +639,7 @@ class GPTSoVITSTextFeatures:
     phones: list[int]
     bert_features: torch.Tensor
     norm_text: str
+    segments: list[Any]
     profile: dict[str, float]
     total_ms: float
     cpu_preprocess_ms: float
@@ -892,7 +953,7 @@ class GPTSoVITSPrepareRuntimeCoordinator:
         gate_poll_ms = int(os.environ.get("GPTSOVITS_PREPARE_GATE_POLL_MS", "1"))
         use_async_text_feature_path = bool(
             getattr(tts, "prepare_bert_batch_worker", None) is not None
-            and os.environ.get("GPTSOVITS_PREPARE_TEXT_FEATURE_DIRECT", "0") != "0"
+            and os.environ.get("GPTSOVITS_PREPARE_TEXT_FEATURE_DIRECT", "1") != "0"
         )
         text_feature_workers = 0
         text_feature_executor = None
@@ -1265,8 +1326,17 @@ class GPTSoVITSPreparedTextPhase:
 
 
 @dataclass(slots=True)
+class GPTSoVITSTextSegmentFeatures:
+    phones: list[int]
+    bert_features: torch.Tensor
+    norm_text: str
+
+
+@dataclass(slots=True)
 class GPTSoVITST2SRequestState:
     request_id: str
+    parent_request_id: str
+    segment_index: int
     ref_audio_path: Any
     prompt_text: str
     prompt_lang: str
@@ -1289,6 +1359,18 @@ class GPTSoVITST2SRequestState:
     repetition_penalty: float
     early_stop_num: int
     ready_step: int
+    prepare_profile: dict[str, float]
+
+
+@dataclass(slots=True)
+class GPTSoVITSMultiSegmentRequestState:
+    request_id: str
+    prompt_phones: torch.LongTensor
+    prompt_semantic: torch.LongTensor
+    refer_spec: GPTSoVITSReferSpec | None
+    raw_audio: torch.Tensor
+    raw_sr: int
+    segment_states: list[GPTSoVITST2SRequestState]
     prepare_profile: dict[str, float]
 
 
@@ -1326,6 +1408,17 @@ class GPTSoVITSDecodePreparedRequest:
     raw_audio: torch.Tensor
     raw_sr: int
     speed_factor: float
+    fragment_interval: float
+    sample_steps: int
+    super_sampling: bool
+
+
+@dataclass(slots=True)
+class GPTSoVITSDecodePreparedRequestGroup:
+    request_id: str
+    segment_requests: list[GPTSoVITSDecodePreparedRequest]
+    speed_factor: float
+    fragment_interval: float
     sample_steps: int
     super_sampling: bool
 
@@ -1336,6 +1429,16 @@ class GPTSoVITSDecodedAudio:
     audio_fragment: Any
     output_sr: int
     speed_factor: float
+    fragment_interval: float
+    super_sampling: bool
+
+
+@dataclass(slots=True)
+class GPTSoVITSDecodedAudioGroup:
+    request_id: str
+    segment_items: list[GPTSoVITSDecodedAudio]
+    speed_factor: float
+    fragment_interval: float
     super_sampling: bool
 
 
@@ -2696,10 +2799,15 @@ class GPTSoVITSRuntime:
                 finish_reason = "eos_argmax"
 
             if finish_reason is not None:
+                semantic_tokens = (
+                    new_history[prefix_len:-1].clone()
+                    if finish_reason in {"eos_sample", "eos_argmax"}
+                    else new_history[prefix_len:].clone()
+                )
                 finished_items.append(
                     GPTSoVITSARFinishedItem(
                         request_id=str(state.request_id),
-                        semantic_tokens=new_history[prefix_len:-1].clone(),
+                        semantic_tokens=semantic_tokens,
                         finish_idx=step_index,
                         finish_reason=finish_reason,
                     )
@@ -2796,10 +2904,15 @@ class GPTSoVITSRuntime:
 
             if finish_reason is not None:
                 prefix_len = int(active_batch.prefix_lens[batch_index].item())
+                semantic_tokens = (
+                    new_history[prefix_len:-1].clone()
+                    if finish_reason in {"eos_sample", "eos_argmax"}
+                    else new_history[prefix_len:].clone()
+                )
                 finished_items.append(
                     GPTSoVITSARFinishedItem(
                         request_id=str(state.request_id),
-                        semantic_tokens=new_history[prefix_len:-1].clone(),
+                        semantic_tokens=semantic_tokens,
                         finish_idx=step_index,
                         finish_reason=finish_reason,
                     )
@@ -3224,12 +3337,16 @@ class GPTSoVITSRuntime:
         *,
         max_steps: int,
     ) -> list[GPTSoVITSARFinishedItem]:
+        max_active_batch = self._get_t2s_max_active_batch()
         pool = self._get_kv_pool(model)
         pool_snapshot_start = None if pool is None else dict(pool.snapshot())
         stats: dict[str, Any] = {
             "request_count": int(len(states)),
             "max_steps_limit": int(max_steps),
+            "max_active_batch_limit": int(max_active_batch),
             "scheduler_ticks": 0,
+            "admission_limited_ticks": 0,
+            "ready_backlog_peak": 0,
             "prefill_calls": 0,
             "prefill_wall_ms": 0.0,
             "decode_calls": 0,
@@ -3279,8 +3396,19 @@ class GPTSoVITSRuntime:
         while pending or active_batch is not None:
             stats["scheduler_ticks"] = int(stats["scheduler_ticks"]) + 1
             admitted: list[Any] = []
-            while pending and pending[0].ready_step <= current_tick:
+            active_request_count = 0 if active_batch is None else int(len(getattr(active_batch, "request_ids", []) or []))
+            remaining_capacity = len(pending) if int(max_active_batch) <= 0 else max(0, int(max_active_batch) - active_request_count)
+            while remaining_capacity > 0 and pending and pending[0].ready_step <= current_tick:
                 admitted.append(pending.pop(0))
+                remaining_capacity -= 1
+            if int(max_active_batch) > 0 and pending and pending[0].ready_step <= current_tick:
+                stats["admission_limited_ticks"] = int(stats.get("admission_limited_ticks", 0)) + 1
+                ready_backlog = 0
+                for pending_state in pending:
+                    if int(pending_state.ready_step) > current_tick:
+                        break
+                    ready_backlog += 1
+                stats["ready_backlog_peak"] = max(int(stats.get("ready_backlog_peak", 0)), ready_backlog)
 
             admitted_active_batch, admitted_finished = self._run_prefill_active_batch(
                 model,
@@ -3457,6 +3585,7 @@ class GPTSoVITSRuntime:
             early_stop_num=int(getattr(pipeline.configs, "hz", 50) * getattr(pipeline.configs, "max_sec", 30)),
             aux_ref_audio_paths=[str(item) for item in list(inputs.get("aux_ref_audio_paths") or [])],
             speed_factor=float(inputs.get("speed_factor", 1.0)),
+            fragment_interval=float(inputs.get("fragment_interval", 0.3)),
             sample_steps=int(inputs.get("sample_steps", 32)),
             super_sampling=bool(inputs.get("super_sampling", False)),
             ready_step=int(request.get("ready_step", 0)),
@@ -3475,21 +3604,23 @@ class GPTSoVITSRuntime:
 
     @staticmethod
     def _estimate_scheduler_max_steps(states: list[Any]) -> int:
+        del states
         env_override = os.environ.get("GPT_SOVITS_SCHEDULER_MAX_STEPS")
-        max_steps = max(1, int(env_override)) if env_override not in [None, ""] else 1500
-        for state in states:
-            phones = getattr(state, "all_phones", None)
-            bert = getattr(state, "all_bert_features", None)
-            early_stop_num = int(getattr(state, "early_stop_num", -1))
-            phones_len = int(phones.shape[0]) if isinstance(phones, torch.Tensor) and phones.ndim > 0 else 0
-            bert_len = int(bert.shape[-1]) if isinstance(bert, torch.Tensor) and bert.ndim > 0 else 0
-            # Semantic length regularly exceeds phone/BERT sequence length, so
-            # the scheduler budget must not be derived from those tensors alone.
-            heuristic_steps = max(phones_len, bert_len) * 8
-            max_steps = max(max_steps, phones_len, bert_len, heuristic_steps)
-            if early_stop_num > 0:
-                max_steps = max(max_steps, early_stop_num + 1)
-        return max_steps
+        if env_override not in [None, ""]:
+            return max(1, int(env_override))
+        # Match upstream GPT-SoVITS infer_panel(), which always hard-stops after
+        # 1500 decode iterations even when early_stop_num is larger.
+        return 1500
+
+    @staticmethod
+    def _get_t2s_max_active_batch() -> int:
+        raw_value = str(os.environ.get("GPTSOVITS_T2S_MAX_ACTIVE_BATCH", "")).strip()
+        if raw_value == "":
+            return 0
+        try:
+            return max(1, int(raw_value))
+        except Exception:
+            return 0
 
     def preload_ref_audio_asset(self, ref_audio_path: str, *, submit_at: float | None = None) -> Any:
         coordinator = self._ensure_prepare_coordinator()
@@ -4215,6 +4346,7 @@ class GPTSoVITSRuntime:
         bert_features: torch.Tensor,
         norm_text: str,
         *,
+        segments: list[GPTSoVITSTextSegmentFeatures] | None = None,
         profile: dict[str, float] | None = None,
         total_ms: float = 0.0,
         cpu_preprocess_ms: float = 0.0,
@@ -4223,6 +4355,7 @@ class GPTSoVITSRuntime:
             phones=[int(item) for item in list(phones or [])],
             bert_features=bert_features,
             norm_text=str(norm_text),
+            segments=list(segments or []),
             profile=dict(profile or {}),
             total_ms=float(total_ms),
             cpu_preprocess_ms=float(cpu_preprocess_ms),
@@ -4244,6 +4377,7 @@ class GPTSoVITSRuntime:
                 dtype=((dtype if dtype is not None else None) or torch.float32),
             ),
             norm_text="",
+            segments=[],
             profile={"cpu_preprocess_ms": 0.0, "bert_total_ms": 0.0},
             total_ms=0.0,
             cpu_preprocess_ms=0.0,
@@ -4339,7 +4473,7 @@ class GPTSoVITSRuntime:
         phones_list: list[list[int]] = []
         bert_list: list[torch.Tensor | None] = []
         norm_text_list: list[str] = []
-        pending_items: list[tuple[list[torch.Tensor | None], int, dict[str, float] | None, Any, Any]] = []
+        pending_items: list[tuple[list[torch.Tensor | None], int, dict[str, float] | None, Any, str, list[int]]] = []
 
         for segment in prepared_segments or []:
             phones = [int(item) for item in list(getattr(segment, "phones", []) or [])]
@@ -4362,11 +4496,13 @@ class GPTSoVITSRuntime:
                     len(bert_list) - 1,
                     profile,
                     device,
-                    worker.submit_async(norm_text, list(word2ph)),
+                    norm_text,
+                    list(word2ph),
                 )
             )
 
         return {
+            "worker": worker,
             "device": device,
             "phones_list": phones_list,
             "bert_list": bert_list,
@@ -4374,19 +4510,38 @@ class GPTSoVITSRuntime:
             "pending_items": pending_items,
         }
 
+    async def _submit_text_feature_pending_items(
+        self,
+        worker: Any,
+        pending_items: list[tuple[list[torch.Tensor | None], int, dict[str, float] | None, Any, str, list[int]]],
+    ) -> None:
+        if not pending_items:
+            return
+        if hasattr(worker, "submit_many_async"):
+            pending_results = await worker.submit_many_async(
+                [(norm_text, list(word2ph)) for _, _, _, _, norm_text, word2ph in pending_items]
+            )
+        else:
+            pending_results = await asyncio.gather(
+                *[
+                    worker.submit_async(norm_text, list(word2ph))
+                    for _, _, _, _, norm_text, word2ph in pending_items
+                ]
+            )
+        for (bert_list, bert_index, profile, device, _norm_text, _word2ph), (feature, worker_profile) in zip(
+            pending_items,
+            pending_results,
+        ):
+            self._merge_bert_worker_profile(profile, dict(worker_profile))
+            bert_list[bert_index] = feature.to(device)
+
     async def _finalize_text_feature_segment_jobs(
         self,
         segment_jobs: dict[str, Any],
-    ) -> tuple[list[int], torch.Tensor, str]:
+    ) -> tuple[list[int], torch.Tensor, str, list[GPTSoVITSTextSegmentFeatures]]:
         pending_items = list(segment_jobs.get("pending_items", []) or [])
         if pending_items:
-            pending_results = await asyncio.gather(*[future for _, _, _, _, future in pending_items])
-            for (bert_list, bert_index, profile, device, _), (feature, worker_profile) in zip(
-                pending_items,
-                pending_results,
-            ):
-                self._merge_bert_worker_profile(profile, dict(worker_profile))
-                bert_list[bert_index] = feature.to(device)
+            await self._submit_text_feature_pending_items(segment_jobs["worker"], pending_items)
 
         bert_features = [feature for feature in segment_jobs.get("bert_list", []) if feature is not None]
         if bert_features:
@@ -4395,7 +4550,19 @@ class GPTSoVITSRuntime:
             bert = self._empty_bert_feature(0, segment_jobs.get("device", "cpu"))
         phones = sum(segment_jobs.get("phones_list", []), [])
         norm_text = "".join(segment_jobs.get("norm_text_list", []))
-        return phones, bert, norm_text
+        segment_features = [
+            GPTSoVITSTextSegmentFeatures(
+                phones=[int(item) for item in phones],
+                bert_features=feature,
+                norm_text=str(norm_text_item),
+            )
+            for phones, feature, norm_text_item in zip(
+                segment_jobs.get("phones_list", []),
+                bert_features,
+                segment_jobs.get("norm_text_list", []),
+            )
+        ]
+        return phones, bert, norm_text, segment_features
 
     def _build_text_features(
         self,
@@ -4413,12 +4580,21 @@ class GPTSoVITSRuntime:
         phones_list: list[list[int]] = []
         bert_list: list[torch.Tensor] = []
         norm_text_list: list[str] = []
+        segment_features: list[GPTSoVITSTextSegmentFeatures] = []
         for segment in resolved_segments:
             phones = [int(item) for item in list(getattr(segment, "phones", []) or [])]
             norm_text = str(getattr(segment, "norm_text", "") or "")
             phones_list.append(phones)
             norm_text_list.append(norm_text)
-            bert_list.append(self._build_segment_bert_feature(segment, profile=profile))
+            bert_feature = self._build_segment_bert_feature(segment, profile=profile)
+            bert_list.append(bert_feature)
+            segment_features.append(
+                GPTSoVITSTextSegmentFeatures(
+                    phones=phones,
+                    bert_features=bert_feature,
+                    norm_text=norm_text,
+                )
+            )
         if bert_list:
             bert_features = torch.cat(bert_list, dim=1)
         else:
@@ -4431,6 +4607,7 @@ class GPTSoVITSRuntime:
             phones,
             bert_features,
             norm_text,
+            segments=segment_features,
             profile=profile,
             total_ms=total_ms,
             cpu_preprocess_ms=cpu_run_ms,
@@ -5308,6 +5485,7 @@ class GPTSoVITSRuntime:
                 result_raw[0],
                 result_raw[1],
                 result_raw[2],
+                segments=result_raw[3],
                 profile=profile,
                 total_ms=float(cpu_run_ms + self._estimate_text_feature_run_ms(profile)),
                 cpu_preprocess_ms=cpu_run_ms,
@@ -5761,6 +5939,7 @@ class GPTSoVITSRuntime:
                         target_result_raw[0],
                         target_result_raw[1],
                         target_result_raw[2],
+                        segments=target_result_raw[3],
                         profile=target_profile,
                         total_ms=float(target_cpu_run_ms + self._estimate_text_feature_run_ms(target_profile)),
                         cpu_preprocess_ms=target_cpu_run_ms,
@@ -5777,6 +5956,7 @@ class GPTSoVITSRuntime:
                     target_result_raw[0],
                     target_result_raw[1],
                     target_result_raw[2],
+                    segments=target_result_raw[3],
                     profile=target_profile,
                     total_ms=float(target_cpu_run_ms + self._estimate_text_feature_run_ms(target_profile)),
                     cpu_preprocess_ms=target_cpu_run_ms,
@@ -5802,13 +5982,7 @@ class GPTSoVITSRuntime:
             target_jobs = self._prepare_text_feature_segment_jobs(target_segments, target_profile)
             pending_jobs = list(prompt_jobs["pending_items"]) + list(target_jobs["pending_items"])
             if pending_jobs:
-                pending_results = await asyncio.gather(*[future for _, _, _, _, future in pending_jobs])
-                for (bert_list, bert_index, profile, device, _), (feature, worker_profile) in zip(
-                    pending_jobs,
-                    pending_results,
-                ):
-                    self._merge_bert_worker_profile(profile, dict(worker_profile))
-                    bert_list[bert_index] = feature.to(device)
+                await self._submit_text_feature_pending_items(prepare_bert_batch_worker, pending_jobs)
             prompt_result_raw = await self._finalize_text_feature_segment_jobs({**prompt_jobs, "pending_items": []})
             target_result_raw = await self._finalize_text_feature_segment_jobs({**target_jobs, "pending_items": []})
             finished_at = time.perf_counter()
@@ -5817,6 +5991,7 @@ class GPTSoVITSRuntime:
                 prompt_result_raw[0],
                 prompt_result_raw[1],
                 prompt_result_raw[2],
+                segments=prompt_result_raw[3],
                 profile=prompt_profile,
                 total_ms=float(prompt_cpu_run_ms + self._estimate_text_feature_run_ms(prompt_profile)),
                 cpu_preprocess_ms=prompt_cpu_run_ms,
@@ -5825,6 +6000,7 @@ class GPTSoVITSRuntime:
                 target_result_raw[0],
                 target_result_raw[1],
                 target_result_raw[2],
+                segments=target_result_raw[3],
                 profile=target_profile,
                 total_ms=float(target_cpu_run_ms + self._estimate_text_feature_run_ms(target_profile)),
                 cpu_preprocess_ms=target_cpu_run_ms,
@@ -6703,7 +6879,7 @@ class GPTSoVITSRuntime:
         prepare_start: float,
         prepare_sync_start: float,
         profile_overrides: dict[str, float] | None = None,
-    ) -> GPTSoVITST2SRequestState:
+    ) -> Any:
         device = pipeline.configs.device
         _sync_runtime_device(device)
         ref_audio_bundle_ms = float(ref_audio_bundle.profile.get("bundle_total_ms", 0.0))
@@ -6925,8 +7101,71 @@ class GPTSoVITSRuntime:
         }
         if profile_overrides:
             prepare_profile.update({key: float(value) for key, value in profile_overrides.items()})
+        target_segments = list(getattr(target_result, "segments", []) or [])
+        if len(target_segments) > 1:
+            segment_states: list[GPTSoVITST2SRequestState] = []
+            for segment_index, target_segment in enumerate(target_segments):
+                segment_phones = [int(item) for item in list(getattr(target_segment, "phones", []) or [])]
+                segment_bert_features = getattr(target_segment, "bert_features", None)
+                if not isinstance(segment_bert_features, torch.Tensor):
+                    continue
+                segment_phones_tensor = torch.LongTensor(segment_phones).to(pipeline.configs.device)
+                segment_bert_tensor = segment_bert_features.to(
+                    dtype=pipeline.precision,
+                    device=pipeline.configs.device,
+                )
+                segment_states.append(
+                    GPTSoVITST2SRequestState(
+                        request_id=f"{spec.request_id}::seg{segment_index:04d}",
+                        parent_request_id=str(spec.request_id),
+                        segment_index=int(segment_index),
+                        ref_audio_path=spec.ref_audio_path,
+                        prompt_text=str(prompt_text),
+                        prompt_lang=str(spec.prompt_lang),
+                        text=str(text),
+                        text_lang=str(spec.text_lang),
+                        norm_prompt_text=str(prompt_result.norm_text),
+                        norm_text=str(getattr(target_segment, "norm_text", "") or ""),
+                        phones=segment_phones_tensor,
+                        prompt_phones=prompt_phones_tensor,
+                        all_phones=torch.cat([prompt_phones_tensor, segment_phones_tensor], dim=0),
+                        all_bert_features=torch.cat([prompt_bert_features, segment_bert_tensor], dim=1),
+                        prompt_semantic=prompt_semantic,
+                        refer_spec=(
+                            None
+                            if spec_audio is None
+                            else GPTSoVITSReferSpec(spec_audio=spec_audio, audio_16k=audio_16k)
+                        ),
+                        aux_refer_specs=aux_refer_specs,
+                        raw_audio=raw_audio,
+                        raw_sr=raw_sr,
+                        top_k=int(spec.top_k),
+                        top_p=float(spec.top_p),
+                        temperature=float(spec.temperature),
+                        repetition_penalty=float(spec.repetition_penalty),
+                        early_stop_num=int(spec.early_stop_num),
+                        ready_step=int(spec.ready_step),
+                        prepare_profile=dict(prepare_profile),
+                    )
+                )
+            return GPTSoVITSMultiSegmentRequestState(
+                request_id=str(spec.request_id),
+                prompt_phones=prompt_phones_tensor,
+                prompt_semantic=prompt_semantic,
+                refer_spec=(
+                    None
+                    if spec_audio is None
+                    else GPTSoVITSReferSpec(spec_audio=spec_audio, audio_16k=audio_16k)
+                ),
+                raw_audio=raw_audio,
+                raw_sr=raw_sr,
+                segment_states=segment_states,
+                prepare_profile=prepare_profile,
+            )
         return GPTSoVITST2SRequestState(
             request_id=str(spec.request_id),
+            parent_request_id=str(spec.request_id),
+            segment_index=0,
             ref_audio_path=spec.ref_audio_path,
             prompt_text=str(prompt_text),
             prompt_lang=str(spec.prompt_lang),
@@ -7218,34 +7457,64 @@ class GPTSoVITSRuntime:
             tokens = tokens[:-1]
         return tokens.to("cpu").contiguous()
 
+    @staticmethod
+    def _flatten_scheduler_states(states: Sequence[Any]) -> list[Any]:
+        flattened: list[Any] = []
+        for state in states:
+            segment_states = list(getattr(state, "segment_states", []) or [])
+            if segment_states:
+                flattened.extend(segment_states)
+            else:
+                flattened.append(state)
+        return flattened
+
     def generate_semantic_tokens(
         self,
         prepared_requests: list[GPTSoVITSPreparedRequest],
         *,
         max_steps: int | None = None,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, Any]:
         if not prepared_requests:
             return {}
         pipeline = self._ensure_pipeline()
         states = [item.state for item in prepared_requests]
-        max_steps = int(max_steps or self._estimate_scheduler_max_steps(states))
+        flat_states = self._flatten_scheduler_states(states)
+        max_steps = int(max_steps or self._estimate_scheduler_max_steps(flat_states))
         with self._run_lock:
             with torch.inference_mode(False), torch.no_grad():
                 finished_items = self._run_continuous_batch_scheduler(
                     pipeline.t2s_model.model,
-                    states,
+                    flat_states,
                     max_steps=max_steps,
                 )
-        return {
-            str(item.request_id): item.semantic_tokens.detach().to("cpu").contiguous().to(dtype=torch.long)
-            for item in finished_items
-        }
+        grouped: dict[str, list[tuple[int, torch.Tensor]]] = {}
+        for item in finished_items:
+            request_id = str(item.request_id)
+            parent_request_id = request_id
+            segment_index = 0
+            if "::seg" in request_id:
+                parent_request_id, _sep, suffix = request_id.partition("::seg")
+                try:
+                    segment_index = int(suffix)
+                except Exception:
+                    segment_index = len(grouped.get(parent_request_id, []))
+            grouped.setdefault(parent_request_id, []).append(
+                (
+                    int(segment_index),
+                    item.semantic_tokens.detach().to("cpu").contiguous().to(dtype=torch.long),
+                )
+            )
+        results: dict[str, Any] = {}
+        for request_id, items in grouped.items():
+            ordered = [tokens for _, tokens in sorted(items, key=lambda pair: pair[0])]
+            results[request_id] = ordered[0] if len(ordered) == 1 else ordered
+        return results
 
     def prepare_decode_request(
         self,
-        semantic_tokens: torch.Tensor,
+        semantic_tokens: Any,
         transport_info: GPTSoVITSStageTransport | dict[str, Any],
-    ) -> GPTSoVITSDecodePreparedRequest:
+    ) -> Any:
         pipeline = self._ensure_pipeline()
         device = torch.device(getattr(pipeline.configs, "device", "cpu"))
         transport = GPTSoVITSStageTransport.from_info(
@@ -7253,6 +7522,39 @@ class GPTSoVITSRuntime:
             semantic_tokens=semantic_tokens,
         )
         request_id = str(transport.request_id or f"gpt_sovits_decode_{time.time_ns()}")
+        if transport.semantic_token_segments or transport.segment_phones:
+            semantic_segments = list(transport.semantic_token_segments)
+            if not semantic_segments and isinstance(semantic_tokens, (list, tuple)):
+                semantic_segments = [torch.as_tensor(item, dtype=torch.long) for item in semantic_tokens]
+            segment_phones = list(transport.segment_phones)
+            if semantic_segments and segment_phones and len(semantic_segments) != len(segment_phones):
+                raise ValueError("GPT-SoVITS segment semantic count does not match segment phone count")
+            segment_requests = [
+                GPTSoVITSDecodePreparedRequest(
+                    request_id=f"{request_id}::seg{segment_index:04d}",
+                    semantic_tokens=segment_semantic.to(device=device, dtype=torch.long),
+                    phones=segment_phone.to(device=device, dtype=torch.long),
+                    prompt_phones=transport.prompt_phones.to(device=device, dtype=torch.long),
+                    prompt_semantic=transport.prompt_semantic.to(device=device, dtype=torch.long),
+                    refer_audio_spec=transport.refer_audio_spec.to(dtype=torch.float32),
+                    refer_audio_16k=transport.refer_audio_16k.to(dtype=torch.float32),
+                    raw_audio=transport.raw_audio.to(dtype=torch.float32),
+                    raw_sr=int(transport.raw_sr),
+                    speed_factor=float(transport.speed_factor),
+                    fragment_interval=float(transport.fragment_interval),
+                    sample_steps=int(transport.sample_steps),
+                    super_sampling=bool(transport.super_sampling),
+                )
+                for segment_index, (segment_semantic, segment_phone) in enumerate(zip(semantic_segments, segment_phones))
+            ]
+            return GPTSoVITSDecodePreparedRequestGroup(
+                request_id=request_id,
+                segment_requests=segment_requests,
+                speed_factor=float(transport.speed_factor),
+                fragment_interval=float(transport.fragment_interval),
+                sample_steps=int(transport.sample_steps),
+                super_sampling=bool(transport.super_sampling),
+            )
         return GPTSoVITSDecodePreparedRequest(
             request_id=request_id,
             semantic_tokens=transport.semantic_tokens.to(device=device, dtype=torch.long),
@@ -7264,6 +7566,7 @@ class GPTSoVITSRuntime:
             raw_audio=transport.raw_audio.to(dtype=torch.float32),
             raw_sr=int(transport.raw_sr),
             speed_factor=float(transport.speed_factor),
+            fragment_interval=float(transport.fragment_interval),
             sample_steps=int(transport.sample_steps),
             super_sampling=bool(transport.super_sampling),
         )
@@ -7611,6 +7914,7 @@ class GPTSoVITSRuntime:
                     audio_fragment=audio_fragment,
                     output_sr=int(output_sr),
                     speed_factor=float(prepared.speed_factor),
+                    fragment_interval=float(prepared.fragment_interval),
                     super_sampling=bool(prepared.super_sampling),
                 )
                 for prepared, (audio_fragment, output_sr) in (
@@ -7673,6 +7977,7 @@ class GPTSoVITSRuntime:
                     audio_fragment=torch.zeros((0,), dtype=torch.float32, device=device),
                     output_sr=output_sr,
                     speed_factor=float(prepared.speed_factor),
+                    fragment_interval=float(prepared.fragment_interval),
                     super_sampling=bool(prepared.super_sampling),
                 )
                 for prepared in prepared_requests
@@ -7725,6 +8030,7 @@ class GPTSoVITSRuntime:
                     audio_fragment=audio_fragment,
                     output_sr=output_sr,
                     speed_factor=float(prepared.speed_factor),
+                    fragment_interval=float(prepared.fragment_interval),
                     super_sampling=bool(prepared.super_sampling),
                 )
             )
@@ -7767,6 +8073,7 @@ class GPTSoVITSRuntime:
                             audio_fragment=audio_fragment,
                             output_sr=int(output_sr),
                             speed_factor=float(prepared.speed_factor),
+                            fragment_interval=float(prepared.fragment_interval),
                             super_sampling=bool(prepared.super_sampling),
                         )
                     ]
@@ -8221,22 +8528,15 @@ class GPTSoVITSRuntime:
         fea, _ = vits_model.wns1(fea, y_lengths1, ge)
         return fea, ge
 
-    def _decode_prepared_request_fragment(
+    def _build_non_vocoder_prompt_context(
         self,
         pipeline: Any,
         prepared: GPTSoVITSDecodePreparedRequest,
-    ) -> tuple[Any, int]:
+    ) -> dict[str, Any]:
         self._bind_pipeline_components(pipeline)
-        refer_spec = self._build_refer_spec_from_prepared(prepared)
-        if bool(getattr(pipeline.configs, "use_vocoder", False)):
-            return self._decode_prepared_request_vocoder_fragment(
-                pipeline,
-                prepared,
-                refer_spec.spec_audio,
-            )
-
         device = torch.device(self._get_runtime_configs().device)
         vits_model = self._get_runtime_vits_model()
+        refer_spec = self._build_refer_spec_from_prepared(prepared)
         refer_audio_spec = refer_spec.spec_audio.to(dtype=self._get_runtime_precision(), device=device)
         sv_emb = None
         if self._is_runtime_v2pro():
@@ -8249,6 +8549,33 @@ class GPTSoVITSRuntime:
             refer_audio_spec,
             sv_emb=sv_emb,
         )
+        return {
+            "device": device,
+            "vits_model": vits_model,
+            "refer_audio_spec": refer_audio_spec,
+            "ge": ge,
+        }
+
+    def _decode_prepared_request_fragment(
+        self,
+        pipeline: Any,
+        prepared: GPTSoVITSDecodePreparedRequest,
+        prompt_context: dict[str, Any] | None = None,
+    ) -> tuple[Any, int]:
+        self._bind_pipeline_components(pipeline)
+        refer_spec = self._build_refer_spec_from_prepared(prepared)
+        if bool(getattr(pipeline.configs, "use_vocoder", False)):
+            return self._decode_prepared_request_vocoder_fragment(
+                pipeline,
+                prepared,
+                refer_spec.spec_audio,
+            )
+
+        if prompt_context is None:
+            prompt_context = self._build_non_vocoder_prompt_context(pipeline, prepared)
+        device = cast(torch.device, prompt_context["device"])
+        vits_model = prompt_context["vits_model"]
+        ge = cast(torch.Tensor, prompt_context["ge"])
         chunk_tokens = self._get_vits_streaming_chunk_tokens()
         if (
             chunk_tokens > 0
@@ -8289,6 +8616,7 @@ class GPTSoVITSRuntime:
         self,
         pipeline: Any,
         prepared_requests: list[GPTSoVITSDecodePreparedRequest],
+        prompt_context: dict[str, Any] | None = None,
     ) -> list[GPTSoVITSDecodedAudio]:
         self._bind_pipeline_components(pipeline)
         if not prepared_requests:
@@ -8296,8 +8624,10 @@ class GPTSoVITSRuntime:
         if bool(getattr(pipeline.configs, "use_vocoder", False)):
             raise ValueError("non-vocoder batched decode helper received vocoder pipeline")
 
-        device = torch.device(self._get_runtime_configs().device)
-        vits_model = self._get_runtime_vits_model()
+        if prompt_context is None:
+            prompt_context = self._build_non_vocoder_prompt_context(pipeline, prepared_requests[0])
+        device = cast(torch.device, prompt_context["device"])
+        vits_model = prompt_context["vits_model"]
         batch_size = len(prepared_requests)
         first_speed = float(prepared_requests[0].speed_factor)
         first_sample_steps = int(prepared_requests[0].sample_steps)
@@ -8306,68 +8636,12 @@ class GPTSoVITSRuntime:
         if any(int(item.sample_steps) != first_sample_steps for item in prepared_requests):
             raise ValueError("GPT-SoVITS batched non-vocoder decode requires identical sample_steps")
 
-        refer_specs = [self._build_refer_spec_from_prepared(prepared) for prepared in prepared_requests]
-        shared_single_refer = False
-        shared_refer_audio_spec = None
-        if refer_specs:
-            first_spec = refer_specs[0].spec_audio
-            first_audio = refer_specs[0].audio_16k
-            first_spec_key = (
-                str(first_spec.device),
-                str(first_spec.dtype),
-                tuple(int(item) for item in first_spec.shape),
-                int(first_spec.data_ptr()),
-            )
-            first_audio_key = None
-            if first_audio is not None:
-                first_audio_key = (
-                    str(first_audio.device),
-                    str(first_audio.dtype),
-                    tuple(int(item) for item in first_audio.shape),
-                    int(first_audio.data_ptr()),
-                )
-            shared_single_refer = True
-            for refer_spec in refer_specs[1:]:
-                refer_audio_spec = refer_spec.spec_audio
-                audio_tensor = refer_spec.audio_16k
-                refer_spec_key = (
-                    str(refer_audio_spec.device),
-                    str(refer_audio_spec.dtype),
-                    tuple(int(item) for item in refer_audio_spec.shape),
-                    int(refer_audio_spec.data_ptr()),
-                )
-                if refer_spec_key != first_spec_key:
-                    shared_single_refer = False
-                    break
-                if first_audio_key is None:
-                    if audio_tensor is not None:
-                        shared_single_refer = False
-                        break
-                else:
-                    if audio_tensor is None:
-                        shared_single_refer = False
-                        break
-                    audio_key = (
-                        str(audio_tensor.device),
-                        str(audio_tensor.dtype),
-                        tuple(int(item) for item in audio_tensor.shape),
-                        int(audio_tensor.data_ptr()),
-                    )
-                    if audio_key != first_audio_key:
-                        shared_single_refer = False
-                        break
-            if shared_single_refer:
-                shared_refer_audio_spec = first_spec.to(dtype=self._get_runtime_precision(), device=device)
-
         max_semantic_len = max(int(item.semantic_tokens.shape[-1]) for item in prepared_requests)
         max_phone_len = max(int(item.phones.shape[-1]) for item in prepared_requests)
         semantic_batch = torch.zeros((1, batch_size, max_semantic_len), dtype=torch.long, device=device)
         phone_batch = torch.zeros((batch_size, max_phone_len), dtype=torch.long, device=device)
         semantic_lengths: list[int] = []
         phone_lengths: list[int] = []
-        refer_audio_specs: list[torch.Tensor] = []
-        sv_emb_batch = None
-        sv_emb_list: list[torch.Tensor] = []
 
         for batch_index, prepared in enumerate(prepared_requests):
             semantic_len = int(prepared.semantic_tokens.shape[-1])
@@ -8376,51 +8650,7 @@ class GPTSoVITSRuntime:
             phone_batch[batch_index, :phone_len] = prepared.phones.to(device=device, dtype=torch.long)
             semantic_lengths.append(semantic_len)
             phone_lengths.append(phone_len)
-            if shared_single_refer:
-                continue
-            refer_spec = refer_specs[batch_index]
-            refer_audio_specs.append(refer_spec.spec_audio.to(dtype=self._get_runtime_precision(), device=device))
-            if self._is_runtime_v2pro():
-                if refer_spec.audio_16k is None:
-                    raise ValueError("GPT-SoVITS v2Pro batched non-vocoder decode 缺少 16k 参考音频")
-                sv_emb_list.append(self._get_runtime_sv_model().compute_embedding3(refer_spec.audio_16k).to(device))
-
-        if self._is_runtime_v2pro():
-            if shared_single_refer:
-                shared_audio_tensor = refer_specs[0].audio_16k
-                if shared_audio_tensor is None:
-                    raise ValueError("GPT-SoVITS v2Pro batched non-vocoder decode 缺少 16k 参考音频")
-                sv_emb_batch = self._get_runtime_sv_model().compute_embedding3(shared_audio_tensor).to(device)
-            else:
-                sv_emb_batch = torch.cat(sv_emb_list, dim=0)
-
-        ge_batch = None
-        if shared_single_refer:
-            if shared_refer_audio_spec is None:
-                raise ValueError("shared_single_refer detected but refer_audio_spec missing")
-            refer_audio_specs = [shared_refer_audio_spec]
-            ge_batch = self._compute_vits_reference_ge(
-                vits_model,
-                shared_refer_audio_spec,
-                sv_emb=(sv_emb_batch[:1] if sv_emb_batch is not None else None),
-            )
-            ge_batch = ge_batch.expand(batch_size, -1, -1)
-        else:
-            refer_lengths = torch.LongTensor([int(item.size(2)) for item in refer_audio_specs]).to(device)
-            max_refer_len = int(refer_lengths.max().item())
-            refer_batch = torch.zeros(
-                (batch_size, int(refer_audio_specs[0].size(1)), max_refer_len),
-                dtype=refer_audio_specs[0].dtype,
-                device=device,
-            )
-            for batch_index, refer in enumerate(refer_audio_specs):
-                refer_batch[batch_index, :, : int(refer.size(2))] = refer.squeeze(0)
-            ge_batch = self._compute_vits_reference_ge(
-                vits_model,
-                refer_batch,
-                refer_lengths=refer_lengths,
-                sv_emb=sv_emb_batch,
-            )
+        ge_batch = cast(torch.Tensor, prompt_context["ge"]).expand(batch_size, -1, -1)
 
         with self._run_lock:
             audio_batch, y_mask = self._run_vits_non_vocoder_decode(
@@ -8444,6 +8674,7 @@ class GPTSoVITSRuntime:
                 audio_fragment=audio_fragment,
                 output_sr=output_sr,
                 speed_factor=float(prepared.speed_factor),
+                fragment_interval=float(prepared.fragment_interval),
                 super_sampling=bool(prepared.super_sampling),
             )
             for prepared, audio_fragment in zip(prepared_requests, audio_fragments)
@@ -8451,8 +8682,16 @@ class GPTSoVITSRuntime:
 
     def decode_prepared_request(
         self,
-        prepared: GPTSoVITSDecodePreparedRequest,
-    ) -> GPTSoVITSDecodedAudio:
+        prepared: Any,
+    ) -> Any:
+        if isinstance(prepared, GPTSoVITSDecodePreparedRequestGroup):
+            return GPTSoVITSDecodedAudioGroup(
+                request_id=prepared.request_id,
+                segment_items=self._decode_prepared_request_group_segments(prepared.segment_requests),
+                speed_factor=float(prepared.speed_factor),
+                fragment_interval=float(prepared.fragment_interval),
+                super_sampling=bool(prepared.super_sampling),
+            )
         pipeline = self._ensure_pipeline()
         if prepared.semantic_tokens.numel() == 0:
             return GPTSoVITSDecodedAudio(
@@ -8460,6 +8699,7 @@ class GPTSoVITSRuntime:
                 audio_fragment=np.zeros((0,), dtype=np.float32),
                 output_sr=int(getattr(pipeline.configs, "sampling_rate", 32000)),
                 speed_factor=float(prepared.speed_factor),
+                fragment_interval=float(prepared.fragment_interval),
                 super_sampling=bool(prepared.super_sampling),
             )
         with self._run_lock:
@@ -8470,15 +8710,149 @@ class GPTSoVITSRuntime:
             audio_fragment=audio_fragment,
             output_sr=int(output_sr),
             speed_factor=float(prepared.speed_factor),
+            fragment_interval=float(prepared.fragment_interval),
             super_sampling=bool(prepared.super_sampling),
         )
 
+    @staticmethod
+    def _get_segment_decode_max_batch() -> int:
+        raw_value = str(
+            os.environ.get(
+                "GPTSOVITS_SEGMENT_DECODE_MAX_BATCH",
+                os.environ.get("GPTSOVITS_SEGMENT_DECODE_CHUNK_SIZE", "4"),
+            )
+        ).strip()
+        try:
+            return max(1, int(raw_value))
+        except Exception:
+            return 4
+
+    @staticmethod
+    def _get_segment_decode_max_semantic_tokens() -> int:
+        raw_value = str(os.environ.get("GPTSOVITS_SEGMENT_DECODE_MAX_SEMANTIC_TOKENS", "3072")).strip()
+        try:
+            return max(0, int(raw_value))
+        except Exception:
+            return 3072
+
+    @staticmethod
+    def _get_segment_decode_max_phone_tokens() -> int:
+        raw_value = str(os.environ.get("GPTSOVITS_SEGMENT_DECODE_MAX_PHONE_TOKENS", "960")).strip()
+        try:
+            return max(0, int(raw_value))
+        except Exception:
+            return 960
+
+    @staticmethod
+    def _segment_decode_length_key(prepared: GPTSoVITSDecodePreparedRequest) -> tuple[int, int, int]:
+        semantic_len = int(prepared.semantic_tokens.shape[-1])
+        phone_len = int(prepared.phones.shape[-1])
+        return (max(semantic_len, phone_len), semantic_len, phone_len)
+
+    def _plan_segment_decode_batches(
+        self,
+        segment_requests: list[GPTSoVITSDecodePreparedRequest],
+        *,
+        max_batch_size: int,
+    ) -> list[list[tuple[int, GPTSoVITSDecodePreparedRequest]]]:
+        if not segment_requests:
+            return []
+        max_semantic_tokens = self._get_segment_decode_max_semantic_tokens()
+        max_phone_tokens = self._get_segment_decode_max_phone_tokens()
+        indexed_requests = list(enumerate(segment_requests))
+        indexed_requests.sort(key=lambda item: self._segment_decode_length_key(item[1]), reverse=True)
+
+        batches: list[list[tuple[int, GPTSoVITSDecodePreparedRequest]]] = []
+        current_batch: list[tuple[int, GPTSoVITSDecodePreparedRequest]] = []
+        current_semantic_tokens = 0
+        current_phone_tokens = 0
+        for original_index, prepared in indexed_requests:
+            semantic_len = int(prepared.semantic_tokens.shape[-1])
+            phone_len = int(prepared.phones.shape[-1])
+            would_exceed_batch = len(current_batch) >= max_batch_size
+            would_exceed_semantic = (
+                bool(current_batch)
+                and max_semantic_tokens > 0
+                and current_semantic_tokens + semantic_len > max_semantic_tokens
+            )
+            would_exceed_phone = (
+                bool(current_batch)
+                and max_phone_tokens > 0
+                and current_phone_tokens + phone_len > max_phone_tokens
+            )
+            if would_exceed_batch or would_exceed_semantic or would_exceed_phone:
+                batches.append(current_batch)
+                current_batch = []
+                current_semantic_tokens = 0
+                current_phone_tokens = 0
+            current_batch.append((original_index, prepared))
+            current_semantic_tokens += semantic_len
+            current_phone_tokens += phone_len
+        if current_batch:
+            batches.append(current_batch)
+        return batches
+
+    def _decode_prepared_request_group_segments(
+        self,
+        segment_requests: list[GPTSoVITSDecodePreparedRequest],
+    ) -> list[GPTSoVITSDecodedAudio]:
+        if not segment_requests:
+            return []
+        pipeline = self._ensure_pipeline()
+        non_vocoder_prompt_context = None
+        if not bool(getattr(pipeline.configs, "use_vocoder", False)):
+            with self._run_lock:
+                with self._project_root_cwd():
+                    non_vocoder_prompt_context = self._build_non_vocoder_prompt_context(pipeline, segment_requests[0])
+        current_max_batch_size = min(self._get_segment_decode_max_batch(), len(segment_requests))
+        while True:
+            try:
+                decoded_items: list[GPTSoVITSDecodedAudio | None] = [None] * len(segment_requests)
+                for batch in self._plan_segment_decode_batches(
+                    segment_requests,
+                    max_batch_size=current_max_batch_size,
+                ):
+                    batch_indices = [item[0] for item in batch]
+                    chunk = [item[1] for item in batch]
+                    if non_vocoder_prompt_context is not None:
+                        chunk_decoded = self._decode_prepared_requests_batched_non_vocoder(
+                            pipeline,
+                            chunk,
+                            prompt_context=non_vocoder_prompt_context,
+                        )
+                    else:
+                        chunk_decoded = self.decode_prepared_requests(chunk)
+                    for original_index, decoded_item in zip(batch_indices, chunk_decoded):
+                        decoded_items[original_index] = decoded_item
+                return [item for item in decoded_items if item is not None]
+            except torch.OutOfMemoryError:
+                if current_max_batch_size <= 1:
+                    raise
+                next_chunk_size = max(1, current_max_batch_size // 2)
+                if next_chunk_size >= current_max_batch_size:
+                    raise
+                logger.warning(
+                    "GPT-SoVITS segment-group decode OOM at batch=%d; retrying with batch=%d",
+                    int(current_max_batch_size),
+                    int(next_chunk_size),
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                current_max_batch_size = next_chunk_size
+
     def decode_prepared_requests(
         self,
-        prepared_requests: list[GPTSoVITSDecodePreparedRequest],
+        prepared_requests: list[Any],
     ) -> list[GPTSoVITSDecodedAudio]:
         if not prepared_requests:
             return []
+        expanded_prepared: list[GPTSoVITSDecodePreparedRequest] = []
+        for prepared in prepared_requests:
+            if isinstance(prepared, GPTSoVITSDecodePreparedRequestGroup):
+                expanded_prepared.extend(prepared.segment_requests)
+            else:
+                expanded_prepared.append(prepared)
+        prepared_requests = expanded_prepared
         pipeline = self._ensure_pipeline()
         decoded: list[GPTSoVITSDecodedAudio | None] = [None] * len(prepared_requests)
         output_sr_default = int(getattr(pipeline.configs, "sampling_rate", 32000))
@@ -8493,6 +8867,7 @@ class GPTSoVITSRuntime:
                     audio_fragment=np.zeros((0,), dtype=np.float32),
                     output_sr=output_sr_default,
                     speed_factor=float(prepared.speed_factor),
+                    fragment_interval=float(prepared.fragment_interval),
                     super_sampling=bool(prepared.super_sampling),
                 )
                 continue
@@ -8592,8 +8967,27 @@ class GPTSoVITSRuntime:
 
     def finalize_decoded_audio(
         self,
-        decoded: GPTSoVITSDecodedAudio,
+        decoded: Any,
     ) -> GPTSoVITSResult:
+        if isinstance(decoded, GPTSoVITSDecodedAudioGroup):
+            if not decoded.segment_items:
+                pipeline = self._ensure_pipeline()
+                return GPTSoVITSResult(
+                    sample_rate=int(getattr(pipeline.configs, "sampling_rate", 32000)),
+                    audio=np.zeros((0,), dtype=np.float32),
+                )
+            pipeline = self._ensure_pipeline()
+            output_sr = int(decoded.segment_items[0].output_sr)
+            with self._run_lock:
+                sample_rate, audio = self._audio_postprocess_native(
+                    pipeline,
+                    audio_fragments=[item.audio_fragment for item in decoded.segment_items],
+                    sr=output_sr,
+                    speed_factor=float(decoded.speed_factor),
+                    fragment_interval=float(decoded.fragment_interval),
+                    super_sampling=bool(decoded.super_sampling),
+                )
+            return GPTSoVITSResult(sample_rate=int(sample_rate), audio=self._normalize_audio(np.asarray(audio)))
         pipeline = self._ensure_pipeline()
         with self._run_lock:
             sample_rate, audio = self._audio_postprocess_native(
@@ -8601,24 +8995,31 @@ class GPTSoVITSRuntime:
                 audio_fragments=[decoded.audio_fragment],
                 sr=int(decoded.output_sr),
                 speed_factor=float(decoded.speed_factor),
-                fragment_interval=0.0,
+                fragment_interval=float(decoded.fragment_interval),
                 super_sampling=bool(decoded.super_sampling),
             )
         return GPTSoVITSResult(sample_rate=int(sample_rate), audio=self._normalize_audio(np.asarray(audio)))
 
     def finalize_decoded_audios(
         self,
-        decoded_items: list[GPTSoVITSDecodedAudio],
+        decoded_items: list[Any],
     ) -> list[GPTSoVITSResult]:
         return [self.finalize_decoded_audio(decoded) for decoded in decoded_items]
 
     def decode_semantic_tokens_from_transport(
         self,
-        semantic_tokens: torch.Tensor,
+        semantic_tokens: Any,
         transport_info: GPTSoVITSStageTransport | dict[str, Any],
     ) -> GPTSoVITSResult:
         prepared = self.prepare_decode_request(semantic_tokens, transport_info)
-        if prepared.semantic_tokens.numel() == 0:
+        if isinstance(prepared, GPTSoVITSDecodePreparedRequestGroup):
+            if not prepared.segment_requests:
+                pipeline = self._ensure_pipeline()
+                return GPTSoVITSResult(
+                    sample_rate=int(getattr(pipeline.configs, "sampling_rate", 32000)),
+                    audio=np.zeros((0,), dtype=np.float32),
+                )
+        elif prepared.semantic_tokens.numel() == 0:
             pipeline = self._ensure_pipeline()
             return GPTSoVITSResult(
                 sample_rate=int(getattr(pipeline.configs, "sampling_rate", 32000)),

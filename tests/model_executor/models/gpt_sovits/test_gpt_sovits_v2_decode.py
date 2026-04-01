@@ -25,7 +25,9 @@ def _conditioning_info(*, semantic_count: int) -> dict[str, object]:
     transport = GPTSoVITSStageTransport(
         request_id="req",
         semantic_tokens=torch.arange(semantic_count, dtype=torch.long) + 100,
+        semantic_token_segments=(),
         phones=torch.tensor([1, 2], dtype=torch.long),
+        segment_phones=(),
         prompt_phones=torch.tensor([3], dtype=torch.long),
         prompt_semantic=torch.tensor([4], dtype=torch.long),
         refer_audio_spec=torch.randn(2, dtype=torch.float32),
@@ -33,6 +35,7 @@ def _conditioning_info(*, semantic_count: int) -> dict[str, object]:
         raw_audio=torch.randn(4, dtype=torch.float32),
         raw_sr=32000,
         speed_factor=1.0,
+        fragment_interval=0.3,
         sample_steps=32,
         super_sampling=False,
     )
@@ -134,7 +137,9 @@ def test_has_decode_conditioning_allows_empty_refer_audio_16k_for_non_v2pro():
     info["gpt_sovits_transport"] = GPTSoVITSStageTransport(
         request_id=transport.request_id,
         semantic_tokens=transport.semantic_tokens,
+        semantic_token_segments=transport.semantic_token_segments,
         phones=transport.phones,
+        segment_phones=transport.segment_phones,
         prompt_phones=transport.prompt_phones,
         prompt_semantic=transport.prompt_semantic,
         refer_audio_spec=transport.refer_audio_spec,
@@ -142,6 +147,7 @@ def test_has_decode_conditioning_allows_empty_refer_audio_16k_for_non_v2pro():
         raw_audio=transport.raw_audio,
         raw_sr=transport.raw_sr,
         speed_factor=transport.speed_factor,
+        fragment_interval=transport.fragment_interval,
         sample_steps=transport.sample_steps,
         super_sampling=transport.super_sampling,
     ).to_transport_dict()

@@ -511,7 +511,7 @@ class PrepareCoordinator:
         self.ref_audio_asset_cache: Dict[str, Tuple[PreparedRefAudioAsset, float]] = {}
         self.use_async_text_feature_path = bool(
             getattr(tts, "prepare_bert_batch_worker", None) is not None
-            and os.environ.get("GPTSOVITS_PREPARE_TEXT_FEATURE_DIRECT", "0") != "0"
+            and os.environ.get("GPTSOVITS_PREPARE_TEXT_FEATURE_DIRECT", "1") != "0"
         )
         self.max_inflight = max(0, int(os.environ.get("GPTSOVITS_PREPARE_MAX_INFLIGHT", "0")))
         gate_poll_ms = int(os.environ.get("GPTSOVITS_PREPARE_GATE_POLL_MS", "1"))
