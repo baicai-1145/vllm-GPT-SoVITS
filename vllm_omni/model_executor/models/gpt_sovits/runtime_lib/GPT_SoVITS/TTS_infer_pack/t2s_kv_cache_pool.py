@@ -47,6 +47,8 @@ class T2SKVCachePool:
         hidden_dim: int,
         max_batch_size: int,
         max_seq_len: int,
+        hard_max_batch_size: int = 0,
+        hard_max_seq_len: int = 0,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
@@ -54,6 +56,8 @@ class T2SKVCachePool:
         self.hidden_dim = int(hidden_dim)
         self.max_batch_size = int(max_batch_size)
         self.max_seq_len = int(max_seq_len)
+        self.hard_max_batch_size = max(0, int(hard_max_batch_size))
+        self.hard_max_seq_len = max(0, int(hard_max_seq_len))
         self.k_buffers: List[torch.Tensor] = []
         self.v_buffers: List[torch.Tensor] = []
         self.decode_mask_buffer: Optional[torch.Tensor] = None
@@ -105,6 +109,8 @@ class T2SKVCachePool:
                 allocated_bytes += int(self.decode_mask_buffer.numel() * self.decode_mask_buffer.element_size())
             self.state.enabled = True
             self.state.allocated_bytes = allocated_bytes
+            self.state.max_batch_size = int(self.max_batch_size)
+            self.state.max_seq_len = int(self.max_seq_len)
         except Exception as exc:
             self._disable(str(exc))
 
@@ -115,6 +121,122 @@ class T2SKVCachePool:
         self.positions = None
         self.state.enabled = False
         self.state.last_fallback_reason = str(reason)
+
+    @staticmethod
+    def _get_seq_reserve_tokens() -> int:
+        try:
+            return max(1, int(os.environ.get("GPTSOVITS_ENGINE_KV_POOL_SEQ_RESERVE_TOKENS", "32")))
+        except Exception:
+            return 32
+
+    @classmethod
+    def _round_seq_capacity(cls, min_seq_len: int) -> int:
+        reserve = cls._get_seq_reserve_tokens()
+        return max(reserve, int(((max(1, min_seq_len) + reserve - 1) // reserve) * reserve))
+
+    def _update_allocated_bytes(self) -> None:
+        allocated_bytes = 0
+        for tensor in self.k_buffers + self.v_buffers:
+            allocated_bytes += int(tensor.numel() * tensor.element_size())
+        if self.decode_mask_buffer is not None:
+            allocated_bytes += int(self.decode_mask_buffer.numel() * self.decode_mask_buffer.element_size())
+        self.state.allocated_bytes = allocated_bytes
+        self.state.max_batch_size = int(self.max_batch_size)
+        self.state.max_seq_len = int(self.max_seq_len)
+
+    def ensure_capacity(
+        self,
+        *,
+        batch_size: int,
+        max_kv_len: int,
+        preserve_existing: bool,
+    ) -> bool:
+        requested_batch_size = max(1, int(batch_size))
+        requested_seq_len = max(1, int(max_kv_len))
+        if self.hard_max_batch_size > 0 and requested_batch_size > self.hard_max_batch_size:
+            self.record_fallback(
+                f"resize_batch_limit_overflow(batch={requested_batch_size},limit={self.hard_max_batch_size})"
+            )
+            return False
+        if self.hard_max_seq_len > 0 and requested_seq_len > self.hard_max_seq_len:
+            self.record_fallback(
+                f"resize_seq_limit_overflow(seq={requested_seq_len},limit={self.hard_max_seq_len})"
+            )
+            return False
+
+        if preserve_existing:
+            target_batch_size = max(self.max_batch_size, requested_batch_size)
+            target_seq_len = max(self.max_seq_len, self._round_seq_capacity(requested_seq_len))
+        else:
+            target_batch_size = requested_batch_size
+            target_seq_len = self._round_seq_capacity(requested_seq_len)
+
+        if self.hard_max_batch_size > 0:
+            target_batch_size = min(target_batch_size, self.hard_max_batch_size)
+        if self.hard_max_seq_len > 0:
+            target_seq_len = min(target_seq_len, self.hard_max_seq_len)
+
+        if (
+            self.state.enabled
+            and self.max_batch_size == target_batch_size
+            and self.max_seq_len == target_seq_len
+            and self.can_handle(requested_batch_size, requested_seq_len)
+        ):
+            return True
+        if preserve_existing and self.can_handle(requested_batch_size, requested_seq_len):
+            return True
+
+        old_k_buffers = self.k_buffers
+        old_v_buffers = self.v_buffers
+        old_active_rows = int(self.state.active_rows)
+        copy_rows = min(old_active_rows, target_batch_size) if preserve_existing else 0
+        copy_seq_len = min(self.max_seq_len, target_seq_len) if preserve_existing else 0
+        try:
+            next_k_buffers = [
+                torch.empty(
+                    (target_batch_size, target_seq_len, self.hidden_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                for _ in range(self.num_layers)
+            ]
+            next_v_buffers = [
+                torch.empty(
+                    (target_batch_size, target_seq_len, self.hidden_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                for _ in range(self.num_layers)
+            ]
+            next_decode_mask_buffer = torch.empty(
+                (target_batch_size, 1, 1, target_seq_len + 1),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            next_positions = torch.arange(target_seq_len + 1, device=self.device, dtype=torch.long)
+            if copy_rows > 0 and copy_seq_len > 0:
+                for layer_index in range(self.num_layers):
+                    next_k_buffers[layer_index][:copy_rows, :copy_seq_len, :].copy_(
+                        old_k_buffers[layer_index][:copy_rows, :copy_seq_len, :]
+                    )
+                    next_v_buffers[layer_index][:copy_rows, :copy_seq_len, :].copy_(
+                        old_v_buffers[layer_index][:copy_rows, :copy_seq_len, :]
+                    )
+        except Exception as exc:
+            self.record_fallback(f"resize_failed(batch={target_batch_size},seq={target_seq_len}): {exc}")
+            return False
+
+        self.k_buffers = next_k_buffers
+        self.v_buffers = next_v_buffers
+        self.decode_mask_buffer = next_decode_mask_buffer
+        self.positions = next_positions
+        self.max_batch_size = int(target_batch_size)
+        self.max_seq_len = int(target_seq_len)
+        self.state.enabled = True
+        self.state.allocated_at = time.time()
+        self.state.active_rows = copy_rows
+        self._update_allocated_bytes()
+        return True
 
     @staticmethod
     def _copy_rows_left_aligned(dst: torch.Tensor, src: torch.Tensor, kv_lens: Sequence[int]) -> None:
@@ -169,6 +291,9 @@ class T2SKVCachePool:
             [buffer[:batch_size, :, :] for buffer in self.k_buffers],
             [buffer[:batch_size, :, :] for buffer in self.v_buffers],
         )
+
+    def get_views(self, batch_size: int) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        return self._build_views(batch_size)
 
     def pack_dynamic_cache_layers(
         self,
@@ -265,10 +390,22 @@ def attach_t2s_kv_cache_pool(model: Any, device: Any) -> T2SKVCachePoolState:
     params = list(model.parameters())
     model_dtype = params[0].dtype if params else torch.float32
     max_batch_raw = os.environ.get("GPTSOVITS_ENGINE_KV_POOL_MAX_BATCH")
-    if max_batch_raw in [None, ""]:
-        max_batch_raw = os.environ.get("GPTSOVITS_T2S_MAX_ACTIVE_BATCH", "1")
-    max_batch_size = max(1, int(max_batch_raw))
-    max_seq_len = max(1, int(os.environ.get("GPTSOVITS_ENGINE_KV_POOL_MAX_SEQ_LEN", "8192")))
+    t2s_max_active_batch_raw = os.environ.get("GPTSOVITS_T2S_MAX_ACTIVE_BATCH")
+    if max_batch_raw not in [None, ""]:
+        hard_max_batch_size = max(1, int(max_batch_raw))
+        max_batch_size = hard_max_batch_size
+    elif t2s_max_active_batch_raw not in [None, ""]:
+        hard_max_batch_size = max(1, int(t2s_max_active_batch_raw))
+        max_batch_size = hard_max_batch_size
+    else:
+        hard_max_batch_size = 0
+        max_batch_size = 1
+    hard_max_seq_len = max(1, int(os.environ.get("GPTSOVITS_ENGINE_KV_POOL_MAX_SEQ_LEN", "8192")))
+    init_seq_raw = os.environ.get("GPTSOVITS_ENGINE_KV_POOL_INIT_MAX_SEQ_LEN")
+    if init_seq_raw in [None, ""]:
+        max_seq_len = min(hard_max_seq_len, 256)
+    else:
+        max_seq_len = min(hard_max_seq_len, max(1, int(init_seq_raw)))
     pool = T2SKVCachePool(
         device=torch.device(device),
         dtype=model_dtype,
@@ -276,6 +413,8 @@ def attach_t2s_kv_cache_pool(model: Any, device: Any) -> T2SKVCachePoolState:
         hidden_dim=int(getattr(model, "model_dim", 0)),
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        hard_max_batch_size=hard_max_batch_size,
+        hard_max_seq_len=hard_max_seq_len,
     )
     setattr(model, "kv_cache_pool", pool if pool.state.enabled else None)
     setattr(model, "kv_cache_pool_state", pool.state)

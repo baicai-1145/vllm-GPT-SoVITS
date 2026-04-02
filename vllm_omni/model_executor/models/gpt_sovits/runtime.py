@@ -2421,22 +2421,31 @@ class GPTSoVITSRuntime:
     ) -> torch.Tensor:
         if not y_sequences:
             raise ValueError("GPT-SoVITS AR decode requires at least one semantic history")
-        if len(y_sequences) == 1:
-            sequence = y_sequences[0]
-            last_tokens = sequence[-1:].unsqueeze(0)
-            y_emb = model.ar_audio_embedding(last_tokens)
-            position_id = int(sequence.shape[0] - 1)
-            self._ensure_audio_position_encoding(model, position_id, y_emb.dtype, y_emb.device)
-            pos_emb = model.ar_audio_position.pe.narrow(1, position_id, 1)
-            return y_emb * model.ar_audio_position.x_scale + model.ar_audio_position.alpha * pos_emb.to(
-                dtype=y_emb.dtype,
-                device=y_emb.device,
-            )
-        last_tokens = torch.stack([seq[-1:] for seq in y_sequences], dim=0)
-        y_emb = model.ar_audio_embedding(last_tokens)
-        position_ids = torch.tensor([int(seq.shape[0] - 1) for seq in y_sequences], dtype=torch.long, device=y_emb.device)
+        last_tokens = torch.tensor(
+            [int(sequence[-1].item()) for sequence in y_sequences],
+            dtype=torch.long,
+            device=y_sequences[0].device,
+        )
+        position_ids = torch.tensor(
+            [int(sequence.shape[0] - 1) for sequence in y_sequences],
+            dtype=torch.long,
+            device=last_tokens.device,
+        )
+        return self._build_next_xy_pos_from_sampled_tokens(model, last_tokens, position_ids)
+
+    def _build_next_xy_pos_from_sampled_tokens(
+        self,
+        model: Any,
+        sampled_tokens: torch.LongTensor,
+        position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        if sampled_tokens.numel() <= 0 or position_ids.numel() <= 0:
+            raise ValueError("GPT-SoVITS AR decode requires sampled tokens and position ids")
+        sampled_tokens = sampled_tokens.view(-1, 1)
+        position_ids = position_ids.view(-1)
+        y_emb = model.ar_audio_embedding(sampled_tokens)
         self._ensure_audio_position_encoding(model, int(position_ids.max().item()), y_emb.dtype, y_emb.device)
-        pos_emb = model.ar_audio_position.pe[0].index_select(0, position_ids).unsqueeze(1)
+        pos_emb = model.ar_audio_position.pe[0].index_select(0, position_ids.to(device=y_emb.device, dtype=torch.long)).unsqueeze(1)
         return y_emb * model.ar_audio_position.x_scale + model.ar_audio_position.alpha * pos_emb.to(
             dtype=y_emb.dtype,
             device=y_emb.device,
@@ -2472,9 +2481,23 @@ class GPTSoVITSRuntime:
             return False
         batch_size = int(active_batch.kv_lens.shape[0])
         max_kv_len = int(active_batch.kv_lens.max().item())
-        if max_kv_len + 1 > int(pool.max_seq_len):
+        required_seq_len = max_kv_len + 1
+        ensure_capacity = getattr(pool, "ensure_capacity", None)
+        if callable(ensure_capacity):
+            capacity_ok = bool(
+                ensure_capacity(
+                    batch_size=batch_size,
+                    max_kv_len=required_seq_len,
+                    preserve_existing=False,
+                )
+            )
+        else:
+            capacity_ok = required_seq_len <= int(pool.max_seq_len)
+        if not capacity_ok:
             try:
-                pool.record_fallback(f"pack_decode_headroom_overflow(batch={batch_size},seq={max_kv_len},next={max_kv_len + 1})")
+                pool.record_fallback(
+                    f"pack_decode_headroom_overflow(batch={batch_size},seq={max_kv_len},next={required_seq_len})"
+                )
             except Exception:
                 pass
             active_batch.kv_cache_pooled = False
@@ -2924,6 +2947,155 @@ class GPTSoVITSRuntime:
         return mapped
 
     @staticmethod
+    def _t2s_prealloc_nomask_grouping_enabled() -> bool:
+        return str(os.environ.get("GPTSOVITS_T2S_PREALLOC_NOMASK_GROUPING", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _get_t2s_prealloc_nomask_min_group_size() -> int:
+        raw_value = str(os.environ.get("GPTSOVITS_T2S_PREALLOC_NOMASK_MIN_GROUP_SIZE", "16")).strip()
+        try:
+            return max(2, int(raw_value))
+        except Exception:
+            return 16
+
+    def _run_dynamic_prealloc_decode_subbatch(
+        self,
+        model: Any,
+        active_batch: Any,
+        *,
+        row_index: torch.LongTensor,
+        row_next_kv_lens: torch.LongTensor,
+        attn_mask: torch.Tensor | None,
+        pending_cuda_timings: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] | None,
+        timing_device: torch.device | None,
+        stats: dict[str, Any] | None,
+        use_nomask_fast_path: bool,
+    ) -> torch.Tensor:
+        subgroup_xy = torch.index_select(active_batch.xy_pos, dim=0, index=row_index)
+        subgroup_kv_lens = torch.index_select(active_batch.kv_lens, dim=0, index=row_index)
+        subgroup_k_cache = [
+            torch.index_select(layer, dim=0, index=row_index)
+            for layer in active_batch.k_cache
+        ]
+        subgroup_v_cache = [
+            torch.index_select(layer, dim=0, index=row_index)
+            for layer in active_batch.v_cache
+        ]
+        subgroup_xy_dec, subgroup_k_cache, subgroup_v_cache = self._time_t2s_call(
+            lambda: model.decode_next_token_prealloc_runtime(
+                subgroup_xy,
+                subgroup_k_cache,
+                subgroup_v_cache,
+                subgroup_kv_lens,
+                attn_mask,
+            ),
+            pending_cuda_timings=pending_cuda_timings,
+            stat_key="dynamic_decode_kernel_ms",
+            device=timing_device,
+        )
+        self._merge_numeric_t2s_stats(
+            stats,
+            self._map_prealloc_profile_to_dynamic_stats(
+                getattr(model, "get_last_prealloc_decode_profile", lambda: {})(),
+            ),
+        )
+        if use_nomask_fast_path:
+            self._increment_t2s_stat(stats, "dynamic_prealloc_nomask_groups")
+            self._increment_t2s_stat(stats, "dynamic_prealloc_nomask_rows", int(row_index.numel()))
+        else:
+            self._increment_t2s_stat(stats, "dynamic_prealloc_masked_subbatches")
+            self._increment_t2s_stat(stats, "dynamic_prealloc_masked_rows", int(row_index.numel()))
+        active_batch.xy_pos.index_copy_(0, row_index, subgroup_xy_dec)
+        for layer_index in range(len(active_batch.k_cache)):
+            active_batch.k_cache[layer_index].index_copy_(0, row_index, subgroup_k_cache[layer_index])
+            active_batch.v_cache[layer_index].index_copy_(0, row_index, subgroup_v_cache[layer_index])
+        return subgroup_xy_dec
+
+    def _maybe_decode_dynamic_prealloc_grouped_by_kv_lens(
+        self,
+        model: Any,
+        active_batch: Any,
+        *,
+        next_kv_lens: torch.LongTensor,
+        pending_cuda_timings: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] | None,
+        timing_device: torch.device | None,
+        stats: dict[str, Any] | None,
+    ) -> torch.Tensor | None:
+        if (
+            not self._t2s_prealloc_nomask_grouping_enabled()
+            or active_batch.k_cache is None
+            or active_batch.v_cache is None
+            or active_batch.kv_lens is None
+            or int(next_kv_lens.numel()) < self._get_t2s_prealloc_nomask_min_group_size()
+        ):
+            return None
+        unique_lens, inverse, counts = torch.unique(
+            next_kv_lens,
+            sorted=True,
+            return_inverse=True,
+            return_counts=True,
+        )
+        min_group_size = self._get_t2s_prealloc_nomask_min_group_size()
+        group_indices: list[torch.LongTensor] = []
+        processed_mask = torch.zeros_like(next_kv_lens, dtype=torch.bool)
+        for group_index, group_count in enumerate(counts.tolist()):
+            if int(group_count) < min_group_size:
+                continue
+            row_index = (inverse == group_index).nonzero(as_tuple=False).view(-1)
+            if int(row_index.numel()) < min_group_size:
+                continue
+            group_indices.append(row_index)
+            processed_mask[row_index] = True
+        if not group_indices:
+            return None
+
+        xy_dec = torch.empty_like(active_batch.xy_pos)
+        for row_index in group_indices:
+            subgroup_xy_dec = self._run_dynamic_prealloc_decode_subbatch(
+                model,
+                active_batch,
+                row_index=row_index,
+                row_next_kv_lens=torch.index_select(next_kv_lens, dim=0, index=row_index),
+                attn_mask=None,
+                pending_cuda_timings=pending_cuda_timings,
+                timing_device=timing_device,
+                stats=stats,
+                use_nomask_fast_path=True,
+            )
+            xy_dec.index_copy_(0, row_index, subgroup_xy_dec)
+
+        leftover_index = (~processed_mask).nonzero(as_tuple=False).view(-1)
+        if int(leftover_index.numel()) > 0:
+            leftover_next_kv_lens = torch.index_select(next_kv_lens, dim=0, index=leftover_index)
+            leftover_mask = self._time_t2s_call(
+                lambda: self._build_decode_mask_from_kv_lens(
+                    leftover_next_kv_lens,
+                    device=timing_device or active_batch.xy_pos.device,
+                ),
+                pending_cuda_timings=pending_cuda_timings,
+                stat_key="dynamic_materialize_decode_mask_ms",
+                device=timing_device,
+            )
+            subgroup_xy_dec = self._run_dynamic_prealloc_decode_subbatch(
+                model,
+                active_batch,
+                row_index=leftover_index,
+                row_next_kv_lens=leftover_next_kv_lens,
+                attn_mask=leftover_mask,
+                pending_cuda_timings=pending_cuda_timings,
+                timing_device=timing_device,
+                stats=stats,
+                use_nomask_fast_path=False,
+            )
+            xy_dec.index_copy_(0, leftover_index, subgroup_xy_dec)
+        return xy_dec
+
+    @staticmethod
     def _stack_token_sequences_if_same_length(
         token_sequences: Sequence[torch.LongTensor],
     ) -> torch.LongTensor | None:
@@ -3210,7 +3382,7 @@ class GPTSoVITSRuntime:
         *,
         max_steps: int,
         stats: dict[str, Any] | None = None,
-    ) -> tuple[list[GPTSoVITSARFinishedItem], list[int], list[torch.LongTensor]]:
+    ) -> tuple[list[GPTSoVITSARFinishedItem], list[int], list[torch.LongTensor], torch.Tensor | None]:
         sampling_started = time.perf_counter()
         finished_items: list[GPTSoVITSARFinishedItem] = []
         keep_indices: list[int] = []
@@ -3246,9 +3418,17 @@ class GPTSoVITSRuntime:
                 and sampled_token != model.EOS
                 and argmax_token != model.EOS
             ):
-                self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+                elapsed_ms = (time.perf_counter() - finish_scan_started) * 1000.0
+                self._increment_t2s_stat(stats, "sampling_finish_scan_single_fast_path_calls")
+                self._accumulate_t2s_stat(stats, "sampling_finish_scan_single_fast_path_ms", elapsed_ms)
+                self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", elapsed_ms)
                 self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
-                return [], [0], [new_history]
+                next_xy_pos = self._build_next_xy_pos_from_sampled_tokens(
+                    model,
+                    sampled_tensor.view(-1),
+                    torch.tensor([int(current_history.shape[0])], dtype=torch.long, device=sampled_tensor.device),
+                )
+                return [], [0], [new_history], next_xy_pos
 
             finish_reason: str | None = None
             if state.early_stop_num != -1 and (new_history.shape[0] - prefix_len) > state.early_stop_num:
@@ -3274,12 +3454,23 @@ class GPTSoVITSRuntime:
                         finish_reason=finish_reason,
                     )
                 )
-                self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+                elapsed_ms = (time.perf_counter() - finish_scan_started) * 1000.0
+                self._increment_t2s_stat(stats, "sampling_finish_scan_single_finish_path_calls")
+                self._accumulate_t2s_stat(stats, "sampling_finish_scan_single_finish_path_ms", elapsed_ms)
+                self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", elapsed_ms)
                 self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
-                return finished_items, [], []
-            self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+                return finished_items, [], [], None
+            elapsed_ms = (time.perf_counter() - finish_scan_started) * 1000.0
+            self._increment_t2s_stat(stats, "sampling_finish_scan_single_fallback_path_calls")
+            self._accumulate_t2s_stat(stats, "sampling_finish_scan_single_fallback_path_ms", elapsed_ms)
+            self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", elapsed_ms)
             self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
-            return [], [0], [new_history]
+            next_xy_pos = self._build_next_xy_pos_from_sampled_tokens(
+                model,
+                sampled_tensor.view(-1),
+                torch.tensor([int(current_history.shape[0])], dtype=torch.long, device=sampled_tensor.device),
+            )
+            return [], [0], [new_history], next_xy_pos
 
         uniform_sampling_key = self._uniform_sampling_group_key(active_batch)
         sampled_items: list[torch.Tensor]
@@ -3303,12 +3494,25 @@ class GPTSoVITSRuntime:
                 and not bool(sampled_token_tensor.eq(model.EOS).any().item())
                 and not bool(argmax_token_tensor.eq(model.EOS).any().item())
             ):
-                self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+                elapsed_ms = (time.perf_counter() - finish_scan_started) * 1000.0
+                self._increment_t2s_stat(stats, "sampling_finish_scan_uniform_fast_path_calls")
+                self._accumulate_t2s_stat(stats, "sampling_finish_scan_uniform_fast_path_ms", elapsed_ms)
+                self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", elapsed_ms)
                 self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
+                next_xy_pos = self._build_next_xy_pos_from_sampled_tokens(
+                    model,
+                    sampled_token_tensor,
+                    torch.tensor(
+                        [int(sequence.shape[0]) for sequence in active_batch.y_sequences],
+                        dtype=torch.long,
+                        device=sampled_token_tensor.device,
+                    ),
+                )
                 return (
                     [],
                     list(range(len(active_batch.states))),
                     self._append_sampled_token_sequences(active_batch.y_sequences, sampled_token_tensor),
+                    next_xy_pos,
                 )
             if (
                 all(state.early_stop_num == -1 for state in active_batch.states)
@@ -3330,8 +3534,18 @@ class GPTSoVITSRuntime:
                             keep_index_tensor.to(device=sampled_token_tensor.device, dtype=torch.long),
                         )
                         updated_sequences = self._append_sampled_token_sequences(kept_histories, kept_sampled_tokens)
+                        next_xy_pos = self._build_next_xy_pos_from_sampled_tokens(
+                            model,
+                            kept_sampled_tokens,
+                            torch.tensor(
+                                [int(history.shape[0]) for history in kept_histories],
+                                dtype=torch.long,
+                                device=kept_sampled_tokens.device,
+                            ),
+                        )
                     else:
                         updated_sequences = []
+                        next_xy_pos = None
                     for finished_index in finished_index_tensor.tolist():
                         state = active_batch.states[int(finished_index)]
                         prefix_len = int(prefix_lens[int(finished_index)])
@@ -3346,14 +3560,16 @@ class GPTSoVITSRuntime:
                                 finish_reason=finish_reason,
                             )
                         )
-                    self._accumulate_t2s_stat(
-                        stats,
-                        "sampling_finish_scan_ms",
-                        (time.perf_counter() - finish_scan_started) * 1000.0,
-                    )
+                    elapsed_ms = (time.perf_counter() - finish_scan_started) * 1000.0
+                    self._increment_t2s_stat(stats, "sampling_finish_scan_uniform_eos_path_calls")
+                    self._accumulate_t2s_stat(stats, "sampling_finish_scan_uniform_eos_path_ms", elapsed_ms)
+                    self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", elapsed_ms)
                     self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
-                    return finished_items, keep_indices, updated_sequences
-            self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+                    return finished_items, keep_indices, updated_sequences, next_xy_pos
+            elapsed_ms = (time.perf_counter() - finish_scan_started) * 1000.0
+            self._increment_t2s_stat(stats, "sampling_finish_scan_uniform_fallback_path_calls")
+            self._accumulate_t2s_stat(stats, "sampling_finish_scan_uniform_fallback_path_ms", elapsed_ms)
+            self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", elapsed_ms)
             sampled_items = [sampled_tensor[index : index + 1] for index in range(sampled_tensor.shape[0])]
             argmax_tokens = [int(item) for item in argmax_tensor.tolist()]
         else:
@@ -3417,9 +3633,25 @@ class GPTSoVITSRuntime:
             else:
                 keep_indices.append(batch_index)
                 updated_sequences.append(new_history)
-        self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
+        elapsed_ms = (time.perf_counter() - finish_scan_started) * 1000.0
+        self._increment_t2s_stat(stats, "sampling_finish_scan_general_path_calls")
+        self._accumulate_t2s_stat(stats, "sampling_finish_scan_general_path_ms", elapsed_ms)
+        self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", elapsed_ms)
         self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
-        return finished_items, keep_indices, updated_sequences
+        next_xy_pos = None
+        if keep_indices:
+            keep_index_tensor = torch.tensor(keep_indices, dtype=torch.long, device=sampled_token_tensor.device)
+            kept_sampled_tokens = sampled_token_tensor.index_select(0, keep_index_tensor)
+            next_xy_pos = self._build_next_xy_pos_from_sampled_tokens(
+                model,
+                kept_sampled_tokens,
+                torch.tensor(
+                    [int(active_batch.y_sequences[index].shape[0]) for index in keep_indices],
+                    dtype=torch.long,
+                    device=sampled_token_tensor.device,
+                ),
+            )
+        return finished_items, keep_indices, updated_sequences, next_xy_pos
 
     def _decode_active_batch_one_step(
         self,
@@ -3499,17 +3731,34 @@ class GPTSoVITSRuntime:
                 if pool is None:
                     raise ValueError("GPT-SoVITS AR pooled KV cache is unavailable")
                 next_kv_lens = active_batch.kv_lens + 1
-                if int(next_kv_lens.max().item()) > int(pool.max_seq_len):
+                required_seq_len = int(next_kv_lens.max().item())
+                ensure_capacity = getattr(pool, "ensure_capacity", None)
+                if callable(ensure_capacity):
+                    capacity_ok = bool(
+                        ensure_capacity(
+                            batch_size=int(next_kv_lens.shape[0]),
+                            max_kv_len=required_seq_len,
+                            preserve_existing=True,
+                        )
+                    )
+                else:
+                    capacity_ok = required_seq_len <= int(pool.max_seq_len)
+                if not capacity_ok:
                     self._fallback_pooled_active_batch_to_dynamic_cache(
                         model,
                         active_batch,
                         reason=(
                             "decode_headroom_overflow"
                             f"(batch={int(next_kv_lens.shape[0])},seq={int(active_batch.kv_lens.max().item())},"
-                            f"next={int(next_kv_lens.max().item())})"
+                            f"next={required_seq_len})"
                         ),
                     )
                 else:
+                    get_views = getattr(pool, "get_views", None)
+                    if callable(get_views):
+                        active_batch.k_cache, active_batch.v_cache = get_views(int(next_kv_lens.shape[0]))
+                    active_batch.kv_cache_capacity = int(pool.max_seq_len)
+                    active_batch.kv_cache_batch_capacity = int(pool.max_batch_size)
                     batched_decode_attn_mask = self._time_t2s_call(
                         lambda: pool.build_decode_mask(next_kv_lens),
                         pending_cuda_timings=pending_cuda_timings,
@@ -3540,7 +3789,7 @@ class GPTSoVITSRuntime:
                     )
                     if pending_cuda_timings is not None:
                         self._flush_t2s_timing_records(stats, pending_cuda_timings, device=xy_dec.device)
-                    finished_items, keep_indices, updated_sequences = self._sample_active_batch_requests(
+                    finished_items, keep_indices, updated_sequences, next_xy_pos = self._sample_active_batch_requests(
                         model,
                         active_batch,
                         logits,
@@ -3556,7 +3805,10 @@ class GPTSoVITSRuntime:
                         active_batch.step_indices = active_batch.step_indices + 1
                         active_batch.kv_lens = active_batch.kv_lens + 1
                         xy_pos_started = time.perf_counter()
-                        active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+                        active_batch.xy_pos = next_xy_pos if next_xy_pos is not None else self._build_next_xy_pos(
+                            model,
+                            active_batch.y_sequences,
+                        )
                         self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
                         _record_stage("pooled", active_batch)
                         return active_batch, finished_items
@@ -3579,7 +3831,10 @@ class GPTSoVITSRuntime:
                             keep_tensor=keep_tensor,
                         )
                     xy_pos_started = time.perf_counter()
-                    active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+                    active_batch.xy_pos = next_xy_pos if next_xy_pos is not None else self._build_next_xy_pos(
+                        model,
+                        active_batch.y_sequences,
+                    )
                     self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
                     _record_stage("pooled", active_batch)
                     return active_batch, finished_items
@@ -3589,30 +3844,39 @@ class GPTSoVITSRuntime:
                     active_batch,
                     min_capacity=int(next_kv_lens.max().item()),
                 )
-                batched_decode_attn_mask = self._time_t2s_call(
-                    lambda: self._build_decode_mask_from_kv_lens(next_kv_lens, device=timing_device or active_batch.xy_pos.device),
+                xy_dec = self._maybe_decode_dynamic_prealloc_grouped_by_kv_lens(
+                    model,
+                    active_batch,
+                    next_kv_lens=next_kv_lens,
                     pending_cuda_timings=pending_cuda_timings,
-                    stat_key="dynamic_materialize_decode_mask_ms",
-                    device=timing_device,
+                    timing_device=timing_device,
+                    stats=stats,
                 )
-                xy_dec, active_batch.k_cache, active_batch.v_cache = self._time_t2s_call(
-                    lambda: model.decode_next_token_prealloc_runtime(
-                        active_batch.xy_pos,
-                        active_batch.k_cache,
-                        active_batch.v_cache,
-                        active_batch.kv_lens,
-                        batched_decode_attn_mask,
-                    ),
-                    pending_cuda_timings=pending_cuda_timings,
-                    stat_key="dynamic_decode_kernel_ms",
-                    device=timing_device,
-                )
-                self._merge_numeric_t2s_stats(
-                    stats,
-                    self._map_prealloc_profile_to_dynamic_stats(
-                        getattr(model, "get_last_prealloc_decode_profile", lambda: {})(),
-                    ),
-                )
+                if xy_dec is None:
+                    batched_decode_attn_mask = self._time_t2s_call(
+                        lambda: self._build_decode_mask_from_kv_lens(next_kv_lens, device=timing_device or active_batch.xy_pos.device),
+                        pending_cuda_timings=pending_cuda_timings,
+                        stat_key="dynamic_materialize_decode_mask_ms",
+                        device=timing_device,
+                    )
+                    xy_dec, active_batch.k_cache, active_batch.v_cache = self._time_t2s_call(
+                        lambda: model.decode_next_token_prealloc_runtime(
+                            active_batch.xy_pos,
+                            active_batch.k_cache,
+                            active_batch.v_cache,
+                            active_batch.kv_lens,
+                            batched_decode_attn_mask,
+                        ),
+                        pending_cuda_timings=pending_cuda_timings,
+                        stat_key="dynamic_decode_kernel_ms",
+                        device=timing_device,
+                    )
+                    self._merge_numeric_t2s_stats(
+                        stats,
+                        self._map_prealloc_profile_to_dynamic_stats(
+                            getattr(model, "get_last_prealloc_decode_profile", lambda: {})(),
+                        ),
+                    )
                 active_batch.decode_attn_mask = None
             else:
                 batched_decode_attn_mask = None
@@ -3658,7 +3922,7 @@ class GPTSoVITSRuntime:
         )
         if pending_cuda_timings is not None:
             self._flush_t2s_timing_records(stats, pending_cuda_timings, device=xy_dec.device)
-        finished_items, keep_indices, updated_sequences = self._sample_active_batch_requests(
+        finished_items, keep_indices, updated_sequences, next_xy_pos = self._sample_active_batch_requests(
             model,
             active_batch,
             logits,
@@ -3678,7 +3942,10 @@ class GPTSoVITSRuntime:
             if not was_prefill and active_batch.kv_lens is not None:
                 active_batch.kv_lens = active_batch.kv_lens + 1
             xy_pos_started = time.perf_counter()
-            active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+            active_batch.xy_pos = next_xy_pos if next_xy_pos is not None else self._build_next_xy_pos(
+                model,
+                active_batch.y_sequences,
+            )
             self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
             _record_stage("prefill" if was_prefill else "dynamic", active_batch)
             return active_batch, finished_items
@@ -3709,7 +3976,10 @@ class GPTSoVITSRuntime:
             )
 
         xy_pos_started = time.perf_counter()
-        active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
+        active_batch.xy_pos = next_xy_pos if next_xy_pos is not None else self._build_next_xy_pos(
+            model,
+            active_batch.y_sequences,
+        )
         self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
         _record_stage("prefill" if was_prefill else "dynamic", active_batch)
         return active_batch, finished_items

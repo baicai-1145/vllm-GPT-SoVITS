@@ -7,6 +7,7 @@ from typing import Any, Callable, List, Optional
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn import functional as F
 from tqdm import tqdm
 
@@ -429,6 +430,31 @@ class Text2SemanticDecoder(nn.Module):
         }
 
     @staticmethod
+    def _get_decode_nomask_sdpa_backend() -> SDPBackend | None:
+        raw_value = os.environ.get("GPTSOVITS_T2S_DECODE_NOMASK_SDPA_BACKEND", "efficient").strip().lower()
+        backend_mapping = {
+            "auto": None,
+            "efficient": SDPBackend.EFFICIENT_ATTENTION,
+            "flash": SDPBackend.FLASH_ATTENTION,
+            "math": SDPBackend.MATH,
+        }
+        return backend_mapping.get(raw_value, SDPBackend.EFFICIENT_ATTENTION)
+
+    @classmethod
+    def _run_decode_sdpa(
+        cls,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        backend = cls._get_decode_nomask_sdpa_backend()
+        if attn_mask is None and query.device.type == "cuda" and backend is not None:
+            with sdpa_kernel(backends=[backend]):
+                return F.scaled_dot_product_attention(query, key, value, None)
+        return F.scaled_dot_product_attention(query, key, value, attn_mask)
+
+    @staticmethod
     def _profile_t2s_call(
         fn: Callable[[], Any],
         *,
@@ -533,7 +559,7 @@ class Text2SemanticDecoder(nn.Module):
         k_context = k_context.view(batch_size, next_max_kv_len, self.num_head, -1).transpose(1, 2)
         v_context = v_context.view(batch_size, next_max_kv_len, self.num_head, -1).transpose(1, 2)
 
-        attn = F.scaled_dot_product_attention(q, k_context, v_context, sdpa_attn_mask)
+        attn = self._run_decode_sdpa(q, k_context, v_context, sdpa_attn_mask)
         attn = attn.transpose(1, 2).reshape(batch_size, 1, -1)
         attn = F.linear(attn, layer.self_attn.out_proj.weight, layer.self_attn.out_proj.bias)
 
@@ -637,7 +663,7 @@ class Text2SemanticDecoder(nn.Module):
         )
 
         attn = self._profile_t2s_call(
-            lambda: F.scaled_dot_product_attention(q, k_context, v_context, sdpa_attn_mask),
+            lambda: self._run_decode_sdpa(q, k_context, v_context, sdpa_attn_mask),
             records=records,
             stat_key=(
                 "pooled_prealloc_sdpa_ms",
@@ -876,7 +902,7 @@ class Text2SemanticDecoder(nn.Module):
         )
 
         attn = self._profile_t2s_call(
-            lambda: F.scaled_dot_product_attention(q, k_context, v_context, (~attn_mask) if attn_mask is not None else None),
+            lambda: self._run_decode_sdpa(q, k_context, v_context, (~attn_mask) if attn_mask is not None else None),
             records=records,
             stat_key="dynamic_sdpa_ms",
             device=device,
