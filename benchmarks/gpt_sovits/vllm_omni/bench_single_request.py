@@ -104,6 +104,7 @@ class IterationMetrics:
     sample_rate: int
     prepare_profile: dict[str, float]
     t2s_profile: dict[str, Any]
+    vits_profile: dict[str, Any]
 
     def summarized(self) -> dict[str, Any]:
         profile = self.prepare_profile
@@ -136,6 +137,7 @@ class IterationMetrics:
             "g2pw_total_ms": float(profile.get("text_g2pw_total_ms", 0.0))
             + float(profile.get("prompt_text_g2pw_total_ms", 0.0)),
             "t2s_profile": _to_serializable(self.t2s_profile),
+            "vits_profile": _to_serializable(self.vits_profile),
         }
 
 
@@ -190,6 +192,7 @@ def run_iteration(
     start = _stage_timer()
     decoded = runtime.decode_prepared_request(decode_prepared)
     vits_ms = _elapsed_ms(start)
+    vits_profile = runtime.get_last_vits_decode_profile()
 
     start = _stage_timer()
     result = runtime.finalize_decoded_audio(decoded)
@@ -216,6 +219,7 @@ def run_iteration(
         sample_rate=int(result.sample_rate),
         prepare_profile={str(key): float(value) for key, value in prepared.state.prepare_profile.items()},
         t2s_profile=t2s_profile,
+        vits_profile=vits_profile,
     )
 
 

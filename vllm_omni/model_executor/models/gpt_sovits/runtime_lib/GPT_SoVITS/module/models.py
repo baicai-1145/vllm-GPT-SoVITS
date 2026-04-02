@@ -2,6 +2,9 @@ import warnings
 
 warnings.filterwarnings("ignore")
 import math
+import os
+import threading
+import time
 from typing import List
 
 import torch
@@ -24,6 +27,72 @@ from text import symbols2 as symbols_v2
 from torch.cuda.amp import autocast
 import contextlib
 import random
+
+
+def _sync_profile_device(device):
+    try:
+        device_str = str(device)
+        if device_str.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        elif device_str == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+            torch.mps.synchronize()
+    except Exception:
+        pass
+
+
+def _vits_static_bucket_compile_enabled() -> bool:
+    return os.environ.get("GPTSOVITS_COMPILE_VITS_DEC_STATIC_BUCKETS", "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
+def _vits_static_bucket_min_hits() -> int:
+    raw_value = os.environ.get("GPTSOVITS_COMPILE_VITS_DEC_STATIC_BUCKET_MIN_HITS", "2").strip()
+    try:
+        return max(1, int(raw_value))
+    except Exception:
+        return 2
+
+
+def _vits_static_bucket_compile_mode() -> str:
+    return os.environ.get("GPTSOVITS_COMPILE_VITS_DEC_STATIC_BUCKET_MODE", "default").strip() or "default"
+
+
+def _vits_decoder_cudagraph_enabled() -> bool:
+    return os.environ.get("GPTSOVITS_VITS_DECODER_CUDAGRAPH", "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
+def _vits_decoder_cudagraph_min_hits() -> int:
+    raw_value = os.environ.get("GPTSOVITS_VITS_DECODER_CUDAGRAPH_MIN_HITS", "2").strip()
+    try:
+        return max(1, int(raw_value))
+    except Exception:
+        return 2
+
+
+def _vits_decoder_cudagraph_max_entries() -> int:
+    raw_value = os.environ.get("GPTSOVITS_VITS_DECODER_CUDAGRAPH_MAX_ENTRIES", "2").strip()
+    try:
+        return max(1, int(raw_value))
+    except Exception:
+        return 2
+
+
+def _vits_decoder_cudagraph_shape_whitelist() -> set[str]:
+    raw_value = os.environ.get("GPTSOVITS_VITS_DECODER_CUDAGRAPH_SHAPES", "").strip()
+    if not raw_value:
+        return set()
+    return {item.strip() for item in raw_value.split(",") if item.strip()}
 
 
 class StochasticDurationPredictor(nn.Module):
@@ -483,6 +552,94 @@ class Generator(torch.nn.Module):
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
 
+    @staticmethod
+    def _profile_decoder_enabled() -> bool:
+        return str(os.environ.get("GPTSOVITS_PROFILE_VITS_DECODE", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _accumulate_profile_metric(stats, key, elapsed_ms):
+        stats[key] = float(stats.get(key, 0.0)) + float(elapsed_ms)
+
+    @staticmethod
+    def _profile_call(fn, stats, key, device):
+        _sync_profile_device(device)
+        started = time.perf_counter()
+        result = fn()
+        _sync_profile_device(device)
+        Generator._accumulate_profile_metric(stats, key, (time.perf_counter() - started) * 1000.0)
+        return result
+
+    def _run_resblock_profiled(self, block, x, stats, prefix, device):
+        block_started = time.perf_counter()
+        if hasattr(block, "convs1") and hasattr(block, "convs2"):
+            for layer_index, (c1, c2) in enumerate(zip(block.convs1, block.convs2)):
+                residual = x
+                xt = self._profile_call(
+                    lambda current=x: F.leaky_relu(current, modules.LRELU_SLOPE),
+                    stats,
+                    f"{prefix}_layer_{layer_index}_relu1_ms",
+                    device,
+                )
+                xt = self._profile_call(
+                    lambda current=xt, conv=c1: conv(current),
+                    stats,
+                    f"{prefix}_layer_{layer_index}_conv1_ms",
+                    device,
+                )
+                xt = self._profile_call(
+                    lambda current=xt: F.leaky_relu(current, modules.LRELU_SLOPE),
+                    stats,
+                    f"{prefix}_layer_{layer_index}_relu2_ms",
+                    device,
+                )
+                xt = self._profile_call(
+                    lambda current=xt, conv=c2: conv(current),
+                    stats,
+                    f"{prefix}_layer_{layer_index}_conv2_ms",
+                    device,
+                )
+                x = self._profile_call(
+                    lambda current=xt, residual=residual: current + residual,
+                    stats,
+                    f"{prefix}_layer_{layer_index}_residual_add_ms",
+                    device,
+                )
+        elif hasattr(block, "convs"):
+            for layer_index, conv in enumerate(block.convs):
+                residual = x
+                xt = self._profile_call(
+                    lambda current=x: F.leaky_relu(current, modules.LRELU_SLOPE),
+                    stats,
+                    f"{prefix}_layer_{layer_index}_relu_ms",
+                    device,
+                )
+                xt = self._profile_call(
+                    lambda current=xt, conv=conv: conv(current),
+                    stats,
+                    f"{prefix}_layer_{layer_index}_conv_ms",
+                    device,
+                )
+                x = self._profile_call(
+                    lambda current=xt, residual=residual: current + residual,
+                    stats,
+                    f"{prefix}_layer_{layer_index}_residual_add_ms",
+                    device,
+                )
+        else:
+            x = self._profile_call(
+                lambda block=block, current=x: block(current),
+                stats,
+                f"{prefix}_ms",
+                device,
+            )
+        stats[f"{prefix}_total_ms"] = float((time.perf_counter() - block_started) * 1000.0)
+        return x
+
     def forward(self, x, g=None):
         x = self.conv_pre(x)
         if g is not None:
@@ -503,6 +660,69 @@ class Generator(torch.nn.Module):
         x = torch.tanh(x)
 
         return x
+
+    def forward_profiled(self, x, g=None):
+        stats = {
+            "decoder_profiled_calls": 1,
+            "decoder_num_upsamples": int(self.num_upsamples),
+            "decoder_num_kernels": int(self.num_kernels),
+        }
+        total_started = time.perf_counter()
+        device = x.device
+        x = self._profile_call(lambda: self.conv_pre(x), stats, "decoder_conv_pre_ms", device)
+        if g is not None:
+            x = self._profile_call(lambda: x + self.cond(g), stats, "decoder_cond_add_ms", device)
+
+        for i in range(self.num_upsamples):
+            stage_started = time.perf_counter()
+            x = self._profile_call(
+                lambda: F.leaky_relu(x, modules.LRELU_SLOPE),
+                stats,
+                f"decoder_stage_{i}_pre_relu_ms",
+                device,
+            )
+            x = self._profile_call(
+                lambda: self.ups[i](x),
+                stats,
+                f"decoder_stage_{i}_upsample_ms",
+                device,
+            )
+            xs = None
+            for j in range(self.num_kernels):
+                block = self.resblocks[i * self.num_kernels + j]
+                block_out = self._run_resblock_profiled(
+                    block,
+                    x,
+                    stats,
+                    f"decoder_stage_{i}_resblock_{j}",
+                    device,
+                )
+                self._accumulate_profile_metric(
+                    stats,
+                    f"decoder_stage_{i}_resblock_{j}_ms",
+                    stats.get(f"decoder_stage_{i}_resblock_{j}_total_ms", 0.0),
+                )
+                if xs is None:
+                    xs = block_out
+                else:
+                    xs = self._profile_call(
+                        lambda current=xs, block_out=block_out: current + block_out,
+                        stats,
+                        f"decoder_stage_{i}_resblock_accum_ms",
+                        device,
+                    )
+            x = self._profile_call(
+                lambda: xs / self.num_kernels,
+                stats,
+                f"decoder_stage_{i}_resblock_avg_ms",
+                device,
+            )
+            stats[f"decoder_stage_{i}_total_ms"] = float((time.perf_counter() - stage_started) * 1000.0)
+        x = self._profile_call(lambda: F.leaky_relu(x), stats, "decoder_post_relu_ms", device)
+        x = self._profile_call(lambda: self.conv_post(x), stats, "decoder_conv_post_ms", device)
+        x = self._profile_call(lambda: torch.tanh(x), stats, "decoder_tanh_ms", device)
+        stats["decoder_total_ms"] = float((time.perf_counter() - total_started) * 1000.0)
+        return x, stats
 
     def remove_weight_norm(self):
         print("Removing weight norm...")
@@ -931,11 +1151,221 @@ class SynthesizerTrn(nn.Module):
             self.sv_emb = nn.Linear(20480, gin_channels)
             self.ge_to512 = nn.Linear(gin_channels, 512)
             self.prelu = nn.PReLU(num_parameters=gin_channels)
+        self._last_decoder_profile = {}
+        self._last_decoder_runtime_stats = {}
+        self._compiled_dec_static_buckets = {}
+        self._compiled_dec_static_bucket_seen = {}
+        self._compiled_dec_static_bucket_failures = set()
+        self._compiled_dec_static_bucket_lock = threading.Lock()
+        self._decoder_cuda_graphs = {}
+        self._decoder_cuda_graph_seen = {}
+        self._decoder_cuda_graph_failures = set()
+        self._decoder_cuda_graph_lock = threading.Lock()
+
+    def get_last_decoder_profile(self):
+        return dict(self._last_decoder_profile)
+
+    def _set_last_decoder_profile(self, stats):
+        self._last_decoder_profile = dict(stats)
+
+    def get_last_decoder_runtime_stats(self):
+        return dict(self._last_decoder_runtime_stats)
+
+    def _set_last_decoder_runtime_stats(self, stats):
+        self._last_decoder_runtime_stats = dict(stats)
+
+    @staticmethod
+    def _decoder_static_bucket_key(x: torch.Tensor, g: torch.Tensor | None) -> tuple[object, ...]:
+        return (
+            tuple(int(dim) for dim in x.shape),
+            str(x.dtype),
+            str(x.device),
+            None if g is None else tuple(int(dim) for dim in g.shape),
+            None if g is None else str(g.dtype),
+            None if g is None else str(g.device),
+        )
+
+    @staticmethod
+    def _decoder_runtime_shape_id(x: torch.Tensor, g: torch.Tensor | None) -> str:
+        x_part = "x" + "x".join(str(int(dim)) for dim in x.shape)
+        if g is None:
+            return f"{x_part}_gNone"
+        g_part = "g" + "x".join(str(int(dim)) for dim in g.shape)
+        return f"{x_part}_{g_part}"
+
+    def _get_decoder_cuda_graph_entry(self, key: tuple[object, ...]):
+        return self._decoder_cuda_graphs.get(key)
+
+    def _maybe_capture_decoder_cuda_graph(
+        self,
+        key: tuple[object, ...],
+        shape_id: str,
+        runtime_dec,
+        x: torch.Tensor,
+        g: torch.Tensor | None,
+        runtime_stats: dict[str, object],
+    ) -> None:
+        if not _vits_decoder_cudagraph_enabled():
+            return
+        if runtime_dec is None or x.device.type != "cuda":
+            return
+        shape_whitelist = _vits_decoder_cudagraph_shape_whitelist()
+        if shape_whitelist and shape_id not in shape_whitelist:
+            return
+        if key in self._decoder_cuda_graphs or key in self._decoder_cuda_graph_failures:
+            return
+        seen_hits = int(self._decoder_cuda_graph_seen.get(key, 0)) + 1
+        self._decoder_cuda_graph_seen[key] = seen_hits
+        if seen_hits < _vits_decoder_cudagraph_min_hits():
+            return
+        if len(self._decoder_cuda_graphs) >= _vits_decoder_cudagraph_max_entries():
+            return
+        with self._decoder_cuda_graph_lock:
+            if key in self._decoder_cuda_graphs or key in self._decoder_cuda_graph_failures:
+                return
+            try:
+                started_at = time.perf_counter()
+                from vllm.platforms import current_platform
+
+                pool = current_platform.get_global_graph_pool()
+                static_x = torch.empty_like(x)
+                static_x.copy_(x)
+                static_g = None if g is None else torch.empty_like(g)
+                if static_g is not None:
+                    static_g.copy_(g)
+                with torch.no_grad():
+                    _ = runtime_dec(static_x, g=static_g)
+                _sync_profile_device(x.device)
+                graph = torch.cuda.CUDAGraph()
+                with torch.no_grad():
+                    with torch.cuda.graph(graph, pool=pool):
+                        static_out = runtime_dec(static_x, g=static_g)
+                self._decoder_cuda_graphs[key] = {
+                    "graph": graph,
+                    "x": static_x,
+                    "g": static_g,
+                    "out": static_out,
+                }
+                runtime_stats["decoder_runtime_cudagraph_capture_ms"] = float((time.perf_counter() - started_at) * 1000.0)
+                runtime_stats["decoder_runtime_cudagraph_captures"] = 1
+            except Exception:
+                self._decoder_cuda_graph_failures.add(key)
 
     def _decode_audio_runtime(self, x: torch.Tensor, g: torch.Tensor | None = None):
         runtime_dec = getattr(self, "_compiled_dec", None)
+        static_bucket_key = self._decoder_static_bucket_key(x, g)
+        shape_id = self._decoder_runtime_shape_id(x, g)
+        static_runtime = None
+        cuda_graph_entry = self._get_decoder_cuda_graph_entry(static_bucket_key)
+        runtime_stats = {
+            "decoder_runtime_calls": 1,
+            "decoder_runtime_compiled_available": bool(runtime_dec is not None),
+            "decoder_runtime_x_shape": [int(dim) for dim in x.shape],
+            "decoder_runtime_x_dtype": str(x.dtype),
+            "decoder_runtime_x_device": str(x.device),
+            "decoder_runtime_g_shape": None if g is None else [int(dim) for dim in g.shape],
+            "decoder_runtime_static_bucket_key": repr(static_bucket_key),
+            "decoder_runtime_shape_id": shape_id,
+            "decoder_runtime_cudagraph_hits": 0,
+            "decoder_runtime_cudagraph_misses": 0,
+            "decoder_runtime_cudagraph_captures": 0,
+            "decoder_runtime_path_hist": {},
+            "decoder_runtime_shape_hist": {shape_id: 1},
+            "decoder_runtime_cudagraph_shape_hist": {},
+            "decoder_runtime_cudagraph_miss_shape_hist": {},
+        }
+        if getattr(self.dec, "_profile_decoder_enabled", None) is not None and self.dec._profile_decoder_enabled():
+            audio, stats = self.dec.forward_profiled(x, g=g)
+            runtime_stats["decoder_runtime_profiled_calls"] = 1
+            runtime_stats["decoder_runtime_compiled_calls"] = 0
+            runtime_stats["decoder_runtime_eager_calls"] = 0
+            runtime_stats["decoder_runtime_static_bucket_hits"] = 0
+            runtime_stats["decoder_runtime_static_bucket_misses"] = 0
+            runtime_stats["decoder_runtime_path"] = "profiled_eager"
+            runtime_stats["decoder_runtime_path_hist"] = {"profiled_eager": 1}
+            self._set_last_decoder_profile(stats)
+            self._set_last_decoder_runtime_stats(runtime_stats)
+            return audio
+        if cuda_graph_entry is not None:
+            cuda_graph_entry["x"].copy_(x)
+            static_g = cuda_graph_entry["g"]
+            if static_g is not None and g is not None:
+                static_g.copy_(g)
+            cuda_graph_entry["graph"].replay()
+            runtime_stats["decoder_runtime_profiled_calls"] = 0
+            runtime_stats["decoder_runtime_compiled_calls"] = 1
+            runtime_stats["decoder_runtime_eager_calls"] = 0
+            runtime_stats["decoder_runtime_static_bucket_hits"] = 0
+            runtime_stats["decoder_runtime_static_bucket_misses"] = 0
+            runtime_stats["decoder_runtime_cudagraph_hits"] = 1
+            runtime_stats["decoder_runtime_path_hist"] = {"compiled_cudagraph": 1}
+            runtime_stats["decoder_runtime_cudagraph_shape_hist"] = {shape_id: 1}
+            runtime_stats["decoder_runtime_path"] = "compiled_cudagraph"
+            self._set_last_decoder_profile({})
+            self._set_last_decoder_runtime_stats(runtime_stats)
+            return cuda_graph_entry["out"].clone()
+        if runtime_dec is not None and _vits_static_bucket_compile_enabled():
+            static_runtime = self._compiled_dec_static_buckets.get(static_bucket_key)
+            if static_runtime is not None:
+                runtime_stats["decoder_runtime_profiled_calls"] = 0
+                runtime_stats["decoder_runtime_compiled_calls"] = 1
+                runtime_stats["decoder_runtime_eager_calls"] = 0
+                runtime_stats["decoder_runtime_static_bucket_hits"] = 1
+                runtime_stats["decoder_runtime_static_bucket_misses"] = 0
+                runtime_stats["decoder_runtime_path_hist"] = {"compiled_static_bucket": 1}
+                runtime_stats["decoder_runtime_path"] = "compiled_static_bucket"
+                self._set_last_decoder_profile({})
+                self._set_last_decoder_runtime_stats(runtime_stats)
+                return static_runtime(x, g=g)
+            runtime_stats["decoder_runtime_static_bucket_hits"] = 0
+            runtime_stats["decoder_runtime_static_bucket_misses"] = 1
+            if static_bucket_key not in self._compiled_dec_static_bucket_failures:
+                seen_hits = int(self._compiled_dec_static_bucket_seen.get(static_bucket_key, 0)) + 1
+                self._compiled_dec_static_bucket_seen[static_bucket_key] = seen_hits
+                if seen_hits >= _vits_static_bucket_min_hits():
+                    with self._compiled_dec_static_bucket_lock:
+                        if (
+                            static_bucket_key not in self._compiled_dec_static_buckets
+                            and static_bucket_key not in self._compiled_dec_static_bucket_failures
+                        ):
+                            try:
+                                started_at = time.perf_counter()
+                                static_runtime = torch.compile(
+                                    self.dec,
+                                    mode=_vits_static_bucket_compile_mode(),
+                                    dynamic=False,
+                                )
+                                static_runtime(x, g=g)
+                                runtime_stats["decoder_runtime_static_bucket_compile_ms"] = float(
+                                    (time.perf_counter() - started_at) * 1000.0
+                                )
+                                self._compiled_dec_static_buckets[static_bucket_key] = static_runtime
+                            except Exception:
+                                self._compiled_dec_static_bucket_failures.add(static_bucket_key)
         if runtime_dec is not None:
+            runtime_stats["decoder_runtime_profiled_calls"] = 0
+            runtime_stats["decoder_runtime_compiled_calls"] = 1
+            runtime_stats["decoder_runtime_eager_calls"] = 0
+            runtime_stats.setdefault("decoder_runtime_static_bucket_hits", 0)
+            runtime_stats.setdefault("decoder_runtime_static_bucket_misses", 0)
+            runtime_stats["decoder_runtime_cudagraph_misses"] = 1 if _vits_decoder_cudagraph_enabled() else 0
+            if runtime_stats["decoder_runtime_cudagraph_misses"]:
+                runtime_stats["decoder_runtime_cudagraph_miss_shape_hist"] = {shape_id: 1}
+            self._maybe_capture_decoder_cuda_graph(static_bucket_key, shape_id, runtime_dec, x, g, runtime_stats)
+            runtime_stats["decoder_runtime_path_hist"] = {"compiled": 1}
+            runtime_stats["decoder_runtime_path"] = "compiled"
+            self._set_last_decoder_profile({})
+            self._set_last_decoder_runtime_stats(runtime_stats)
             return runtime_dec(x, g=g)
+        runtime_stats["decoder_runtime_profiled_calls"] = 0
+        runtime_stats["decoder_runtime_compiled_calls"] = 0
+        runtime_stats["decoder_runtime_eager_calls"] = 1
+        runtime_stats["decoder_runtime_static_bucket_hits"] = 0
+        runtime_stats["decoder_runtime_static_bucket_misses"] = 0
+        runtime_stats["decoder_runtime_path_hist"] = {"eager": 1}
+        runtime_stats["decoder_runtime_path"] = "eager"
+        self._set_last_decoder_profile({})
+        self._set_last_decoder_runtime_stats(runtime_stats)
         return self.dec(x, g=g)
 
     def forward(self, ssl, y, y_lengths, text, text_lengths, sv_emb=None):

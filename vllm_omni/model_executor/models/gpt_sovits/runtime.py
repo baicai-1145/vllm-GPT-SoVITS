@@ -1429,6 +1429,13 @@ class GPTSoVITSDecodePreparedRequestGroup:
 
 
 @dataclass(slots=True)
+class GPTSoVITSSegmentDecodeBatchPlan:
+    items: list[tuple[int, GPTSoVITSDecodePreparedRequest]]
+    semantic_bucket_tokens: int
+    phone_bucket_tokens: int
+
+
+@dataclass(slots=True)
 class GPTSoVITSDecodedAudio:
     request_id: str
     audio_fragment: Any
@@ -1519,6 +1526,7 @@ class GPTSoVITSRuntime:
         self._runtime_prepare_bert_stage_limiter: Any | None = None
         self._runtime_prepare_ref_semantic_stage_limiter: Any | None = None
         self._last_t2s_scheduler_stats: dict[str, Any] = {}
+        self._last_vits_decode_profile: dict[str, Any] = {}
         self._sampling_ops_cache: tuple[Any, Any] | None = None
         self._t2s_prompt_prefix_cache_lock = threading.RLock()
         self._t2s_prompt_prefix_cache: OrderedDict[
@@ -2021,6 +2029,70 @@ class GPTSoVITSRuntime:
 
     def get_last_t2s_scheduler_stats(self) -> dict[str, Any]:
         return dict(self._last_t2s_scheduler_stats)
+
+    def get_last_vits_decode_profile(self) -> dict[str, Any]:
+        return dict(self._last_vits_decode_profile)
+
+    @staticmethod
+    def _vits_decode_profile_enabled() -> bool:
+        return str(os.environ.get("GPTSOVITS_PROFILE_VITS_DECODE", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _reset_last_vits_decode_profile(self) -> None:
+        self._last_vits_decode_profile = {}
+
+    def _merge_last_vits_decode_profile(self, delta: dict[str, Any] | None) -> None:
+        if not delta:
+            return
+        merged = dict(self._last_vits_decode_profile)
+        for key, value in delta.items():
+            merged[key] = self._merge_vits_profile_value(merged.get(key), value)
+        self._last_vits_decode_profile = merged
+
+    @classmethod
+    def _merge_vits_profile_value(cls, current: Any, incoming: Any) -> Any:
+        if isinstance(incoming, bool):
+            return bool(incoming)
+        if isinstance(incoming, int):
+            return int(current or 0) + int(incoming)
+        if isinstance(incoming, float):
+            return float(current or 0.0) + float(incoming)
+        if isinstance(incoming, dict):
+            merged = dict(current) if isinstance(current, dict) else {}
+            for key, value in incoming.items():
+                merged[key] = cls._merge_vits_profile_value(merged.get(key), value)
+            return merged
+        return incoming
+
+    @staticmethod
+    def _accumulate_vits_profile_metric(profile: dict[str, Any] | None, key: str, value: float | int) -> None:
+        if profile is None:
+            return
+        if isinstance(value, int):
+            profile[key] = int(profile.get(key, 0)) + int(value)
+        else:
+            profile[key] = float(profile.get(key, 0.0)) + float(value)
+
+    def _time_vits_call(
+        self,
+        fn: Callable[[], Any],
+        *,
+        profile: dict[str, Any] | None,
+        stat_key: str,
+        device: Any,
+    ) -> Any:
+        if profile is None:
+            return fn()
+        _sync_runtime_device(device)
+        started = time.perf_counter()
+        result = fn()
+        _sync_runtime_device(device)
+        self._accumulate_vits_profile_metric(profile, stat_key, (time.perf_counter() - started) * 1000.0)
+        return result
 
     def get_semantic_eos_id(self) -> int:
         model = self.get_t2s_model()
@@ -8559,10 +8631,23 @@ class GPTSoVITSRuntime:
         ge: torch.Tensor,
         speed: float,
         noise_scale: float = 0.5,
+        profile: dict[str, Any] | None = None,
+        stats_sink: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        quantized = vits_model.quantizer.decode(codes)
+        total_started = time.perf_counter() if profile is not None else 0.0
+        quantized = self._time_vits_call(
+            lambda: vits_model.quantizer.decode(codes),
+            profile=profile,
+            stat_key="non_vocoder_quantizer_decode_ms",
+            device=codes.device,
+        )
         if getattr(vits_model, "semantic_frame_rate", "") == "25hz":
-            quantized = F.interpolate(quantized, scale_factor=2, mode="nearest")
+            quantized = self._time_vits_call(
+                lambda: F.interpolate(quantized, scale_factor=2, mode="nearest"),
+                profile=profile,
+                stat_key="non_vocoder_quantizer_upsample_ms",
+                device=quantized.device,
+            )
         code_lengths = code_lengths.to(device=codes.device, dtype=torch.long)
         text_lengths = text_lengths.to(device=text.device, dtype=torch.long)
         y_lengths = code_lengths * 2
@@ -8571,18 +8656,53 @@ class GPTSoVITSRuntime:
             if bool(getattr(vits_model, "is_v2pro", False))
             else ge
         )
-        x, m_p, logs_p, y_mask, _, _ = vits_model.enc_p(
-            quantized,
-            y_lengths,
-            text,
-            text_lengths,
-            encoder_ge,
-            speed,
+        x, m_p, logs_p, y_mask, _, _ = self._time_vits_call(
+            lambda: vits_model.enc_p(
+                quantized,
+                y_lengths,
+                text,
+                text_lengths,
+                encoder_ge,
+                speed,
+            ),
+            profile=profile,
+            stat_key="non_vocoder_enc_p_ms",
+            device=quantized.device,
         )
         del x
-        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * float(noise_scale)
-        z = vits_model.flow(z_p, y_mask, g=ge, reverse=True)
-        audio = vits_model._decode_audio_runtime((z * y_mask)[:, :, :], g=ge)
+        z_p = self._time_vits_call(
+            lambda: m_p + torch.randn_like(m_p) * torch.exp(logs_p) * float(noise_scale),
+            profile=profile,
+            stat_key="non_vocoder_noise_sample_ms",
+            device=m_p.device,
+        )
+        z = self._time_vits_call(
+            lambda: vits_model.flow(z_p, y_mask, g=ge, reverse=True),
+            profile=profile,
+            stat_key="non_vocoder_flow_ms",
+            device=m_p.device,
+        )
+        audio = self._time_vits_call(
+            lambda: vits_model._decode_audio_runtime((z * y_mask)[:, :, :], g=ge),
+            profile=profile,
+            stat_key="non_vocoder_decode_audio_ms",
+            device=z.device,
+        )
+        stats_target = profile if profile is not None else stats_sink
+        self._merge_numeric_t2s_stats(
+            stats_target,
+            getattr(vits_model, "get_last_decoder_profile", lambda: {})(),
+        )
+        self._merge_numeric_t2s_stats(
+            stats_target,
+            getattr(vits_model, "get_last_decoder_runtime_stats", lambda: {})(),
+        )
+        if profile is not None:
+            profile["vits_decode_mode"] = "non_vocoder"
+            profile["non_vocoder_batch_size"] = int(codes.shape[1]) if int(codes.ndim) >= 2 else 1
+            profile["non_vocoder_max_semantic_tokens"] = int(codes.shape[-1])
+            profile["non_vocoder_max_phone_tokens"] = int(text.shape[-1])
+            profile["non_vocoder_total_ms"] = float((time.perf_counter() - total_started) * 1000.0)
         return audio, y_mask
 
     @staticmethod
@@ -8959,23 +9079,43 @@ class GPTSoVITSRuntime:
         self,
         pipeline: Any,
         prepared: GPTSoVITSDecodePreparedRequest,
+        *,
+        profile: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._bind_pipeline_components(pipeline)
         device = torch.device(self._get_runtime_configs().device)
         vits_model = self._get_runtime_vits_model()
         refer_spec = self._build_refer_spec_from_prepared(prepared)
-        refer_audio_spec = refer_spec.spec_audio.to(dtype=self._get_runtime_precision(), device=device)
+        prompt_started = time.perf_counter() if profile is not None else 0.0
+        refer_audio_spec = self._time_vits_call(
+            lambda: refer_spec.spec_audio.to(dtype=self._get_runtime_precision(), device=device),
+            profile=profile,
+            stat_key="non_vocoder_prompt_spec_to_device_ms",
+            device=device,
+        )
         sv_emb = None
         if self._is_runtime_v2pro():
             audio_tensor = refer_spec.audio_16k
             if audio_tensor is None:
                 raise ValueError("GPT-SoVITS v2Pro request-local synthesis 缺少 16k 参考音频")
-            sv_emb = self._get_runtime_sv_model().compute_embedding3(audio_tensor).to(device)
-        ge = self._compute_vits_reference_ge(
-            vits_model,
-            refer_audio_spec,
-            sv_emb=sv_emb,
+            sv_emb = self._time_vits_call(
+                lambda: self._get_runtime_sv_model().compute_embedding3(audio_tensor).to(device),
+                profile=profile,
+                stat_key="non_vocoder_prompt_sv_emb_ms",
+                device=device,
+            )
+        ge = self._time_vits_call(
+            lambda: self._compute_vits_reference_ge(
+                vits_model,
+                refer_audio_spec,
+                sv_emb=sv_emb,
+            ),
+            profile=profile,
+            stat_key="non_vocoder_prompt_ge_ms",
+            device=device,
         )
+        if profile is not None:
+            profile["non_vocoder_prompt_context_total_ms"] = float((time.perf_counter() - prompt_started) * 1000.0)
         return {
             "device": device,
             "vits_model": vits_model,
@@ -8990,6 +9130,7 @@ class GPTSoVITSRuntime:
         prompt_context: dict[str, Any] | None = None,
     ) -> tuple[Any, int]:
         self._bind_pipeline_components(pipeline)
+        profile = {} if self._vits_decode_profile_enabled() else None
         refer_spec = self._build_refer_spec_from_prepared(prepared)
         if bool(getattr(pipeline.configs, "use_vocoder", False)):
             return self._decode_prepared_request_vocoder_fragment(
@@ -8998,8 +9139,9 @@ class GPTSoVITSRuntime:
                 refer_spec.spec_audio,
             )
 
+        runtime_stats_only = {} if profile is None else None
         if prompt_context is None:
-            prompt_context = self._build_non_vocoder_prompt_context(pipeline, prepared)
+            prompt_context = self._build_non_vocoder_prompt_context(pipeline, prepared, profile=profile)
         device = cast(torch.device, prompt_context["device"])
         vits_model = prompt_context["vits_model"]
         ge = cast(torch.Tensor, prompt_context["ge"])
@@ -9025,6 +9167,11 @@ class GPTSoVITSRuntime:
                 chunk_tokens=chunk_tokens,
                 overlap_tokens=self._get_vits_streaming_overlap_tokens(),
             )
+            if profile is not None:
+                profile["vits_decode_path"] = "non_vocoder_streaming"
+                profile["vits_streaming_chunk_tokens"] = int(chunk_tokens)
+                profile["non_vocoder_output_samples"] = int(audio_fragment.shape[-1])
+                self._merge_last_vits_decode_profile(profile)
             return audio_fragment, int(self._get_runtime_configs().sampling_rate)
         audio_batch, y_mask = self._run_vits_non_vocoder_decode(
             vits_model,
@@ -9034,9 +9181,29 @@ class GPTSoVITSRuntime:
             text_lengths=torch.LongTensor([int(prepared.phones.shape[-1])]).to(device),
             ge=ge,
             speed=float(prepared.speed_factor),
+            profile=profile,
+            stats_sink=runtime_stats_only,
         )
-        audio_lengths = self._measure_vits_audio_lengths(vits_model, y_mask)
-        audio_fragment = audio_batch[0, 0, : int(audio_lengths[0].item())].detach()
+        audio_lengths = self._time_vits_call(
+            lambda: self._measure_vits_audio_lengths(vits_model, y_mask),
+            profile=profile,
+            stat_key="non_vocoder_measure_audio_lengths_ms",
+            device=device,
+        )
+        audio_fragment = self._time_vits_call(
+            lambda: audio_batch[0, 0, : int(audio_lengths[0].item())].detach(),
+            profile=profile,
+            stat_key="non_vocoder_trim_audio_ms",
+            device=device,
+        )
+        if profile is not None:
+            profile["vits_decode_path"] = "non_vocoder"
+            profile["non_vocoder_output_samples"] = int(audio_fragment.shape[-1])
+            self._merge_last_vits_decode_profile(profile)
+        elif runtime_stats_only:
+            runtime_stats_only["vits_decode_path"] = "non_vocoder"
+            runtime_stats_only["non_vocoder_output_samples"] = int(audio_fragment.shape[-1])
+            self._merge_last_vits_decode_profile(runtime_stats_only)
         return audio_fragment, int(self._get_runtime_configs().sampling_rate)
 
     def _decode_prepared_requests_batched_non_vocoder(
@@ -9044,6 +9211,9 @@ class GPTSoVITSRuntime:
         pipeline: Any,
         prepared_requests: list[GPTSoVITSDecodePreparedRequest],
         prompt_context: dict[str, Any] | None = None,
+        *,
+        semantic_pad_to: int | None = None,
+        phone_pad_to: int | None = None,
     ) -> list[GPTSoVITSDecodedAudio]:
         self._bind_pipeline_components(pipeline)
         if not prepared_requests:
@@ -9051,8 +9221,14 @@ class GPTSoVITSRuntime:
         if bool(getattr(pipeline.configs, "use_vocoder", False)):
             raise ValueError("non-vocoder batched decode helper received vocoder pipeline")
 
+        profile = {} if self._vits_decode_profile_enabled() else None
+        runtime_stats_only = {} if profile is None else None
         if prompt_context is None:
-            prompt_context = self._build_non_vocoder_prompt_context(pipeline, prepared_requests[0])
+            prompt_context = self._build_non_vocoder_prompt_context(
+                pipeline,
+                prepared_requests[0],
+                profile=profile,
+            )
         device = cast(torch.device, prompt_context["device"])
         vits_model = prompt_context["vits_model"]
         batch_size = len(prepared_requests)
@@ -9065,8 +9241,10 @@ class GPTSoVITSRuntime:
 
         max_semantic_len = max(int(item.semantic_tokens.shape[-1]) for item in prepared_requests)
         max_phone_len = max(int(item.phones.shape[-1]) for item in prepared_requests)
-        semantic_batch = torch.zeros((1, batch_size, max_semantic_len), dtype=torch.long, device=device)
-        phone_batch = torch.zeros((batch_size, max_phone_len), dtype=torch.long, device=device)
+        padded_semantic_len = max(int(semantic_pad_to or 0), max_semantic_len)
+        padded_phone_len = max(int(phone_pad_to or 0), max_phone_len)
+        semantic_batch = torch.zeros((1, batch_size, padded_semantic_len), dtype=torch.long, device=device)
+        phone_batch = torch.zeros((batch_size, padded_phone_len), dtype=torch.long, device=device)
         semantic_lengths: list[int] = []
         phone_lengths: list[int] = []
 
@@ -9077,7 +9255,30 @@ class GPTSoVITSRuntime:
             phone_batch[batch_index, :phone_len] = prepared.phones.to(device=device, dtype=torch.long)
             semantic_lengths.append(semantic_len)
             phone_lengths.append(phone_len)
-        ge_batch = cast(torch.Tensor, prompt_context["ge"]).expand(batch_size, -1, -1)
+        if profile is not None:
+            profile["vits_decode_path"] = "non_vocoder_batched"
+            profile["non_vocoder_batch_size"] = int(batch_size)
+            profile["non_vocoder_max_semantic_tokens"] = int(max_semantic_len)
+            profile["non_vocoder_max_phone_tokens"] = int(max_phone_len)
+            profile["non_vocoder_padded_semantic_tokens"] = int(padded_semantic_len)
+            profile["non_vocoder_padded_phone_tokens"] = int(padded_phone_len)
+            profile["segment_decode_vits_batch_shape_hist"] = {
+                f"b{batch_size}_s{padded_semantic_len}_p{padded_phone_len}": 1
+            }
+            profile["segment_decode_vits_semantic_bucket_hist"] = {str(int(padded_semantic_len)): 1}
+            profile["segment_decode_vits_phone_bucket_hist"] = {str(int(padded_phone_len)): 1}
+        elif runtime_stats_only is not None:
+            runtime_stats_only["segment_decode_vits_batch_shape_hist"] = {
+                f"b{batch_size}_s{padded_semantic_len}_p{padded_phone_len}": 1
+            }
+            runtime_stats_only["segment_decode_vits_semantic_bucket_hist"] = {str(int(padded_semantic_len)): 1}
+            runtime_stats_only["segment_decode_vits_phone_bucket_hist"] = {str(int(padded_phone_len)): 1}
+        ge_batch = self._time_vits_call(
+            lambda: cast(torch.Tensor, prompt_context["ge"]).expand(batch_size, -1, -1),
+            profile=profile,
+            stat_key="non_vocoder_expand_ge_ms",
+            device=device,
+        )
 
         with self._run_lock:
             audio_batch, y_mask = self._run_vits_non_vocoder_decode(
@@ -9088,12 +9289,31 @@ class GPTSoVITSRuntime:
                 text_lengths=torch.LongTensor(phone_lengths).to(device),
                 ge=ge_batch,
                 speed=first_speed,
+                profile=profile,
+                stats_sink=runtime_stats_only,
             )
-        audio_lengths = self._measure_vits_audio_lengths(vits_model, y_mask)
+        audio_lengths = self._time_vits_call(
+            lambda: self._measure_vits_audio_lengths(vits_model, y_mask),
+            profile=profile,
+            stat_key="non_vocoder_measure_audio_lengths_ms",
+            device=device,
+        )
         audio_fragments = [
             audio_batch[batch_index, 0, : int(audio_lengths[batch_index].item())].detach()
             for batch_index in range(batch_size)
         ]
+        if profile is not None:
+            profile["non_vocoder_output_samples"] = int(sum(int(fragment.shape[-1]) for fragment in audio_fragments))
+            self._merge_last_vits_decode_profile(profile)
+        elif runtime_stats_only:
+            runtime_stats_only["vits_decode_path"] = "non_vocoder_batched"
+            runtime_stats_only["non_vocoder_batch_size"] = int(batch_size)
+            runtime_stats_only["non_vocoder_max_semantic_tokens"] = int(max_semantic_len)
+            runtime_stats_only["non_vocoder_max_phone_tokens"] = int(max_phone_len)
+            runtime_stats_only["non_vocoder_padded_semantic_tokens"] = int(padded_semantic_len)
+            runtime_stats_only["non_vocoder_padded_phone_tokens"] = int(padded_phone_len)
+            runtime_stats_only["non_vocoder_output_samples"] = int(sum(int(fragment.shape[-1]) for fragment in audio_fragments))
+            self._merge_last_vits_decode_profile(runtime_stats_only)
         output_sr = int(self._get_runtime_configs().sampling_rate)
         return [
             GPTSoVITSDecodedAudio(
@@ -9111,6 +9331,7 @@ class GPTSoVITSRuntime:
         self,
         prepared: Any,
     ) -> Any:
+        self._reset_last_vits_decode_profile()
         if isinstance(prepared, GPTSoVITSDecodePreparedRequestGroup):
             return GPTSoVITSDecodedAudioGroup(
                 request_id=prepared.request_id,
@@ -9146,13 +9367,13 @@ class GPTSoVITSRuntime:
         raw_value = str(
             os.environ.get(
                 "GPTSOVITS_SEGMENT_DECODE_MAX_BATCH",
-                os.environ.get("GPTSOVITS_SEGMENT_DECODE_CHUNK_SIZE", "4"),
+                os.environ.get("GPTSOVITS_SEGMENT_DECODE_CHUNK_SIZE", "8"),
             )
         ).strip()
         try:
             return max(1, int(raw_value))
         except Exception:
-            return 4
+            return 8
 
     @staticmethod
     def _get_segment_decode_max_semantic_tokens() -> int:
@@ -9171,6 +9392,70 @@ class GPTSoVITSRuntime:
             return 960
 
     @staticmethod
+    def _segment_decode_bucketing_enabled() -> bool:
+        return str(os.environ.get("GPTSOVITS_SEGMENT_DECODE_BUCKETING", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _parse_segment_decode_bucket_bounds(raw_value: str, default: tuple[int, ...]) -> tuple[int, ...]:
+        values: list[int] = []
+        for part in str(raw_value).split(","):
+            text = part.strip()
+            if not text:
+                continue
+            try:
+                value = int(text)
+            except Exception:
+                continue
+            if value > 0:
+                values.append(value)
+        if not values:
+            return default
+        return tuple(sorted(set(values)))
+
+    @classmethod
+    def _get_segment_decode_semantic_bucket_bounds(cls) -> tuple[int, ...]:
+        return cls._parse_segment_decode_bucket_bounds(
+            os.environ.get(
+                "GPTSOVITS_SEGMENT_DECODE_SEMANTIC_BUCKETS",
+                "40,48,56,64,72,80,96",
+            ),
+            default=(40, 48, 56, 64, 72, 80, 96),
+        )
+
+    @classmethod
+    def _get_segment_decode_phone_bucket_bounds(cls) -> tuple[int, ...]:
+        return cls._parse_segment_decode_bucket_bounds(
+            os.environ.get(
+                "GPTSOVITS_SEGMENT_DECODE_PHONE_BUCKETS",
+                "16,24,32",
+            ),
+            default=(16, 24, 32),
+        )
+
+    @staticmethod
+    def _bucket_round_up(length: int, bounds: Sequence[int]) -> int:
+        normalized = max(1, int(length))
+        for bound in bounds:
+            if normalized <= int(bound):
+                return int(bound)
+        return normalized
+
+    @classmethod
+    def _segment_decode_bucket_lens(cls, prepared: GPTSoVITSDecodePreparedRequest) -> tuple[int, int]:
+        semantic_len = int(prepared.semantic_tokens.shape[-1])
+        phone_len = int(prepared.phones.shape[-1])
+        if not cls._segment_decode_bucketing_enabled():
+            return semantic_len, phone_len
+        semantic_bucket = cls._bucket_round_up(semantic_len, cls._get_segment_decode_semantic_bucket_bounds())
+        phone_bucket = cls._bucket_round_up(phone_len, cls._get_segment_decode_phone_bucket_bounds())
+        return semantic_bucket, phone_bucket
+
+    @staticmethod
     def _segment_decode_length_key(prepared: GPTSoVITSDecodePreparedRequest) -> tuple[int, int, int]:
         semantic_len = int(prepared.semantic_tokens.shape[-1])
         phone_len = int(prepared.phones.shape[-1])
@@ -9181,43 +9466,144 @@ class GPTSoVITSRuntime:
         segment_requests: list[GPTSoVITSDecodePreparedRequest],
         *,
         max_batch_size: int,
-    ) -> list[list[tuple[int, GPTSoVITSDecodePreparedRequest]]]:
+    ) -> list[GPTSoVITSSegmentDecodeBatchPlan]:
         if not segment_requests:
             return []
         max_semantic_tokens = self._get_segment_decode_max_semantic_tokens()
         max_phone_tokens = self._get_segment_decode_max_phone_tokens()
         indexed_requests = list(enumerate(segment_requests))
-        indexed_requests.sort(key=lambda item: self._segment_decode_length_key(item[1]), reverse=True)
-
-        batches: list[list[tuple[int, GPTSoVITSDecodePreparedRequest]]] = []
-        current_batch: list[tuple[int, GPTSoVITSDecodePreparedRequest]] = []
-        current_semantic_tokens = 0
-        current_phone_tokens = 0
+        if not self._segment_decode_bucketing_enabled():
+            indexed_requests.sort(key=lambda item: self._segment_decode_length_key(item[1]), reverse=True)
+            batches: list[GPTSoVITSSegmentDecodeBatchPlan] = []
+            current_batch: list[tuple[int, GPTSoVITSDecodePreparedRequest]] = []
+            current_semantic_tokens = 0
+            current_phone_tokens = 0
+            current_semantic_bucket = 0
+            current_phone_bucket = 0
+            for original_index, prepared in indexed_requests:
+                semantic_len = int(prepared.semantic_tokens.shape[-1])
+                phone_len = int(prepared.phones.shape[-1])
+                would_exceed_batch = len(current_batch) >= max_batch_size
+                would_exceed_semantic = (
+                    bool(current_batch)
+                    and max_semantic_tokens > 0
+                    and current_semantic_tokens + semantic_len > max_semantic_tokens
+                )
+                would_exceed_phone = (
+                    bool(current_batch)
+                    and max_phone_tokens > 0
+                    and current_phone_tokens + phone_len > max_phone_tokens
+                )
+                if would_exceed_batch or would_exceed_semantic or would_exceed_phone:
+                    batches.append(
+                        GPTSoVITSSegmentDecodeBatchPlan(
+                            items=current_batch,
+                            semantic_bucket_tokens=int(current_semantic_bucket),
+                            phone_bucket_tokens=int(current_phone_bucket),
+                        )
+                    )
+                    current_batch = []
+                    current_semantic_tokens = 0
+                    current_phone_tokens = 0
+                    current_semantic_bucket = 0
+                    current_phone_bucket = 0
+                current_batch.append((original_index, prepared))
+                current_semantic_tokens += semantic_len
+                current_phone_tokens += phone_len
+                current_semantic_bucket = max(current_semantic_bucket, semantic_len)
+                current_phone_bucket = max(current_phone_bucket, phone_len)
+            if current_batch:
+                batches.append(
+                    GPTSoVITSSegmentDecodeBatchPlan(
+                        items=current_batch,
+                        semantic_bucket_tokens=int(current_semantic_bucket),
+                        phone_bucket_tokens=int(current_phone_bucket),
+                    )
+                )
+            return batches
+        bucket_groups: dict[tuple[int, int], list[tuple[int, GPTSoVITSDecodePreparedRequest]]] = {}
         for original_index, prepared in indexed_requests:
-            semantic_len = int(prepared.semantic_tokens.shape[-1])
-            phone_len = int(prepared.phones.shape[-1])
-            would_exceed_batch = len(current_batch) >= max_batch_size
-            would_exceed_semantic = (
-                bool(current_batch)
-                and max_semantic_tokens > 0
-                and current_semantic_tokens + semantic_len > max_semantic_tokens
-            )
-            would_exceed_phone = (
-                bool(current_batch)
-                and max_phone_tokens > 0
-                and current_phone_tokens + phone_len > max_phone_tokens
-            )
-            if would_exceed_batch or would_exceed_semantic or would_exceed_phone:
-                batches.append(current_batch)
-                current_batch = []
-                current_semantic_tokens = 0
-                current_phone_tokens = 0
-            current_batch.append((original_index, prepared))
-            current_semantic_tokens += semantic_len
-            current_phone_tokens += phone_len
-        if current_batch:
-            batches.append(current_batch)
+            bucket_groups.setdefault(self._segment_decode_bucket_lens(prepared), []).append((original_index, prepared))
+
+        batches: list[GPTSoVITSSegmentDecodeBatchPlan] = []
+        for bucket_key in sorted(bucket_groups.keys(), reverse=True):
+            semantic_bucket, phone_bucket = bucket_key
+            grouped_items = bucket_groups[bucket_key]
+            grouped_items.sort(key=lambda item: self._segment_decode_length_key(item[1]), reverse=True)
+            current_batch: list[tuple[int, GPTSoVITSDecodePreparedRequest]] = []
+            current_semantic_tokens = 0
+            current_phone_tokens = 0
+            bucket_batch_limit = max_batch_size
+            # Use bucket-derived caps only for real runtime token budgets; tiny test-time
+            # token ceilings should continue to exercise the legacy length-aware packing path.
+            if max_semantic_tokens >= 64 and semantic_bucket > 0:
+                bucket_batch_limit = min(bucket_batch_limit, max(1, max_semantic_tokens // semantic_bucket))
+            if max_phone_tokens >= 64 and phone_bucket > 0:
+                bucket_batch_limit = min(bucket_batch_limit, max(1, max_phone_tokens // phone_bucket))
+            for original_index, prepared in grouped_items:
+                semantic_len = int(prepared.semantic_tokens.shape[-1])
+                phone_len = int(prepared.phones.shape[-1])
+                would_exceed_batch = len(current_batch) >= bucket_batch_limit
+                would_exceed_semantic = (
+                    bool(current_batch)
+                    and max_semantic_tokens > 0
+                    and current_semantic_tokens + semantic_len > max_semantic_tokens
+                )
+                would_exceed_phone = (
+                    bool(current_batch)
+                    and max_phone_tokens > 0
+                    and current_phone_tokens + phone_len > max_phone_tokens
+                )
+                if would_exceed_batch or would_exceed_semantic or would_exceed_phone:
+                    batches.append(
+                        GPTSoVITSSegmentDecodeBatchPlan(
+                            items=current_batch,
+                            semantic_bucket_tokens=int(semantic_bucket),
+                            phone_bucket_tokens=int(phone_bucket),
+                        )
+                    )
+                    current_batch = []
+                    current_semantic_tokens = 0
+                    current_phone_tokens = 0
+                current_batch.append((original_index, prepared))
+                current_semantic_tokens += semantic_len
+                current_phone_tokens += phone_len
+            if current_batch:
+                batches.append(
+                    GPTSoVITSSegmentDecodeBatchPlan(
+                        items=current_batch,
+                        semantic_bucket_tokens=int(semantic_bucket),
+                        phone_bucket_tokens=int(phone_bucket),
+                    )
+                )
         return batches
+
+    @classmethod
+    def _build_segment_decode_plan_profile(
+        cls,
+        plans: Sequence[GPTSoVITSSegmentDecodeBatchPlan],
+    ) -> dict[str, Any]:
+        batch_size_hist: dict[str, int] = {}
+        semantic_bucket_hist: dict[str, int] = {}
+        phone_bucket_hist: dict[str, int] = {}
+        plan_shape_hist: dict[str, int] = {}
+        for plan in plans:
+            batch_size = int(len(plan.items))
+            semantic_bucket = int(plan.semantic_bucket_tokens)
+            phone_bucket = int(plan.phone_bucket_tokens)
+            batch_size_hist[str(batch_size)] = int(batch_size_hist.get(str(batch_size), 0)) + 1
+            semantic_bucket_hist[str(semantic_bucket)] = int(semantic_bucket_hist.get(str(semantic_bucket), 0)) + 1
+            phone_bucket_hist[str(phone_bucket)] = int(phone_bucket_hist.get(str(phone_bucket), 0)) + 1
+            shape_key = f"b{batch_size}_s{semantic_bucket}_p{phone_bucket}"
+            plan_shape_hist[shape_key] = int(plan_shape_hist.get(shape_key, 0)) + 1
+        return {
+            "segment_decode_bucketing_enabled": cls._segment_decode_bucketing_enabled(),
+            "segment_decode_plan_batches": int(len(plans)),
+            "segment_decode_plan_batch_size_hist": batch_size_hist,
+            "segment_decode_plan_semantic_bucket_hist": semantic_bucket_hist,
+            "segment_decode_plan_phone_bucket_hist": phone_bucket_hist,
+            "segment_decode_plan_shape_hist": plan_shape_hist,
+        }
 
     def _decode_prepared_request_group_segments(
         self,
@@ -9234,18 +9620,23 @@ class GPTSoVITSRuntime:
         current_max_batch_size = min(self._get_segment_decode_max_batch(), len(segment_requests))
         while True:
             try:
+                self._reset_last_vits_decode_profile()
                 decoded_items: list[GPTSoVITSDecodedAudio | None] = [None] * len(segment_requests)
-                for batch in self._plan_segment_decode_batches(
+                planned_batches = self._plan_segment_decode_batches(
                     segment_requests,
                     max_batch_size=current_max_batch_size,
-                ):
-                    batch_indices = [item[0] for item in batch]
-                    chunk = [item[1] for item in batch]
+                )
+                self._merge_last_vits_decode_profile(self._build_segment_decode_plan_profile(planned_batches))
+                for batch in planned_batches:
+                    batch_indices = [item[0] for item in batch.items]
+                    chunk = [item[1] for item in batch.items]
                     if non_vocoder_prompt_context is not None:
                         chunk_decoded = self._decode_prepared_requests_batched_non_vocoder(
                             pipeline,
                             chunk,
                             prompt_context=non_vocoder_prompt_context,
+                            semantic_pad_to=batch.semantic_bucket_tokens,
+                            phone_pad_to=batch.phone_bucket_tokens,
                         )
                     else:
                         chunk_decoded = self.decode_prepared_requests(chunk)
@@ -9271,6 +9662,7 @@ class GPTSoVITSRuntime:
         self,
         prepared_requests: list[Any],
     ) -> list[GPTSoVITSDecodedAudio]:
+        self._reset_last_vits_decode_profile()
         if not prepared_requests:
             return []
         expanded_prepared: list[GPTSoVITSDecodePreparedRequest] = []

@@ -1124,7 +1124,7 @@ def test_decode_prepared_request_group_decodes_segments_in_chunks(tmp_path, monk
     chunk_calls: list[list[str]] = []
     runtime._build_non_vocoder_prompt_context = Mock(return_value={"ge": torch.ones((1, 1, 1)), "device": torch.device("cpu"), "vits_model": object()})  # type: ignore[method-assign]
 
-    def _fake_batched_decode(_pipeline, chunk, prompt_context=None):
+    def _fake_batched_decode(_pipeline, chunk, prompt_context=None, **_kwargs):
         assert prompt_context is not None
         chunk_calls.append([item.request_id for item in chunk])
         return [
@@ -1187,7 +1187,7 @@ def test_decode_prepared_request_group_uses_length_aware_batches_and_restores_or
     chunk_calls: list[list[str]] = []
     runtime._build_non_vocoder_prompt_context = Mock(return_value={"ge": torch.ones((1, 1, 1)), "device": torch.device("cpu"), "vits_model": object()})  # type: ignore[method-assign]
 
-    def _fake_batched_decode(_pipeline, chunk, prompt_context=None):
+    def _fake_batched_decode(_pipeline, chunk, prompt_context=None, **_kwargs):
         assert prompt_context is not None
         chunk_calls.append([item.request_id for item in chunk])
         return [
@@ -1280,6 +1280,97 @@ def test_decode_prepared_request_group_uses_length_aware_batches_and_restores_or
         "req::seg0001",
         "req::seg0002",
         "req::seg0003",
+    ]
+
+
+def test_decode_prepared_request_group_passes_bucket_padding_to_batched_non_vocoder(tmp_path, monkeypatch):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    monkeypatch.setenv("GPTSOVITS_SEGMENT_DECODE_BUCKETING", "1")
+    monkeypatch.setenv("GPTSOVITS_SEGMENT_DECODE_MAX_BATCH", "8")
+    monkeypatch.setenv("GPTSOVITS_SEGMENT_DECODE_MAX_SEMANTIC_TOKENS", "1024")
+    monkeypatch.setenv("GPTSOVITS_SEGMENT_DECODE_MAX_PHONE_TOKENS", "256")
+    monkeypatch.setenv("GPTSOVITS_SEGMENT_DECODE_SEMANTIC_BUCKETS", "4,8")
+    monkeypatch.setenv("GPTSOVITS_SEGMENT_DECODE_PHONE_BUCKETS", "2,4")
+    runtime._pipeline = SimpleNamespace(configs=SimpleNamespace(use_vocoder=False, sampling_rate=32000))
+    bucket_calls: list[tuple[list[str], int | None, int | None]] = []
+    runtime._build_non_vocoder_prompt_context = Mock(return_value={"ge": torch.ones((1, 1, 1)), "device": torch.device("cpu"), "vits_model": object()})  # type: ignore[method-assign]
+
+    def _fake_batched_decode(_pipeline, chunk, prompt_context=None, **kwargs):
+        assert prompt_context is not None
+        bucket_calls.append(
+            (
+                [item.request_id for item in chunk],
+                kwargs.get("semantic_pad_to"),
+                kwargs.get("phone_pad_to"),
+            )
+        )
+        return [
+            GPTSoVITSDecodedAudio(item.request_id, f"audio-{item.request_id}", 32000, 1.0, 0.3, False)
+            for item in chunk
+        ]
+
+    runtime._decode_prepared_requests_batched_non_vocoder = Mock(side_effect=_fake_batched_decode)  # type: ignore[method-assign]
+
+    runtime.decode_prepared_request(
+        GPTSoVITSDecodePreparedRequestGroup(
+            request_id="req",
+            segment_requests=[
+                GPTSoVITSDecodePreparedRequest(
+                    request_id="req::seg0000",
+                    semantic_tokens=torch.tensor([1, 2], dtype=torch.long),
+                    phones=torch.tensor([1], dtype=torch.long),
+                    prompt_phones=torch.tensor([2], dtype=torch.long),
+                    prompt_semantic=torch.tensor([3], dtype=torch.long),
+                    refer_audio_spec=torch.tensor([0.1], dtype=torch.float32),
+                    refer_audio_16k=torch.tensor([0.2], dtype=torch.float32),
+                    raw_audio=torch.tensor([0.3], dtype=torch.float32),
+                    raw_sr=16000,
+                    speed_factor=1.0,
+                    fragment_interval=0.3,
+                    sample_steps=32,
+                    super_sampling=False,
+                ),
+                GPTSoVITSDecodePreparedRequest(
+                    request_id="req::seg0001",
+                    semantic_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+                    phones=torch.tensor([1], dtype=torch.long),
+                    prompt_phones=torch.tensor([2], dtype=torch.long),
+                    prompt_semantic=torch.tensor([3], dtype=torch.long),
+                    refer_audio_spec=torch.tensor([0.1], dtype=torch.float32),
+                    refer_audio_16k=torch.tensor([0.2], dtype=torch.float32),
+                    raw_audio=torch.tensor([0.3], dtype=torch.float32),
+                    raw_sr=16000,
+                    speed_factor=1.0,
+                    fragment_interval=0.3,
+                    sample_steps=32,
+                    super_sampling=False,
+                ),
+                GPTSoVITSDecodePreparedRequest(
+                    request_id="req::seg0002",
+                    semantic_tokens=torch.tensor([1, 2, 3, 4, 5], dtype=torch.long),
+                    phones=torch.tensor([1, 2, 3], dtype=torch.long),
+                    prompt_phones=torch.tensor([2], dtype=torch.long),
+                    prompt_semantic=torch.tensor([3], dtype=torch.long),
+                    refer_audio_spec=torch.tensor([0.1], dtype=torch.float32),
+                    refer_audio_16k=torch.tensor([0.2], dtype=torch.float32),
+                    raw_audio=torch.tensor([0.3], dtype=torch.float32),
+                    raw_sr=16000,
+                    speed_factor=1.0,
+                    fragment_interval=0.3,
+                    sample_steps=32,
+                    super_sampling=False,
+                ),
+            ],
+            speed_factor=1.0,
+            fragment_interval=0.3,
+            sample_steps=32,
+            super_sampling=False,
+        )
+    )
+
+    assert bucket_calls == [
+        (["req::seg0002"], 8, 4),
+        (["req::seg0001", "req::seg0000"], 4, 2),
     ]
 
 
@@ -2242,6 +2333,7 @@ def test_decode_prepared_requests_batched_non_vocoder_uses_native_vits_batch(tmp
                 refer_audio_spec=torch.ones((1, 704, 4), dtype=torch.float32),
                 refer_audio_16k=torch.zeros((0,), dtype=torch.float32),
                 speed_factor=1.0,
+                fragment_interval=0.3,
                 sample_steps=32,
                 super_sampling=False,
             ),
@@ -2252,6 +2344,7 @@ def test_decode_prepared_requests_batched_non_vocoder_uses_native_vits_batch(tmp
                 refer_audio_spec=torch.ones((1, 704, 4), dtype=torch.float32),
                 refer_audio_16k=torch.zeros((0,), dtype=torch.float32),
                 speed_factor=1.0,
+                fragment_interval=0.3,
                 sample_steps=32,
                 super_sampling=False,
             ),
@@ -2265,6 +2358,99 @@ def test_decode_prepared_requests_batched_non_vocoder_uses_native_vits_batch(tmp
     assert [item.request_id for item in decoded] == ["a", "b"]
     assert decoded[0].audio_fragment.tolist() == pytest.approx([0.1, 0.2, 0.3])
     assert decoded[1].audio_fragment.tolist() == pytest.approx([0.4, 0.5])
+
+
+def test_decode_prepared_requests_batched_non_vocoder_records_vits_profile(tmp_path, monkeypatch):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    monkeypatch.setenv("GPTSOVITS_PROFILE_VITS_DECODE", "1")
+    runtime._get_text_frontend_symbol = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            sequence_mask=lambda lengths, max_len: (
+                torch.arange(max_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+            )
+        )
+    )
+    vits_model = SimpleNamespace(
+        version="v2",
+        is_v2pro=False,
+        semantic_frame_rate="50hz",
+        ref_enc=Mock(side_effect=lambda refer, mask: torch.ones((refer.shape[0], 2, 3), dtype=torch.float32)),
+        quantizer=SimpleNamespace(decode=Mock(return_value=torch.ones((1, 2, 3), dtype=torch.float32))),
+        enc_p=Mock(
+            return_value=(
+                torch.zeros((2, 1, 4), dtype=torch.float32),
+                torch.zeros((2, 1, 4), dtype=torch.float32),
+                torch.zeros((2, 1, 4), dtype=torch.float32),
+                torch.tensor(
+                    [
+                        [[1.0, 1.0, 1.0, 0.0]],
+                        [[1.0, 1.0, 0.0, 0.0]],
+                    ],
+                    dtype=torch.float32,
+                ),
+                None,
+                None,
+            )
+        ),
+        flow=Mock(side_effect=lambda z_p, y_mask, g=None, reverse=True: z_p),
+        _decode_audio_runtime=Mock(
+            return_value=torch.tensor(
+                [
+                    [[0.1, 0.2, 0.3, 0.0]],
+                    [[0.4, 0.5, 0.0, 0.0]],
+                ],
+                dtype=torch.float32,
+            )
+        ),
+        dec=SimpleNamespace(ups=[SimpleNamespace(stride=(1,))]),
+    )
+    pipeline = SimpleNamespace(
+        configs=SimpleNamespace(sampling_rate=32000, use_vocoder=False, device="cpu"),
+        precision=torch.float16,
+        is_v2pro=False,
+        vits_model=vits_model,
+    )
+
+    runtime._decode_prepared_requests_batched_non_vocoder(
+        pipeline,
+        [
+            SimpleNamespace(
+                request_id="a",
+                semantic_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+                phones=torch.tensor([10, 11], dtype=torch.long),
+                refer_audio_spec=torch.ones((1, 704, 4), dtype=torch.float32),
+                refer_audio_16k=torch.zeros((0,), dtype=torch.float32),
+                speed_factor=1.0,
+                fragment_interval=0.3,
+                sample_steps=32,
+                super_sampling=False,
+            ),
+            SimpleNamespace(
+                request_id="b",
+                semantic_tokens=torch.tensor([4, 5], dtype=torch.long),
+                phones=torch.tensor([12], dtype=torch.long),
+                refer_audio_spec=torch.ones((1, 704, 4), dtype=torch.float32),
+                refer_audio_16k=torch.zeros((0,), dtype=torch.float32),
+                speed_factor=1.0,
+                fragment_interval=0.3,
+                sample_steps=32,
+                super_sampling=False,
+            ),
+        ],
+        semantic_pad_to=4,
+        phone_pad_to=3,
+    )
+
+    profile = runtime.get_last_vits_decode_profile()
+    assert profile["vits_decode_path"] == "non_vocoder_batched"
+    assert int(profile["non_vocoder_batch_size"]) == 2
+    assert int(profile["non_vocoder_padded_semantic_tokens"]) == 4
+    assert int(profile["non_vocoder_padded_phone_tokens"]) == 3
+    assert float(profile["non_vocoder_quantizer_decode_ms"]) >= 0.0
+    assert float(profile["non_vocoder_enc_p_ms"]) >= 0.0
+    assert float(profile["non_vocoder_flow_ms"]) >= 0.0
+    assert float(profile["non_vocoder_decode_audio_ms"]) >= 0.0
+    assert profile["segment_decode_vits_batch_shape_hist"] == {"b2_s4_p3": 1}
 
 
 def test_decode_prepared_request_fragment_uses_runtime_native_vits_path(tmp_path):
@@ -2322,6 +2508,206 @@ def test_decode_prepared_request_fragment_uses_runtime_native_vits_path(tmp_path
     vits_model.decode.assert_not_called()
     assert audio_fragment.tolist() == pytest.approx([0.1, 0.2, 0.3])
     assert output_sr == 32000
+
+
+def test_decode_prepared_request_fragment_records_vits_profile(tmp_path, monkeypatch):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    monkeypatch.setenv("GPTSOVITS_PROFILE_VITS_DECODE", "1")
+    runtime._get_text_frontend_symbol = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            sequence_mask=lambda lengths, max_len: (
+                torch.arange(max_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+            )
+        )
+    )
+    vits_model = SimpleNamespace(
+        version="v2",
+        is_v2pro=False,
+        semantic_frame_rate="50hz",
+        ref_enc=Mock(return_value=torch.ones((1, 2, 3), dtype=torch.float32)),
+        quantizer=SimpleNamespace(decode=Mock(return_value=torch.ones((1, 1, 3), dtype=torch.float32))),
+        enc_p=Mock(
+            return_value=(
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.tensor([[[1.0, 1.0, 1.0]]], dtype=torch.float32),
+                None,
+                None,
+            )
+        ),
+        flow=Mock(side_effect=lambda z_p, y_mask, g=None, reverse=True: z_p),
+        _decode_audio_runtime=Mock(return_value=torch.tensor([[[0.1, 0.2, 0.3]]], dtype=torch.float32)),
+        dec=SimpleNamespace(ups=[SimpleNamespace(stride=(1,))]),
+    )
+    pipeline = SimpleNamespace(
+        configs=SimpleNamespace(sampling_rate=32000, use_vocoder=False, device="cpu"),
+        precision=torch.float16,
+        is_v2pro=False,
+        vits_model=vits_model,
+    )
+
+    runtime._reset_last_vits_decode_profile()
+    runtime._decode_prepared_request_fragment(
+        pipeline,
+        SimpleNamespace(
+            semantic_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+            phones=torch.tensor([10, 11], dtype=torch.long),
+            refer_audio_spec=torch.ones((1, 704, 4), dtype=torch.float32),
+            refer_audio_16k=torch.zeros((0,), dtype=torch.float32),
+            speed_factor=1.0,
+            sample_steps=32,
+        ),
+    )
+
+    profile = runtime.get_last_vits_decode_profile()
+    assert profile["vits_decode_path"] == "non_vocoder"
+    assert float(profile["non_vocoder_prompt_context_total_ms"]) >= 0.0
+    assert float(profile["non_vocoder_quantizer_decode_ms"]) >= 0.0
+    assert float(profile["non_vocoder_enc_p_ms"]) >= 0.0
+    assert float(profile["non_vocoder_flow_ms"]) >= 0.0
+    assert float(profile["non_vocoder_decode_audio_ms"]) >= 0.0
+    assert float(profile["non_vocoder_measure_audio_lengths_ms"]) >= 0.0
+    assert float(profile["non_vocoder_trim_audio_ms"]) >= 0.0
+
+
+def test_decode_prepared_request_fragment_merges_decoder_internal_profile(tmp_path, monkeypatch):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    monkeypatch.setenv("GPTSOVITS_PROFILE_VITS_DECODE", "1")
+    runtime._get_text_frontend_symbol = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            sequence_mask=lambda lengths, max_len: (
+                torch.arange(max_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+            )
+        )
+    )
+    vits_model = SimpleNamespace(
+        version="v2",
+        is_v2pro=False,
+        semantic_frame_rate="50hz",
+        ref_enc=Mock(return_value=torch.ones((1, 2, 3), dtype=torch.float32)),
+        quantizer=SimpleNamespace(decode=Mock(return_value=torch.ones((1, 1, 3), dtype=torch.float32))),
+        enc_p=Mock(
+            return_value=(
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.tensor([[[1.0, 1.0, 1.0]]], dtype=torch.float32),
+                None,
+                None,
+            )
+        ),
+        flow=Mock(side_effect=lambda z_p, y_mask, g=None, reverse=True: z_p),
+        _decode_audio_runtime=Mock(return_value=torch.tensor([[[0.1, 0.2, 0.3]]], dtype=torch.float32)),
+        get_last_decoder_profile=Mock(
+            return_value={
+                "decoder_total_ms": 12.5,
+                "decoder_conv_pre_ms": 1.2,
+                "decoder_stage_0_upsample_ms": 4.8,
+                "decoder_stage_0_resblock_0_ms": 2.6,
+            }
+        ),
+        dec=SimpleNamespace(ups=[SimpleNamespace(stride=(1,))]),
+    )
+    pipeline = SimpleNamespace(
+        configs=SimpleNamespace(sampling_rate=32000, use_vocoder=False, device="cpu"),
+        precision=torch.float16,
+        is_v2pro=False,
+        vits_model=vits_model,
+    )
+
+    runtime._reset_last_vits_decode_profile()
+    runtime._decode_prepared_request_fragment(
+        pipeline,
+        SimpleNamespace(
+            semantic_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+            phones=torch.tensor([10, 11], dtype=torch.long),
+            refer_audio_spec=torch.ones((1, 704, 4), dtype=torch.float32),
+            refer_audio_16k=torch.zeros((0,), dtype=torch.float32),
+            speed_factor=1.0,
+            sample_steps=32,
+        ),
+    )
+
+    profile = runtime.get_last_vits_decode_profile()
+    vits_model.get_last_decoder_profile.assert_called_once()
+    assert float(profile["decoder_total_ms"]) == 12.5
+    assert float(profile["decoder_conv_pre_ms"]) == 1.2
+    assert float(profile["decoder_stage_0_upsample_ms"]) == 4.8
+    assert float(profile["decoder_stage_0_resblock_0_ms"]) == 2.6
+
+
+def test_decode_prepared_request_fragment_merges_decoder_runtime_path_stats(tmp_path, monkeypatch):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    monkeypatch.setenv("GPTSOVITS_PROFILE_VITS_DECODE", "1")
+    runtime._get_text_frontend_symbol = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            sequence_mask=lambda lengths, max_len: (
+                torch.arange(max_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+            )
+        )
+    )
+    vits_model = SimpleNamespace(
+        version="v2",
+        is_v2pro=False,
+        semantic_frame_rate="50hz",
+        ref_enc=Mock(return_value=torch.ones((1, 2, 3), dtype=torch.float32)),
+        quantizer=SimpleNamespace(decode=Mock(return_value=torch.ones((1, 1, 3), dtype=torch.float32))),
+        enc_p=Mock(
+            return_value=(
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.zeros((1, 1, 3), dtype=torch.float32),
+                torch.tensor([[[1.0, 1.0, 1.0]]], dtype=torch.float32),
+                None,
+                None,
+            )
+        ),
+        flow=Mock(side_effect=lambda z_p, y_mask, g=None, reverse=True: z_p),
+        _decode_audio_runtime=Mock(return_value=torch.tensor([[[0.1, 0.2, 0.3]]], dtype=torch.float32)),
+        get_last_decoder_profile=Mock(return_value={}),
+        get_last_decoder_runtime_stats=Mock(
+            return_value={
+                "decoder_runtime_calls": 1,
+                "decoder_runtime_compiled_available": True,
+                "decoder_runtime_profiled_calls": 1,
+                "decoder_runtime_compiled_calls": 0,
+                "decoder_runtime_eager_calls": 0,
+                "decoder_runtime_path": "profiled_eager",
+                "decoder_runtime_x_shape": [1, 1, 3],
+                "decoder_runtime_g_shape": [1, 2, 3],
+            }
+        ),
+        dec=SimpleNamespace(ups=[SimpleNamespace(stride=(1,))]),
+    )
+    pipeline = SimpleNamespace(
+        configs=SimpleNamespace(sampling_rate=32000, use_vocoder=False, device="cpu"),
+        precision=torch.float16,
+        is_v2pro=False,
+        vits_model=vits_model,
+    )
+
+    runtime._reset_last_vits_decode_profile()
+    runtime._decode_prepared_request_fragment(
+        pipeline,
+        SimpleNamespace(
+            semantic_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+            phones=torch.tensor([10, 11], dtype=torch.long),
+            refer_audio_spec=torch.ones((1, 704, 4), dtype=torch.float32),
+            refer_audio_16k=torch.zeros((0,), dtype=torch.float32),
+            speed_factor=1.0,
+            sample_steps=32,
+        ),
+    )
+
+    profile = runtime.get_last_vits_decode_profile()
+    vits_model.get_last_decoder_runtime_stats.assert_called_once()
+    assert int(profile["decoder_runtime_calls"]) == 1
+    assert bool(profile["decoder_runtime_compiled_available"]) is True
+    assert int(profile["decoder_runtime_profiled_calls"]) == 1
+    assert profile["decoder_runtime_path"] == "profiled_eager"
+    assert profile["decoder_runtime_x_shape"] == [1, 1, 3]
+    assert profile["decoder_runtime_g_shape"] == [1, 2, 3]
 
 
 def test_decode_prepared_request_vocoder_fragment_uses_native_components(tmp_path):
