@@ -3488,9 +3488,30 @@ class GPTSoVITSRuntime:
             sampled_token_tensor = sampled_tensor.view(-1)
             argmax_token_tensor = argmax_tensor.view(-1)
             finish_scan_started = time.perf_counter()
+            uniform_step_index = int(active_batch.step_indices[0].item())
+            uniform_next_step_index = uniform_step_index + 1
+            uniform_early_stop_mask: torch.Tensor | None = None
+            uniform_any_early_stop = False
+            if uniform_next_step_index < max_steps:
+                early_stop_values = torch.tensor(
+                    [int(state.early_stop_num) for state in active_batch.states],
+                    dtype=torch.long,
+                    device=sampled_token_tensor.device,
+                )
+                if bool(early_stop_values.ne(-1).any().item()):
+                    history_lens = torch.tensor(
+                        [int(sequence.shape[0]) + 1 for sequence in active_batch.y_sequences],
+                        dtype=torch.long,
+                        device=sampled_token_tensor.device,
+                    )
+                    prefix_lens = active_batch.prefix_lens.to(device=sampled_token_tensor.device, dtype=torch.long)
+                    uniform_early_stop_mask = early_stop_values.ne(-1) & (
+                        history_lens.sub(prefix_lens) > early_stop_values
+                    )
+                    uniform_any_early_stop = bool(uniform_early_stop_mask.any().item())
             if (
-                all(state.early_stop_num == -1 for state in active_batch.states)
-                and int(active_batch.step_indices[0].item()) + 1 < max_steps
+                uniform_next_step_index < max_steps
+                and not uniform_any_early_stop
                 and not bool(sampled_token_tensor.eq(model.EOS).any().item())
                 and not bool(argmax_token_tensor.eq(model.EOS).any().item())
             ):
@@ -3515,17 +3536,18 @@ class GPTSoVITSRuntime:
                     next_xy_pos,
                 )
             if (
-                all(state.early_stop_num == -1 for state in active_batch.states)
-                and int(active_batch.step_indices[0].item()) + 1 < max_steps
+                uniform_next_step_index < max_steps
             ):
                 eos_sample_mask = sampled_token_tensor.eq(model.EOS)
                 eos_argmax_mask = (~eos_sample_mask) & argmax_token_tensor.eq(model.EOS)
                 finished_mask = eos_sample_mask | eos_argmax_mask
+                if uniform_early_stop_mask is not None:
+                    finished_mask = finished_mask | uniform_early_stop_mask
                 if bool(finished_mask.any().item()):
                     finished_index_tensor = finished_mask.nonzero(as_tuple=False).view(-1)
                     keep_index_tensor = (~finished_mask).nonzero(as_tuple=False).view(-1)
                     prefix_lens = active_batch.prefix_lens.tolist()
-                    step_index = int(active_batch.step_indices[0].item())
+                    step_index = uniform_step_index
                     keep_indices = [int(item) for item in keep_index_tensor.tolist()]
                     if keep_indices:
                         kept_histories = [active_batch.y_sequences[index] for index in keep_indices]
@@ -3549,13 +3571,21 @@ class GPTSoVITSRuntime:
                     for finished_index in finished_index_tensor.tolist():
                         state = active_batch.states[int(finished_index)]
                         prefix_len = int(prefix_lens[int(finished_index)])
-                        finish_reason = (
-                            "eos_sample" if bool(eos_sample_mask[int(finished_index)].item()) else "eos_argmax"
-                        )
+                        current_history = active_batch.y_sequences[int(finished_index)]
+                        sampled_token = sampled_token_tensor[int(finished_index) : int(finished_index) + 1]
+                        if uniform_early_stop_mask is not None and bool(uniform_early_stop_mask[int(finished_index)].item()):
+                            finish_reason = "early_stop"
+                            semantic_tokens = torch.cat([current_history[prefix_len:], sampled_token], dim=0).clone()
+                        elif bool(eos_sample_mask[int(finished_index)].item()):
+                            finish_reason = "eos_sample"
+                            semantic_tokens = current_history[prefix_len:].clone()
+                        else:
+                            finish_reason = "eos_argmax"
+                            semantic_tokens = current_history[prefix_len:].clone()
                         finished_items.append(
                             GPTSoVITSARFinishedItem(
                                 request_id=str(state.request_id),
-                                semantic_tokens=active_batch.y_sequences[int(finished_index)][prefix_len:].clone(),
+                                semantic_tokens=semantic_tokens,
                                 finish_idx=step_index,
                                 finish_reason=finish_reason,
                             )

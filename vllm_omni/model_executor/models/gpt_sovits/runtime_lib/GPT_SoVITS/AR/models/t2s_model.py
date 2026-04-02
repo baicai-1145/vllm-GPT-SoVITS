@@ -389,7 +389,7 @@ class Text2SemanticDecoder(nn.Module):
 
         self.t2s_transformer = T2STransformer(self.num_layers, blocks)
         self.last_infer_stats = {}
-        self._compiled_decode_next_token_prealloc = None
+        self._compiled_decode_next_token_prealloc_with_metadata = None
         self._last_prealloc_decode_profile = {}
         self._last_dynamic_decode_profile = {}
 
@@ -850,15 +850,47 @@ class Text2SemanticDecoder(nn.Module):
         if self._profile_prealloc_decode_enabled():
             return self.decode_next_token_prealloc_profiled(x, k_cache, v_cache, kv_lens, attn_mask)
         self._set_last_prealloc_decode_profile({})
-        runtime = getattr(self, "_compiled_decode_next_token_prealloc", None)
+        prepared_x, batch_index, max_kv_index, next_max_kv_len, sdpa_attn_mask = self._prepare_prealloc_decode_inputs(
+            x,
+            kv_lens,
+            attn_mask,
+        )
+        runtime = getattr(self, "_compiled_decode_next_token_prealloc_with_metadata", None)
         if runtime is None:
-            return self.decode_next_token_prealloc(x, k_cache, v_cache, kv_lens, attn_mask)
+            return self._decode_next_token_prealloc_with_metadata(
+                prepared_x,
+                k_cache,
+                v_cache,
+                kv_lens,
+                batch_index,
+                max_kv_index,
+                next_max_kv_len,
+                sdpa_attn_mask,
+            )
         try:
-            return runtime(x, k_cache, v_cache, kv_lens, attn_mask)
+            return runtime(
+                prepared_x,
+                k_cache,
+                v_cache,
+                kv_lens,
+                batch_index,
+                max_kv_index,
+                next_max_kv_len,
+                sdpa_attn_mask,
+            )
         except Exception as exc:
-            self._compiled_decode_next_token_prealloc = None
+            self._compiled_decode_next_token_prealloc_with_metadata = None
             print(f"Compiled T2S prealloc decode disabled after runtime failure: {exc}")
-            return self.decode_next_token_prealloc(x, k_cache, v_cache, kv_lens, attn_mask)
+            return self._decode_next_token_prealloc_with_metadata(
+                prepared_x,
+                k_cache,
+                v_cache,
+                kv_lens,
+                batch_index,
+                max_kv_index,
+                next_max_kv_len,
+                sdpa_attn_mask,
+            )
 
     def _decode_block_next_token_dynamic_profiled(
         self,

@@ -1117,7 +1117,7 @@ class TTS:
         if not hasattr(torch, "compile") or getattr(self.t2s_model, "model", None) is None:
             return
         model = self.t2s_model.model
-        if getattr(model, "_compiled_decode_next_token_prealloc", None) is not None:
+        if getattr(model, "_compiled_decode_next_token_prealloc_with_metadata", None) is not None:
             return
         compile_mode = (
             os.environ.get("GPTSOVITS_COMPILE_T2S_PREALLOC_MODE", "max-autotune-no-cudagraphs").strip()
@@ -1160,8 +1160,8 @@ class TTS:
                 pass
         try:
             started_at = time.perf_counter()
-            model._compiled_decode_next_token_prealloc = torch.compile(
-                model.decode_next_token_prealloc,
+            model._compiled_decode_next_token_prealloc_with_metadata = torch.compile(
+                model._decode_next_token_prealloc_with_metadata,
                 mode=compile_mode,
                 dynamic=dynamic,
             )
@@ -1172,7 +1172,7 @@ class TTS:
                 f"skip_dynamic_cudagraph={skip_dynamic_graphs} wrap_ms={elapsed_ms:.2f}"
             )
         except Exception as exc:
-            model._compiled_decode_next_token_prealloc = None
+            model._compiled_decode_next_token_prealloc_with_metadata = None
             print(f"Compile T2S prealloc decode skipped: {exc}")
 
     def init_vits_weights(self, weights_path: str):
