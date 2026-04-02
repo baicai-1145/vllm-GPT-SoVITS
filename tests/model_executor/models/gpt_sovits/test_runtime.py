@@ -932,6 +932,44 @@ def test_sample_active_batch_requests_records_single_request_sampling_stats(tmp_
     assert float(stats["sampling_total_ms"]) >= float(stats["sampling_finish_scan_ms"])
 
 
+def test_sample_active_batch_requests_grouped_path_updates_histories(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._batched_sample_by_group = Mock(  # type: ignore[method-assign]
+        return_value=(
+            [
+                torch.tensor([[7]], dtype=torch.long),
+                torch.tensor([[8]], dtype=torch.long),
+            ],
+            [7, 8],
+        )
+    )
+
+    active_batch = SimpleNamespace(
+        states=[
+            SimpleNamespace(request_id="a", top_k=5, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1),
+            SimpleNamespace(request_id="b", top_k=3, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1),
+        ],
+        step_indices=torch.tensor([3, 3], dtype=torch.long),
+        y_sequences=[
+            torch.tensor([1, 2], dtype=torch.long),
+            torch.tensor([3, 4], dtype=torch.long),
+        ],
+        prefix_lens=torch.tensor([1, 1], dtype=torch.long),
+    )
+
+    finished, keep_indices, updated_sequences = runtime._sample_active_batch_requests(
+        SimpleNamespace(EOS=1024),
+        active_batch,
+        torch.zeros((2, 1025), dtype=torch.float32),
+        max_steps=16,
+    )
+
+    runtime._batched_sample_by_group.assert_called_once()
+    assert finished == []
+    assert keep_indices == [0, 1]
+    assert [seq.tolist() for seq in updated_sequences] == [[1, 2, 7], [3, 4, 8]]
+
+
 def test_sample_single_request_records_sampling_stats(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
 
@@ -4006,6 +4044,7 @@ def test_build_ar_session_routes_through_runtime_native_ar_helpers(tmp_path):
         kv_cache_pooled=False,
         kv_cache_capacity=0,
         kv_cache_batch_capacity=0,
+        kv_cache_left_aligned=False,
     )
     fake_model = SimpleNamespace(
         t2s_transformer=SimpleNamespace(
@@ -4022,8 +4061,7 @@ def test_build_ar_session_routes_through_runtime_native_ar_helpers(tmp_path):
     runtime._pipeline = SimpleNamespace(t2s_model=SimpleNamespace(model=fake_model))
     runtime._build_prefill_active_batch = Mock(return_value=active_batch)  # type: ignore[method-assign]
     runtime._pack_active_batch_into_pool = Mock(return_value=False)  # type: ignore[method-assign]
-    runtime._compact_cache_to_kv_lens = Mock(side_effect=lambda layer, kv_lens: layer)  # type: ignore[method-assign]
-    runtime._compact_decode_mask_to_kv_lens = Mock(side_effect=lambda mask, kv_lens: mask)  # type: ignore[method-assign]
+    runtime._ensure_dynamic_kv_prealloc_capacity = Mock()  # type: ignore[method-assign]
     runtime._build_next_xy_pos = Mock(return_value=torch.ones((1, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
 
     prepared = SimpleNamespace(
@@ -4036,8 +4074,7 @@ def test_build_ar_session_routes_through_runtime_native_ar_helpers(tmp_path):
 
     runtime._build_prefill_active_batch.assert_called_once_with(fake_model, [prepared.state])
     runtime._pack_active_batch_into_pool.assert_called_once_with(fake_model, active_batch)
-    assert runtime._compact_cache_to_kv_lens.call_count == 2
-    runtime._compact_decode_mask_to_kv_lens.assert_called_once()
+    runtime._ensure_dynamic_kv_prealloc_capacity.assert_called_once_with(active_batch, min_capacity=3)
     runtime._build_next_xy_pos.assert_called_once_with(fake_model, active_batch.y_sequences)
     assert active_batch.prefill_done is True
     assert active_batch.x is None
@@ -4093,17 +4130,21 @@ def test_advance_ar_session_routes_non_pooled_decode_through_runtime_helpers(tmp
         v_cache=[torch.ones((1, 1, 3), dtype=torch.float32)],
         kv_lens=initial_kv_lens.clone(),
         kv_cache_pooled=False,
+        kv_cache_capacity=0,
+        kv_cache_batch_capacity=0,
+        kv_cache_left_aligned=False,
         decode_attn_mask=initial_decode_mask,
     )
     fake_model = SimpleNamespace(
-        t2s_transformer=SimpleNamespace(
-            decode_next_token=Mock(
-                return_value=(
-                    torch.ones((1, 1, 4), dtype=torch.float32),
-                    [torch.ones((1, 2, 3), dtype=torch.float32)],
-                    [torch.ones((1, 2, 3), dtype=torch.float32)],
-                )
+        decode_next_token_dynamic_runtime=Mock(
+            return_value=(
+                torch.ones((1, 1, 4), dtype=torch.float32),
+                [torch.ones((1, 2, 3), dtype=torch.float32)],
+                [torch.ones((1, 2, 3), dtype=torch.float32)],
             )
+        ),
+        t2s_transformer=SimpleNamespace(
+            decode_next_token=Mock()
         ),
         ar_predict_layer=Mock(return_value=torch.tensor([[0.3, 0.4]], dtype=torch.float32)),
     )
@@ -4129,12 +4170,69 @@ def test_advance_ar_session_routes_non_pooled_decode_through_runtime_helpers(tmp
     assert int(active_batch.step_indices.item()) == 1
     runtime._build_next_xy_pos.assert_called_once_with(fake_model, active_batch.y_sequences)
     runtime._materialize_decode_mask_for_active_batch.assert_called_once_with(active_batch)
-    fake_model.t2s_transformer.decode_next_token.assert_called_once()
-    assert fake_model.t2s_transformer.decode_next_token.call_args.args[3] is None
+    fake_model.decode_next_token_dynamic_runtime.assert_called_once()
+    fake_model.t2s_transformer.decode_next_token.assert_not_called()
+    assert fake_model.decode_next_token_dynamic_runtime.call_args.args[3] is None
     runtime._advance_decode_mask.assert_called_once_with(initial_decode_mask, initial_kv_lens)
     assert torch.equal(active_batch.kv_lens, torch.tensor([2], dtype=torch.long))
     assert torch.equal(active_batch.decode_attn_mask, torch.ones((1, 1, 1, 3), dtype=torch.bool))
     assert torch.equal(session.current_logits, torch.tensor([[0.3, 0.4]], dtype=torch.float32))
+    assert torch.equal(logits, session.current_logits)
+
+
+def test_advance_ar_session_routes_dynamic_prealloc_through_prealloc_runtime(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+
+    initial_kv_lens = torch.tensor([1], dtype=torch.long)
+    active_batch = SimpleNamespace(
+        y_sequences=[torch.tensor([5], dtype=torch.long)],
+        step_indices=torch.tensor([0], dtype=torch.long),
+        xy_pos=torch.zeros((1, 1, 4), dtype=torch.float32),
+        k_cache=[torch.ones((1, 4, 3), dtype=torch.float32)],
+        v_cache=[torch.ones((1, 4, 3), dtype=torch.float32)],
+        kv_lens=initial_kv_lens.clone(),
+        kv_cache_pooled=False,
+        kv_cache_capacity=4,
+        kv_cache_batch_capacity=1,
+        kv_cache_left_aligned=True,
+        decode_attn_mask=None,
+    )
+    fake_model = SimpleNamespace(
+        decode_next_token_prealloc_runtime=Mock(
+            return_value=(
+                torch.ones((1, 1, 4), dtype=torch.float32),
+                [torch.ones((1, 4, 3), dtype=torch.float32)],
+                [torch.ones((1, 4, 3), dtype=torch.float32)],
+            )
+        ),
+        decode_next_token_dynamic_runtime=Mock(),
+        t2s_transformer=SimpleNamespace(decode_next_token=Mock()),
+        ar_predict_layer=Mock(return_value=torch.tensor([[0.5, 0.6]], dtype=torch.float32)),
+    )
+    runtime._pipeline = SimpleNamespace(t2s_model=SimpleNamespace(model=fake_model))
+    runtime._build_next_xy_pos = Mock(return_value=torch.ones((1, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
+    runtime._ensure_dynamic_kv_prealloc_capacity = Mock()  # type: ignore[method-assign]
+    runtime._build_decode_mask_from_kv_lens = Mock(  # type: ignore[method-assign]
+        return_value=torch.zeros((1, 1, 1, 2), dtype=torch.bool)
+    )
+
+    session = GPTSoVITSARSession(
+        request_id="req-advance-prealloc",
+        active_batch=active_batch,
+        transport_info={},
+        current_logits=torch.zeros((1, 2), dtype=torch.float32),
+    )
+
+    logits = runtime.advance_ar_session(session, 9)
+
+    runtime._ensure_dynamic_kv_prealloc_capacity.assert_called_once_with(active_batch, min_capacity=2)
+    runtime._build_decode_mask_from_kv_lens.assert_called_once()
+    fake_model.decode_next_token_prealloc_runtime.assert_called_once()
+    fake_model.decode_next_token_dynamic_runtime.assert_not_called()
+    fake_model.t2s_transformer.decode_next_token.assert_not_called()
+    assert torch.equal(active_batch.kv_lens, torch.tensor([2], dtype=torch.long))
+    assert active_batch.decode_attn_mask is None
+    assert torch.equal(session.current_logits, torch.tensor([[0.5, 0.6]], dtype=torch.float32))
     assert torch.equal(logits, session.current_logits)
 
 
@@ -4176,21 +4274,22 @@ def test_decode_active_batch_falls_back_from_pooled_cache_when_decode_headroom_e
         kv_cache_pooled=True,
         kv_cache_capacity=4,
         kv_cache_batch_capacity=8,
+        kv_cache_left_aligned=True,
         decode_attn_mask=None,
         prefill_done=True,
     )
     fake_model = SimpleNamespace(
         kv_cache_pool=pool,
-        t2s_transformer=SimpleNamespace(
-            decode_next_token=Mock(
-                return_value=(
-                    torch.ones((2, 1, 4), dtype=torch.float32),
-                    [torch.ones((2, 5, 3), dtype=torch.float32)],
-                    [torch.ones((2, 5, 3), dtype=torch.float32)],
-                )
+        decode_next_token_prealloc_runtime=Mock(
+            return_value=(
+                torch.ones((2, 1, 4), dtype=torch.float32),
+                [torch.ones((2, 32, 3), dtype=torch.float32)],
+                [torch.ones((2, 32, 3), dtype=torch.float32)],
             )
         ),
-        decode_next_token_prealloc_runtime=Mock(),
+        t2s_transformer=SimpleNamespace(
+            decode_next_token=Mock()
+        ),
         ar_predict_layer=Mock(return_value=torch.tensor([[0.1, 0.2], [0.3, 0.4]], dtype=torch.float32)),
     )
     runtime._sample_active_batch_requests = Mock(  # type: ignore[method-assign]
@@ -4206,17 +4305,149 @@ def test_decode_active_batch_falls_back_from_pooled_cache_when_decode_headroom_e
 
     assert finished_items == []
     assert updated_batch is active_batch
-    fake_model.decode_next_token_prealloc_runtime.assert_not_called()
-    fake_model.t2s_transformer.decode_next_token.assert_called_once()
-    decode_mask = fake_model.t2s_transformer.decode_next_token.call_args.args[3]
-    assert decode_mask.shape == (2, 1, 1, 5)
-    assert torch.equal(decode_mask[0, 0, 0], torch.tensor([True, False, False, False, False], dtype=torch.bool))
-    assert torch.equal(decode_mask[1, 0, 0], torch.tensor([False, False, False, False, False], dtype=torch.bool))
+    fake_model.decode_next_token_prealloc_runtime.assert_called_once()
+    fake_model.t2s_transformer.decode_next_token.assert_not_called()
+    decode_mask = fake_model.decode_next_token_prealloc_runtime.call_args.args[4]
+    assert decode_mask.shape == (2, 1, 1, 6)
+    assert torch.equal(decode_mask[0, 0, 0], torch.tensor([True, False, False, False, False, False], dtype=torch.bool))
+    assert torch.equal(decode_mask[1, 0, 0], torch.tensor([False, False, False, False, False, False], dtype=torch.bool))
     assert active_batch.kv_cache_pooled is False
-    assert active_batch.kv_cache_capacity == 0
-    assert active_batch.kv_cache_batch_capacity == 0
+    assert active_batch.kv_cache_left_aligned is True
+    assert active_batch.kv_cache_capacity >= 5
+    assert active_batch.kv_cache_batch_capacity == 2
+    assert active_batch.decode_attn_mask is None
     assert torch.equal(active_batch.kv_lens, torch.tensor([4, 5], dtype=torch.long))
     pool.record_fallback.assert_called_once()
+
+
+def test_decode_active_batch_keeps_dynamic_prealloc_layout_after_subset(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    active_batch = SimpleNamespace(
+        request_ids=["req-a", "req-b"],
+        states=[SimpleNamespace(request_id="req-a", early_stop_num=-1), SimpleNamespace(request_id="req-b", early_stop_num=-1)],
+        y_sequences=[torch.tensor([5, 6], dtype=torch.long), torch.tensor([7], dtype=torch.long)],
+        prefix_lens=torch.tensor([1, 1], dtype=torch.long),
+        step_indices=torch.tensor([1, 0], dtype=torch.long),
+        xy_pos=torch.zeros((2, 1, 4), dtype=torch.float32),
+        k_cache=[
+            torch.tensor(
+                [
+                    [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                    [[3.0, 3.0, 3.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                ],
+                dtype=torch.float32,
+            )
+        ],
+        v_cache=[
+            torch.tensor(
+                [
+                    [[10.0, 10.0, 10.0], [20.0, 20.0, 20.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                    [[30.0, 30.0, 30.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                ],
+                dtype=torch.float32,
+            )
+        ],
+        kv_lens=torch.tensor([2, 1], dtype=torch.long),
+        kv_cache_pooled=False,
+        kv_cache_capacity=4,
+        kv_cache_batch_capacity=2,
+        kv_cache_left_aligned=True,
+        decode_attn_mask=None,
+        prefill_done=True,
+    )
+    fake_model = SimpleNamespace(
+        decode_next_token_prealloc_runtime=Mock(
+            return_value=(
+                torch.ones((2, 1, 4), dtype=torch.float32),
+                [torch.ones((2, 4, 3), dtype=torch.float32)],
+                [torch.ones((2, 4, 3), dtype=torch.float32)],
+            )
+        ),
+        ar_predict_layer=Mock(return_value=torch.tensor([[0.1, 0.2], [0.3, 0.4]], dtype=torch.float32)),
+    )
+    runtime._sample_active_batch_requests = Mock(  # type: ignore[method-assign]
+        return_value=([], [1], [torch.tensor([7, 8], dtype=torch.long)])
+    )
+    runtime._build_next_xy_pos = Mock(return_value=torch.ones((1, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
+
+    updated_batch, finished_items = runtime._decode_active_batch_one_step(fake_model, active_batch, max_steps=8)
+
+    assert finished_items == []
+    assert updated_batch is active_batch
+    fake_model.decode_next_token_prealloc_runtime.assert_called_once()
+    assert active_batch.request_ids == ["req-b"]
+    assert active_batch.kv_cache_pooled is False
+    assert active_batch.kv_cache_left_aligned is True
+    assert active_batch.kv_cache_capacity == 4
+    assert active_batch.kv_cache_batch_capacity == 1
+    assert active_batch.k_cache[0].shape == (1, 4, 3)
+    assert active_batch.v_cache[0].shape == (1, 4, 3)
+    assert active_batch.decode_attn_mask is None
+    assert torch.equal(active_batch.kv_lens, torch.tensor([2], dtype=torch.long))
+
+
+def test_decode_active_batch_maps_dynamic_prealloc_profile_into_dynamic_stats(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    active_batch = SimpleNamespace(
+        request_ids=["req-a"],
+        states=[SimpleNamespace(request_id="req-a", early_stop_num=-1)],
+        y_sequences=[torch.tensor([5, 6], dtype=torch.long)],
+        prefix_lens=torch.tensor([1], dtype=torch.long),
+        step_indices=torch.tensor([1], dtype=torch.long),
+        xy_pos=torch.zeros((1, 1, 4), dtype=torch.float32),
+        k_cache=[torch.ones((1, 4, 3), dtype=torch.float32)],
+        v_cache=[torch.ones((1, 4, 3), dtype=torch.float32)],
+        kv_lens=torch.tensor([2], dtype=torch.long),
+        kv_cache_pooled=False,
+        kv_cache_capacity=4,
+        kv_cache_batch_capacity=1,
+        kv_cache_left_aligned=True,
+        decode_attn_mask=None,
+        prefill_done=True,
+    )
+    fake_model = SimpleNamespace(
+        decode_next_token_prealloc_runtime=Mock(
+            return_value=(
+                torch.ones((1, 1, 4), dtype=torch.float32),
+                [torch.ones((1, 4, 3), dtype=torch.float32)],
+                [torch.ones((1, 4, 3), dtype=torch.float32)],
+            )
+        ),
+        get_last_prealloc_decode_profile=Mock(
+            return_value={
+                "pooled_prealloc_profiled_decode_calls": 1,
+                "pooled_prealloc_profiled_layer_calls": 24,
+                "pooled_prealloc_qkv_linear_ms": 10.5,
+                "pooled_prealloc_kv_write_ms": 4.5,
+                "pooled_prealloc_sdpa_ms": 21.0,
+                "pooled_prealloc_layer_total_ms": 40.0,
+            }
+        ),
+        ar_predict_layer=Mock(return_value=torch.tensor([[0.1, 0.9]], dtype=torch.float32)),
+    )
+    runtime._sample_active_batch_requests = Mock(  # type: ignore[method-assign]
+        return_value=([], [0], [torch.tensor([5, 6, 7], dtype=torch.long)])
+    )
+    runtime._build_next_xy_pos = Mock(return_value=torch.ones((1, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
+    stats: dict[str, float | int] = {}
+
+    updated_batch, finished_items = runtime._decode_active_batch_one_step(
+        fake_model,
+        active_batch,
+        max_steps=8,
+        stats=stats,
+    )
+
+    assert finished_items == []
+    assert updated_batch is active_batch
+    fake_model.decode_next_token_prealloc_runtime.assert_called_once()
+    fake_model.get_last_prealloc_decode_profile.assert_called_once()
+    assert int(stats["dynamic_profiled_decode_calls"]) == 1
+    assert int(stats["dynamic_profiled_layer_calls"]) == 24
+    assert float(stats["dynamic_qkv_linear_ms"]) == 10.5
+    assert float(stats["dynamic_kv_append_ms"]) == 4.5
+    assert float(stats["dynamic_sdpa_ms"]) == 21.0
+    assert float(stats["dynamic_layer_total_ms"]) == 40.0
 
 
 def test_decode_active_batch_merges_profiled_prealloc_decode_stats(tmp_path):
@@ -4287,6 +4518,67 @@ def test_decode_active_batch_merges_profiled_prealloc_decode_stats(tmp_path):
     assert float(stats["pooled_prealloc_layer_total_ms"]) == 56.0
 
 
+def test_decode_active_batch_merges_profiled_dynamic_decode_stats(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    active_batch = SimpleNamespace(
+        request_ids=["req-a"],
+        states=[SimpleNamespace(request_id="req-a", early_stop_num=-1)],
+        y_sequences=[torch.tensor([5, 6], dtype=torch.long)],
+        prefix_lens=torch.tensor([1], dtype=torch.long),
+        step_indices=torch.tensor([1], dtype=torch.long),
+        xy_pos=torch.zeros((1, 1, 4), dtype=torch.float32),
+        k_cache=[torch.ones((1, 2, 3), dtype=torch.float32)],
+        v_cache=[torch.ones((1, 2, 3), dtype=torch.float32)],
+        kv_lens=torch.tensor([2], dtype=torch.long),
+        kv_cache_pooled=False,
+        kv_cache_capacity=0,
+        kv_cache_batch_capacity=0,
+        decode_attn_mask=None,
+        prefill_done=True,
+    )
+    fake_model = SimpleNamespace(
+        decode_next_token_dynamic_runtime=Mock(
+            return_value=(
+                torch.ones((1, 1, 4), dtype=torch.float32),
+                [torch.ones((1, 3, 3), dtype=torch.float32)],
+                [torch.ones((1, 3, 3), dtype=torch.float32)],
+            )
+        ),
+        get_last_dynamic_decode_profile=Mock(
+            return_value={
+                "dynamic_profiled_decode_calls": 1,
+                "dynamic_profiled_layer_calls": 24,
+                "dynamic_qkv_linear_ms": 11.5,
+                "dynamic_sdpa_ms": 22.0,
+                "dynamic_layer_total_ms": 44.0,
+            }
+        ),
+        ar_predict_layer=Mock(return_value=torch.tensor([[0.1, 0.9]], dtype=torch.float32)),
+    )
+    runtime._sample_active_batch_requests = Mock(  # type: ignore[method-assign]
+        return_value=([], [0], [torch.tensor([5, 6, 7], dtype=torch.long)])
+    )
+    runtime._build_next_xy_pos = Mock(return_value=torch.ones((1, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
+    stats: dict[str, float | int] = {}
+
+    updated_batch, finished_items = runtime._decode_active_batch_one_step(
+        fake_model,
+        active_batch,
+        max_steps=8,
+        stats=stats,
+    )
+
+    assert finished_items == []
+    assert updated_batch is active_batch
+    fake_model.decode_next_token_dynamic_runtime.assert_called_once()
+    fake_model.get_last_dynamic_decode_profile.assert_called_once()
+    assert int(stats["dynamic_profiled_decode_calls"]) == 1
+    assert int(stats["dynamic_profiled_layer_calls"]) == 24
+    assert float(stats["dynamic_qkv_linear_ms"]) == 11.5
+    assert float(stats["dynamic_sdpa_ms"]) == 22.0
+    assert float(stats["dynamic_layer_total_ms"]) == 44.0
+
+
 def test_runtime_build_next_xy_pos_single_request_fast_path_matches_expected(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     embedding = nn.Embedding(16, 4)
@@ -4309,6 +4601,134 @@ def test_runtime_build_next_xy_pos_single_request_fast_path_matches_expected(tmp
 
     expected = embedding(torch.tensor([[7]], dtype=torch.long)) * 2.0 + 0.5 * audio_position.pe[:, 2:3, :]
     assert torch.allclose(xy_pos, expected)
+
+
+def test_build_prefill_active_batch_reuses_cached_prompt_prefix_without_changing_outputs(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    text_embedding = nn.Embedding(32, 4)
+    audio_embedding = nn.Embedding(32, 4)
+    bert_proj = nn.Linear(1024, 4, bias=False)
+
+    class _FakePosition(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pe = torch.arange(160, dtype=torch.float32).reshape(1, 40, 4)
+            self.x_scale = 1.0
+            self.alpha = torch.tensor([1.0], dtype=torch.float32)
+            self.embedding_dim = 4
+            self.dropout = nn.Dropout(p=0.0)
+            self.extend_pe = Mock(side_effect=AssertionError("unexpected extend_pe call"))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return runtime._apply_position_encoding_slice(self, x, start_index=0)
+
+    with torch.no_grad():
+        text_embedding.weight.copy_(torch.arange(128, dtype=torch.float32).reshape(32, 4))
+        audio_embedding.weight.copy_(torch.arange(128, dtype=torch.float32).reshape(32, 4) * 0.5)
+        bert_proj.weight.zero_()
+        bert_proj.weight[:, :4] = torch.eye(4, dtype=torch.float32)
+    text_position = _FakePosition()
+    audio_position = _FakePosition()
+    fake_model = SimpleNamespace(
+        ar_text_embedding=text_embedding,
+        bert_proj=bert_proj,
+        ar_text_position=text_position,
+        ar_audio_embedding=audio_embedding,
+        ar_audio_position=audio_position,
+    )
+    prompt_phones = torch.tensor([2, 5], dtype=torch.long)
+    segment_phones = torch.tensor([7, 9], dtype=torch.long)
+    prompt_bert = torch.zeros((1024, 2), dtype=torch.float32)
+    prompt_bert[:4, :] = torch.tensor([[1.0, 2.0], [0.5, 1.5], [0.25, 0.75], [0.0, 1.0]], dtype=torch.float32)
+    segment_bert = torch.zeros((1024, 2), dtype=torch.float32)
+    segment_bert[:4, :] = torch.tensor([[3.0, 4.0], [1.0, 2.0], [0.5, 1.5], [0.25, 0.5]], dtype=torch.float32)
+    prompt_semantic = torch.tensor([3, 4, 6], dtype=torch.long)
+    prompt_text_pos, prompt_audio_pos = runtime._build_prompt_prefix_position_cache(
+        fake_model,
+        prompt_phones=prompt_phones,
+        prompt_bert_features=prompt_bert,
+        prompt_semantic=prompt_semantic,
+    )
+
+    common_kwargs = dict(
+        request_id="req",
+        parent_request_id="req",
+        segment_index=0,
+        ref_audio_path="ref.wav",
+        prompt_text="prompt",
+        prompt_lang="zh",
+        text="text",
+        text_lang="zh",
+        norm_prompt_text="prompt",
+        norm_text="seg",
+        phones=segment_phones,
+        prompt_phones=prompt_phones,
+        all_phones=torch.cat([prompt_phones, segment_phones], dim=0),
+        all_bert_features=torch.cat([prompt_bert, segment_bert], dim=1),
+        prompt_semantic=prompt_semantic,
+        refer_spec=None,
+        aux_refer_specs=[],
+        raw_audio=torch.zeros((1,), dtype=torch.float32),
+        raw_sr=16000,
+        top_k=15,
+        top_p=1.0,
+        temperature=1.0,
+        repetition_penalty=1.35,
+        early_stop_num=1500,
+        ready_step=0,
+        prepare_profile={},
+    )
+    uncached_state = GPTSoVITST2SRequestState(**common_kwargs)
+    cached_state = GPTSoVITST2SRequestState(
+        **common_kwargs,
+        prompt_text_pos=prompt_text_pos,
+        prompt_audio_pos=prompt_audio_pos,
+    )
+
+    uncached_batch = runtime._build_prefill_active_batch(fake_model, [uncached_state])
+    cached_batch = runtime._build_prefill_active_batch(fake_model, [cached_state])
+
+    assert torch.allclose(cached_batch.x, uncached_batch.x)
+    assert torch.allclose(cached_batch.xy_pos, uncached_batch.xy_pos)
+    assert torch.equal(cached_batch.x_lens, uncached_batch.x_lens)
+    assert torch.equal(cached_batch.prefix_lens, uncached_batch.prefix_lens)
+    assert torch.equal(cached_batch.prefill_attn_mask, uncached_batch.prefill_attn_mask)
+
+
+def test_get_or_build_prompt_prefix_position_cache_uses_exact_content_cache(tmp_path, monkeypatch):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    monkeypatch.setenv("GPTSOVITS_T2S_PROMPT_PREFIX_CACHE_MAX_ENTRIES", "4")
+    monkeypatch.setenv("GPTSOVITS_T2S_PROMPT_PREFIX_CACHE_TTL_SEC", "60")
+    runtime._build_prompt_prefix_position_cache = Mock(  # type: ignore[method-assign]
+        return_value=(
+            torch.ones((2, 4), dtype=torch.float32),
+            torch.full((3, 4), 2.0, dtype=torch.float32),
+        )
+    )
+
+    prompt_phones_a = torch.tensor([2, 5], dtype=torch.long)
+    prompt_bert_a = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    prompt_bert_a = torch.cat([prompt_bert_a, torch.zeros((1020, 2), dtype=torch.float32)], dim=0)
+    prompt_semantic_a = torch.tensor([3, 4, 6], dtype=torch.long)
+
+    first = runtime._get_or_build_prompt_prefix_position_cache(
+        object(),
+        prompt_phones=prompt_phones_a,
+        prompt_bert_features=prompt_bert_a,
+        prompt_semantic=prompt_semantic_a,
+    )
+    second = runtime._get_or_build_prompt_prefix_position_cache(
+        object(),
+        prompt_phones=prompt_phones_a.clone(),
+        prompt_bert_features=prompt_bert_a.clone(),
+        prompt_semantic=prompt_semantic_a.clone(),
+    )
+
+    runtime._build_prompt_prefix_position_cache.assert_called_once()
+    assert first[2] is False
+    assert second[2] is True
+    assert torch.equal(first[0], second[0])
+    assert torch.equal(first[1], second[1])
 
 
 def test_scheduler_build_next_xy_pos_single_request_fast_path_matches_expected():
@@ -4613,6 +5033,7 @@ def test_merge_active_batches_uses_runtime_native_merge_helpers(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     runtime._build_next_xy_pos = Mock(return_value=torch.ones((2, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
     runtime._pack_active_batch_into_pool = Mock(return_value=False)  # type: ignore[method-assign]
+    runtime._ensure_dynamic_kv_prealloc_capacity = Mock()  # type: ignore[method-assign]
 
     left_batch = SimpleNamespace(
         request_ids=["left"],
@@ -4620,11 +5041,12 @@ def test_merge_active_batches_uses_runtime_native_merge_helpers(tmp_path):
         y_sequences=[torch.tensor([11], dtype=torch.long)],
         prefix_lens=torch.tensor([1], dtype=torch.long),
         step_indices=torch.tensor([0], dtype=torch.long),
-        k_cache=[torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)],
-        v_cache=[torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)],
+        k_cache=[torch.tensor([[[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)],
+        v_cache=[torch.tensor([[[10.0, 10.0, 10.0], [20.0, 20.0, 20.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)],
         kv_lens=torch.tensor([2], dtype=torch.long),
         prefill_done=True,
         kv_cache_pooled=False,
+        kv_cache_left_aligned=True,
     )
     right_batch = SimpleNamespace(
         request_ids=["right"],
@@ -4632,23 +5054,27 @@ def test_merge_active_batches_uses_runtime_native_merge_helpers(tmp_path):
         y_sequences=[torch.tensor([22], dtype=torch.long)],
         prefix_lens=torch.tensor([1], dtype=torch.long),
         step_indices=torch.tensor([1], dtype=torch.long),
-        k_cache=[torch.arange(6, 12, dtype=torch.float32).reshape(1, 2, 3)],
-        v_cache=[torch.arange(6, 12, dtype=torch.float32).reshape(1, 2, 3)],
+        k_cache=[torch.tensor([[[6.0, 6.0, 6.0], [7.0, 7.0, 7.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)],
+        v_cache=[torch.tensor([[[60.0, 60.0, 60.0], [70.0, 70.0, 70.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)],
         kv_lens=torch.tensor([2], dtype=torch.long),
         prefill_done=True,
         kv_cache_pooled=False,
+        kv_cache_left_aligned=True,
     )
 
     merged = runtime._merge_active_batches(SimpleNamespace(), left_batch, right_batch)
 
     runtime._build_next_xy_pos.assert_called_once()
     runtime._pack_active_batch_into_pool.assert_called_once()
+    runtime._ensure_dynamic_kv_prealloc_capacity.assert_called_once_with(merged, min_capacity=3)
     assert isinstance(merged, GPTSoVITSActiveBatch)
     assert merged.request_ids == ["left", "right"]
     assert torch.equal(merged.kv_lens, torch.tensor([2, 2], dtype=torch.long))
     assert torch.equal(merged.step_indices, torch.tensor([0, 1], dtype=torch.long))
     assert merged.prefill_done is True
     assert merged.k_cache[0].shape == (2, 2, 3)
+    assert torch.equal(merged.k_cache[0][0], torch.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], dtype=torch.float32))
+    assert torch.equal(merged.k_cache[0][1], torch.tensor([[6.0, 6.0, 6.0], [7.0, 7.0, 7.0]], dtype=torch.float32))
 
 
 def test_run_continuous_batch_scheduler_uses_runtime_native_loop(tmp_path):

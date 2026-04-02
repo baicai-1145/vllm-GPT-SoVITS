@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import math
 import os
 import sys
@@ -9,6 +10,7 @@ import threading
 import ctypes
 import types
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence, cast
@@ -1360,6 +1362,8 @@ class GPTSoVITST2SRequestState:
     early_stop_num: int
     ready_step: int
     prepare_profile: dict[str, float]
+    prompt_text_pos: torch.Tensor | None = None
+    prompt_audio_pos: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -1394,6 +1398,7 @@ class GPTSoVITSActiveBatch:
     kv_cache_pooled: bool = False
     kv_cache_capacity: int = 0
     kv_cache_batch_capacity: int = 0
+    kv_cache_left_aligned: bool = False
 
 
 @dataclass(slots=True)
@@ -1515,6 +1520,11 @@ class GPTSoVITSRuntime:
         self._runtime_prepare_ref_semantic_stage_limiter: Any | None = None
         self._last_t2s_scheduler_stats: dict[str, Any] = {}
         self._sampling_ops_cache: tuple[Any, Any] | None = None
+        self._t2s_prompt_prefix_cache_lock = threading.RLock()
+        self._t2s_prompt_prefix_cache: OrderedDict[
+            tuple[Any, ...],
+            tuple[float, torch.Tensor, torch.Tensor],
+        ] = OrderedDict()
 
     def _resolve_path(self, maybe_relative_path: str) -> str:
         if os.path.isabs(maybe_relative_path):
@@ -2050,6 +2060,192 @@ class GPTSoVITSRuntime:
             torch.zeros(1, required_len, model.ar_audio_position.embedding_dim, device=device, dtype=dtype)
         )
 
+    @staticmethod
+    def _ensure_text_position_encoding(
+        model: Any,
+        max_position: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        required_len = max_position + 1
+        if model.ar_text_position.pe is not None and model.ar_text_position.pe.size(1) >= required_len:
+            if model.ar_text_position.pe.dtype != dtype or model.ar_text_position.pe.device != device:
+                model.ar_text_position.pe = model.ar_text_position.pe.to(dtype=dtype, device=device)
+            return
+        model.ar_text_position.extend_pe(
+            torch.zeros(1, required_len, model.ar_text_position.embedding_dim, device=device, dtype=dtype)
+        )
+
+    @staticmethod
+    def _apply_position_encoding_slice(
+        position_module: Any,
+        hidden: torch.Tensor,
+        *,
+        start_index: int = 0,
+    ) -> torch.Tensor:
+        if hidden.ndim != 3:
+            raise ValueError("position-encoded hidden tensor 必须是 [B, T, C]")
+        seq_len = int(hidden.shape[1])
+        if seq_len <= 0:
+            return hidden
+        pe = position_module.pe[:, start_index : start_index + seq_len]
+        output = hidden * position_module.x_scale + position_module.alpha * pe.to(
+            dtype=hidden.dtype,
+            device=hidden.device,
+        )
+        return position_module.dropout(output)
+
+    def _build_prompt_prefix_position_cache(
+        self,
+        model: Any,
+        *,
+        prompt_phones: torch.LongTensor,
+        prompt_bert_features: torch.Tensor,
+        prompt_semantic: torch.LongTensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prompt_phones = prompt_phones.detach().clone().contiguous()
+        prompt_bert_features = prompt_bert_features.detach().clone().contiguous()
+        prompt_semantic = prompt_semantic.detach().clone().contiguous()
+        prompt_text_emb = model.ar_text_embedding(prompt_phones.unsqueeze(0))
+        prompt_bert_proj = model.bert_proj(prompt_bert_features.transpose(0, 1).unsqueeze(0))
+        prompt_hidden = prompt_text_emb + prompt_bert_proj
+        self._ensure_text_position_encoding(
+            model,
+            int(prompt_hidden.shape[1] - 1),
+            prompt_hidden.dtype,
+            prompt_hidden.device,
+        )
+        prompt_text_pos = self._apply_position_encoding_slice(model.ar_text_position, prompt_hidden, start_index=0).squeeze(0)
+
+        prompt_audio_emb = model.ar_audio_embedding(prompt_semantic.unsqueeze(0))
+        self._ensure_audio_position_encoding(
+            model,
+            int(prompt_audio_emb.shape[1] - 1),
+            prompt_audio_emb.dtype,
+            prompt_audio_emb.device,
+        )
+        prompt_audio_pos = self._apply_position_encoding_slice(model.ar_audio_position, prompt_audio_emb, start_index=0).squeeze(0)
+        return prompt_text_pos, prompt_audio_pos
+
+    @staticmethod
+    def _tensor_content_key(value: torch.Tensor | None) -> tuple[Any, ...] | None:
+        if value is None:
+            return None
+        normalized = value.detach().to(device="cpu").contiguous()
+        return (
+            str(value.device),
+            str(value.dtype),
+            tuple(int(item) for item in value.shape),
+            hashlib.sha1(normalized.numpy().tobytes()).hexdigest(),
+        )
+
+    def _build_t2s_prompt_prefix_cache_key(
+        self,
+        *,
+        prompt_phones: torch.LongTensor,
+        prompt_bert_features: torch.Tensor,
+        prompt_semantic: torch.LongTensor,
+    ) -> tuple[Any, ...]:
+        return (
+            self._tensor_content_key(prompt_phones),
+            self._tensor_content_key(prompt_bert_features),
+            self._tensor_content_key(prompt_semantic),
+        )
+
+    @staticmethod
+    def _get_t2s_prompt_prefix_cache_ttl_sec() -> float:
+        try:
+            return max(0.0, float(os.environ.get("GPTSOVITS_T2S_PROMPT_PREFIX_CACHE_TTL_SEC", "60")))
+        except Exception:
+            return 60.0
+
+    @staticmethod
+    def _get_t2s_prompt_prefix_cache_max_entries() -> int:
+        try:
+            return max(0, int(os.environ.get("GPTSOVITS_T2S_PROMPT_PREFIX_CACHE_MAX_ENTRIES", "16")))
+        except Exception:
+            return 16
+
+    def _prune_t2s_prompt_prefix_cache_locked(self, now: float | None = None) -> None:
+        ttl_sec = self._get_t2s_prompt_prefix_cache_ttl_sec()
+        max_entries = self._get_t2s_prompt_prefix_cache_max_entries()
+        if ttl_sec <= 0.0 or max_entries <= 0:
+            self._t2s_prompt_prefix_cache.clear()
+            return
+        current = time.perf_counter() if now is None else float(now)
+        stale_keys = [
+            key for key, (cached_at, _text_pos, _audio_pos) in self._t2s_prompt_prefix_cache.items()
+            if current - float(cached_at) > ttl_sec
+        ]
+        for key in stale_keys:
+            self._t2s_prompt_prefix_cache.pop(key, None)
+        overflow = len(self._t2s_prompt_prefix_cache) - int(max_entries)
+        while overflow > 0 and self._t2s_prompt_prefix_cache:
+            self._t2s_prompt_prefix_cache.popitem(last=False)
+            overflow -= 1
+
+    def _get_cached_t2s_prompt_prefix_position_cache(
+        self,
+        cache_key: tuple[Any, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        ttl_sec = self._get_t2s_prompt_prefix_cache_ttl_sec()
+        max_entries = self._get_t2s_prompt_prefix_cache_max_entries()
+        if ttl_sec <= 0.0 or max_entries <= 0:
+            return None
+        with self._t2s_prompt_prefix_cache_lock:
+            self._prune_t2s_prompt_prefix_cache_locked()
+            cached = self._t2s_prompt_prefix_cache.get(cache_key)
+            if cached is None:
+                return None
+            cached_at, prompt_text_pos, prompt_audio_pos = cached
+            self._t2s_prompt_prefix_cache.move_to_end(cache_key)
+            self._t2s_prompt_prefix_cache[cache_key] = (float(cached_at), prompt_text_pos, prompt_audio_pos)
+            return prompt_text_pos, prompt_audio_pos
+
+    def _store_t2s_prompt_prefix_position_cache(
+        self,
+        cache_key: tuple[Any, ...],
+        prompt_text_pos: torch.Tensor,
+        prompt_audio_pos: torch.Tensor,
+    ) -> None:
+        ttl_sec = self._get_t2s_prompt_prefix_cache_ttl_sec()
+        max_entries = self._get_t2s_prompt_prefix_cache_max_entries()
+        if ttl_sec <= 0.0 or max_entries <= 0:
+            return
+        with self._t2s_prompt_prefix_cache_lock:
+            self._t2s_prompt_prefix_cache[cache_key] = (
+                time.perf_counter(),
+                prompt_text_pos,
+                prompt_audio_pos,
+            )
+            self._t2s_prompt_prefix_cache.move_to_end(cache_key)
+            self._prune_t2s_prompt_prefix_cache_locked()
+
+    def _get_or_build_prompt_prefix_position_cache(
+        self,
+        model: Any,
+        *,
+        prompt_phones: torch.LongTensor,
+        prompt_bert_features: torch.Tensor,
+        prompt_semantic: torch.LongTensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        cache_key = self._build_t2s_prompt_prefix_cache_key(
+            prompt_phones=prompt_phones,
+            prompt_bert_features=prompt_bert_features,
+            prompt_semantic=prompt_semantic,
+        )
+        cached = self._get_cached_t2s_prompt_prefix_position_cache(cache_key)
+        if cached is not None:
+            return cached[0], cached[1], True
+        prompt_text_pos, prompt_audio_pos = self._build_prompt_prefix_position_cache(
+            model,
+            prompt_phones=prompt_phones,
+            prompt_bert_features=prompt_bert_features,
+            prompt_semantic=prompt_semantic,
+        )
+        self._store_t2s_prompt_prefix_position_cache(cache_key, prompt_text_pos, prompt_audio_pos)
+        return prompt_text_pos, prompt_audio_pos, False
+
     def _build_prefill_active_batch(
         self,
         model: Any,
@@ -2065,11 +2261,37 @@ class GPTSoVITSRuntime:
         y_sequences: list[torch.Tensor] = []
 
         for state in states:
-            text_emb = model.ar_text_embedding(state.all_phones.unsqueeze(0))
-            bert_proj = model.bert_proj(state.all_bert_features.transpose(0, 1).unsqueeze(0))
-            x_pos = model.ar_text_position(text_emb + bert_proj).squeeze(0)
-            y_emb = model.ar_audio_embedding(state.prompt_semantic.unsqueeze(0))
-            y_pos = model.ar_audio_position(y_emb).squeeze(0)
+            prompt_text_pos = getattr(state, "prompt_text_pos", None)
+            prompt_audio_pos = getattr(state, "prompt_audio_pos", None)
+            if isinstance(prompt_text_pos, torch.Tensor) and isinstance(prompt_audio_pos, torch.Tensor):
+                prompt_len = int(prompt_text_pos.shape[0])
+                target_phones = state.phones
+                if int(target_phones.shape[0]) > 0:
+                    target_text_emb = model.ar_text_embedding(target_phones.unsqueeze(0))
+                    target_bert = state.all_bert_features[:, prompt_len:].transpose(0, 1).unsqueeze(0)
+                    target_hidden = target_text_emb + model.bert_proj(target_bert)
+                    total_text_len = prompt_len + int(target_hidden.shape[1])
+                    self._ensure_text_position_encoding(
+                        model,
+                        max(0, total_text_len - 1),
+                        target_hidden.dtype,
+                        target_hidden.device,
+                    )
+                    target_text_pos = self._apply_position_encoding_slice(
+                        model.ar_text_position,
+                        target_hidden,
+                        start_index=prompt_len,
+                    ).squeeze(0)
+                    x_pos = torch.cat([prompt_text_pos, target_text_pos], dim=0)
+                else:
+                    x_pos = prompt_text_pos
+                y_pos = prompt_audio_pos
+            else:
+                text_emb = model.ar_text_embedding(state.all_phones.unsqueeze(0))
+                bert_proj = model.bert_proj(state.all_bert_features.transpose(0, 1).unsqueeze(0))
+                x_pos = model.ar_text_position(text_emb + bert_proj).squeeze(0)
+                y_emb = model.ar_audio_embedding(state.prompt_semantic.unsqueeze(0))
+                y_pos = model.ar_audio_position(y_emb).squeeze(0)
             x_items.append(x_pos)
             y_pos_items.append(y_pos)
             x_lens.append(int(x_pos.shape[0]))
@@ -2116,6 +2338,7 @@ class GPTSoVITSRuntime:
             kv_cache_pooled=False,
             kv_cache_capacity=0,
             kv_cache_batch_capacity=0,
+            kv_cache_left_aligned=False,
         )
 
     def _build_next_xy_pos(
@@ -2195,6 +2418,7 @@ class GPTSoVITSRuntime:
             active_batch.kv_cache_pooled = False
             active_batch.kv_cache_capacity = 0
             active_batch.kv_cache_batch_capacity = 0
+            active_batch.kv_cache_left_aligned = True
             self._set_kv_pool_active_rows(model, 0)
             return False
         active_batch.k_cache, active_batch.v_cache = pooled_views
@@ -2202,6 +2426,7 @@ class GPTSoVITSRuntime:
         active_batch.kv_cache_pooled = True
         active_batch.kv_cache_capacity = int(pool.max_seq_len)
         active_batch.kv_cache_batch_capacity = int(pool.max_batch_size)
+        active_batch.kv_cache_left_aligned = True
         self._set_kv_pool_active_rows(model, len(active_batch.request_ids))
         return True
 
@@ -2335,10 +2560,11 @@ class GPTSoVITSRuntime:
         kv_len: int,
         *,
         pooled: bool,
+        left_aligned: bool = False,
     ) -> torch.Tensor:
         if kv_len <= 0:
             return cache[batch_index : batch_index + 1, :0, :]
-        if pooled:
+        if pooled or left_aligned:
             return cache[batch_index : batch_index + 1, :kv_len, :]
         return cache[batch_index : batch_index + 1, -kv_len:, :]
 
@@ -2356,6 +2582,7 @@ class GPTSoVITSRuntime:
             active_batch.kv_cache_pooled = False
             active_batch.kv_cache_capacity = 0
             active_batch.kv_cache_batch_capacity = 0
+            active_batch.kv_cache_left_aligned = True
             self._set_kv_pool_active_rows(model, 0)
             return False
         active_batch.k_cache, active_batch.v_cache = pooled_views
@@ -2363,6 +2590,7 @@ class GPTSoVITSRuntime:
         active_batch.kv_cache_pooled = True
         active_batch.kv_cache_capacity = int(pool.max_seq_len)
         active_batch.kv_cache_batch_capacity = int(pool.max_batch_size)
+        active_batch.kv_cache_left_aligned = True
         self._set_kv_pool_active_rows(model, len(active_batch.request_ids))
         return True
 
@@ -2397,14 +2625,128 @@ class GPTSoVITSRuntime:
             unpacked_v_cache.append(unpacked_v)
         active_batch.k_cache = unpacked_k_cache
         active_batch.v_cache = unpacked_v_cache
-        active_batch.decode_attn_mask = self._build_decode_mask_from_kv_lens(
-            active_batch.kv_lens,
-            device=active_batch.k_cache[0].device,
-        )
+        active_batch.decode_attn_mask = None
         active_batch.kv_cache_pooled = False
         active_batch.kv_cache_capacity = 0
         active_batch.kv_cache_batch_capacity = 0
+        active_batch.kv_cache_left_aligned = False
         self._set_kv_pool_active_rows(model, 0)
+        self._ensure_dynamic_kv_prealloc_capacity(
+            active_batch,
+            min_capacity=int(active_batch.kv_lens.max().item()) + 1,
+        )
+
+    @staticmethod
+    def _dynamic_kv_prealloc_enabled() -> bool:
+        return str(os.environ.get("GPTSOVITS_T2S_DYNAMIC_KV_PREALLOC", "1")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+            "",
+        }
+
+    @staticmethod
+    def _get_dynamic_kv_reserve_tokens() -> int:
+        try:
+            return max(1, int(os.environ.get("GPTSOVITS_T2S_DYNAMIC_KV_RESERVE_TOKENS", "32")))
+        except Exception:
+            return 32
+
+    def _round_dynamic_kv_capacity(self, min_capacity: int) -> int:
+        reserve = self._get_dynamic_kv_reserve_tokens()
+        return max(reserve, int(((max(1, min_capacity) + reserve - 1) // reserve) * reserve))
+
+    @staticmethod
+    def _uses_dynamic_kv_prealloc(active_batch: Any) -> bool:
+        return bool(
+            (not getattr(active_batch, "kv_cache_pooled", False))
+            and bool(getattr(active_batch, "kv_cache_left_aligned", False))
+            and int(getattr(active_batch, "kv_cache_capacity", 0) or 0) > 0
+        )
+
+    def _ensure_dynamic_kv_prealloc_capacity(
+        self,
+        active_batch: Any,
+        *,
+        min_capacity: int,
+    ) -> None:
+        if (
+            not self._dynamic_kv_prealloc_enabled()
+            or active_batch.k_cache is None
+            or active_batch.v_cache is None
+            or active_batch.kv_lens is None
+        ):
+            return
+        batch_size = len(getattr(active_batch, "request_ids", []) or [])
+        current_capacity = int(getattr(active_batch, "kv_cache_capacity", 0) or 0)
+        current_batch_capacity = int(getattr(active_batch, "kv_cache_batch_capacity", 0) or 0)
+        left_aligned = bool(getattr(active_batch, "kv_cache_left_aligned", False))
+        if current_capacity >= int(min_capacity) and current_batch_capacity >= batch_size and left_aligned:
+            return
+        target_capacity = self._round_dynamic_kv_capacity(max(int(min_capacity), current_capacity))
+        kv_lens_list = [int(item) for item in active_batch.kv_lens.tolist()]
+        rebuilt_k_cache: list[torch.Tensor] = []
+        rebuilt_v_cache: list[torch.Tensor] = []
+        for layer_k, layer_v in zip(active_batch.k_cache, active_batch.v_cache):
+            rebuilt_k = layer_k.new_zeros((batch_size, target_capacity, layer_k.shape[2]))
+            rebuilt_v = layer_v.new_zeros((batch_size, target_capacity, layer_v.shape[2]))
+            for batch_index, kv_len in enumerate(kv_lens_list):
+                if kv_len <= 0:
+                    continue
+                if left_aligned:
+                    rebuilt_k[batch_index, :kv_len, :] = layer_k[batch_index, :kv_len, :]
+                    rebuilt_v[batch_index, :kv_len, :] = layer_v[batch_index, :kv_len, :]
+                else:
+                    rebuilt_k[batch_index, :kv_len, :] = layer_k[batch_index, -kv_len:, :]
+                    rebuilt_v[batch_index, :kv_len, :] = layer_v[batch_index, -kv_len:, :]
+            rebuilt_k_cache.append(rebuilt_k)
+            rebuilt_v_cache.append(rebuilt_v)
+        active_batch.k_cache = rebuilt_k_cache
+        active_batch.v_cache = rebuilt_v_cache
+        active_batch.decode_attn_mask = None
+        active_batch.kv_cache_capacity = int(target_capacity)
+        active_batch.kv_cache_batch_capacity = int(batch_size)
+        active_batch.kv_cache_left_aligned = True
+
+    def _rebuild_nonpooled_active_batch_cache_after_subset(
+        self,
+        active_batch: Any,
+        *,
+        keep_tensor: torch.LongTensor,
+    ) -> None:
+        if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
+            return
+        preserve_prealloc_layout = bool(getattr(active_batch, "kv_cache_left_aligned", False))
+        for cache_index in range(len(active_batch.k_cache)):
+            active_batch.k_cache[cache_index] = torch.index_select(
+                active_batch.k_cache[cache_index],
+                dim=0,
+                index=keep_tensor,
+            )
+            active_batch.v_cache[cache_index] = torch.index_select(
+                active_batch.v_cache[cache_index],
+                dim=0,
+                index=keep_tensor,
+            )
+        if preserve_prealloc_layout:
+            active_batch.decode_attn_mask = None
+            active_batch.kv_cache_batch_capacity = int(len(getattr(active_batch, "request_ids", []) or []))
+            self._ensure_dynamic_kv_prealloc_capacity(
+                active_batch,
+                min_capacity=int(active_batch.kv_lens.max().item()) + 1,
+            )
+            return
+        active_batch.k_cache = [
+            self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
+        ]
+        active_batch.v_cache = [
+            self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
+        ]
+        active_batch.decode_attn_mask = self._compact_decode_mask_to_kv_lens(
+            active_batch.decode_attn_mask,
+            active_batch.kv_lens,
+        )
 
     def _get_sampling_ops(self) -> tuple[Any, Any]:
         if self._sampling_ops_cache is not None:
@@ -2486,6 +2828,29 @@ class GPTSoVITSRuntime:
                 stats[key] = value
 
     @staticmethod
+    def _map_prealloc_profile_to_dynamic_stats(delta: dict[str, Any] | None) -> dict[str, Any]:
+        if not delta:
+            return {}
+        key_mapping = {
+            "pooled_prealloc_profiled_decode_calls": "dynamic_profiled_decode_calls",
+            "pooled_prealloc_profiled_layer_calls": "dynamic_profiled_layer_calls",
+            "pooled_prealloc_qkv_linear_ms": "dynamic_qkv_linear_ms",
+            "pooled_prealloc_kv_write_ms": "dynamic_kv_append_ms",
+            "pooled_prealloc_kv_context_ms": "dynamic_kv_context_ms",
+            "pooled_prealloc_sdpa_ms": "dynamic_sdpa_ms",
+            "pooled_prealloc_out_proj_ms": "dynamic_out_proj_ms",
+            "pooled_prealloc_attn_residual_ms": "dynamic_attn_residual_ms",
+            "pooled_prealloc_norm1_ms": "dynamic_norm1_ms",
+            "pooled_prealloc_ffn_ms": "dynamic_ffn_ms",
+            "pooled_prealloc_norm2_ms": "dynamic_norm2_ms",
+            "pooled_prealloc_layer_total_ms": "dynamic_layer_total_ms",
+        }
+        mapped: dict[str, Any] = {}
+        for key, value in delta.items():
+            mapped[key_mapping.get(key, key)] = value
+        return mapped
+
+    @staticmethod
     def _stack_token_sequences_if_same_length(
         token_sequences: Sequence[torch.LongTensor],
     ) -> torch.LongTensor | None:
@@ -2496,6 +2861,30 @@ class GPTSoVITSRuntime:
             if int(sequence.shape[0]) != target_len:
                 return None
         return torch.stack(list(token_sequences), dim=0)
+
+    @staticmethod
+    def _append_sampled_token_sequences(
+        token_sequences: Sequence[torch.LongTensor],
+        sampled_tokens: torch.LongTensor,
+    ) -> list[torch.LongTensor]:
+        if not token_sequences:
+            return []
+        sampled_tokens = sampled_tokens.view(-1)
+        if len(token_sequences) != int(sampled_tokens.shape[0]):
+            raise ValueError("sampled_tokens 与 token_sequences 数量不匹配")
+        stacked = GPTSoVITSRuntime._stack_token_sequences_if_same_length(token_sequences)
+        if stacked is not None:
+            return list(torch.cat([stacked, sampled_tokens.view(-1, 1)], dim=1).unbind(0))
+        return [
+            torch.cat([history, sampled_tokens[index : index + 1]], dim=0)
+            for index, history in enumerate(token_sequences)
+        ]
+
+    @staticmethod
+    def _flatten_sampled_token_tensor(sampled_items: Sequence[torch.Tensor]) -> torch.LongTensor:
+        if not sampled_items:
+            return torch.empty((0,), dtype=torch.long)
+        return torch.cat([item.view(-1).to(dtype=torch.long) for item in sampled_items], dim=0)
 
     @staticmethod
     def _sampling_group_key(
@@ -2835,7 +3224,6 @@ class GPTSoVITSRuntime:
             sampled_token_tensor = sampled_tensor.view(-1)
             argmax_token_tensor = argmax_tensor.view(-1)
             finish_scan_started = time.perf_counter()
-            stacked_histories = self._stack_token_sequences_if_same_length(active_batch.y_sequences)
             if (
                 all(state.early_stop_num == -1 for state in active_batch.states)
                 and int(active_batch.step_indices[0].item()) + 1 < max_steps
@@ -2847,12 +3235,7 @@ class GPTSoVITSRuntime:
                 return (
                     [],
                     list(range(len(active_batch.states))),
-                    list(torch.cat([stacked_histories, sampled_token_tensor.view(-1, 1)], dim=1).unbind(0))
-                    if stacked_histories is not None
-                    else [
-                        torch.cat([history, sampled_token_tensor[index : index + 1]], dim=0)
-                        for index, history in enumerate(active_batch.y_sequences)
-                    ],
+                    self._append_sampled_token_sequences(active_batch.y_sequences, sampled_token_tensor),
                 )
             self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
             sampled_items = [sampled_tensor[index : index + 1] for index in range(sampled_tensor.shape[0])]
@@ -2875,25 +3258,24 @@ class GPTSoVITSRuntime:
                 sampling_keys=sampling_keys,
                 stats=stats,
             )
+            sampled_token_tensor = self._flatten_sampled_token_tensor(sampled_items)
+            argmax_token_tensor = torch.tensor(argmax_tokens, dtype=torch.long, device=sampled_token_tensor.device)
 
         finish_scan_started = time.perf_counter()
+        if sampled_token_tensor is None or argmax_token_tensor is None:
+            raise ValueError("GPT-SoVITS sampling did not produce token tensors")
+        updated_histories = self._append_sampled_token_sequences(active_batch.y_sequences, sampled_token_tensor)
+        prefix_lens = active_batch.prefix_lens.tolist()
+        step_indices = active_batch.step_indices.tolist()
         for batch_index, state in enumerate(active_batch.states):
-            step_index = int(active_batch.step_indices[batch_index].item())
-            current_history = active_batch.y_sequences[batch_index]
-            if sampled_token_tensor is not None and argmax_token_tensor is not None:
-                sampled = sampled_token_tensor[batch_index : batch_index + 1]
-                sampled_token = int(sampled_token_tensor[batch_index].item())
-                argmax_token = int(argmax_token_tensor[batch_index].item())
-            else:
-                sampled = sampled_items[batch_index]
-                sampled_token = int(sampled[0, 0].item())
-                argmax_token = argmax_tokens[batch_index]
-            new_history = torch.cat([current_history, sampled.view(-1)], dim=0)
+            step_index = int(step_indices[batch_index])
+            sampled_token = int(sampled_token_tensor[batch_index].item())
+            argmax_token = int(argmax_token_tensor[batch_index].item())
+            new_history = updated_histories[batch_index]
 
             finish_reason: str | None = None
-            if state.early_stop_num != -1 and (
-                new_history.shape[0] - int(active_batch.prefix_lens[batch_index].item())
-            ) > state.early_stop_num:
+            prefix_len = int(prefix_lens[batch_index])
+            if state.early_stop_num != -1 and (new_history.shape[0] - prefix_len) > state.early_stop_num:
                 finish_reason = "early_stop"
             elif step_index + 1 >= max_steps:
                 finish_reason = "max_step"
@@ -2903,7 +3285,6 @@ class GPTSoVITSRuntime:
                 finish_reason = "eos_argmax"
 
             if finish_reason is not None:
-                prefix_len = int(active_batch.prefix_lens[batch_index].item())
                 semantic_tokens = (
                     new_history[prefix_len:-1].clone()
                     if finish_reason in {"eos_sample", "eos_argmax"}
@@ -2984,20 +3365,10 @@ class GPTSoVITSRuntime:
             if active_batch.k_cache is None or active_batch.v_cache is None or active_batch.kv_lens is None:
                 raise ValueError("GPT-SoVITS AR prefill did not produce complete KV cache")
             if not self._pack_active_batch_into_pool(model, active_batch):
-                active_batch.decode_attn_mask = F.pad(
-                    active_batch.key_padding_mask.unsqueeze(1).unsqueeze(1),
-                    (0, 1),
-                    value=False,
-                )
-                active_batch.k_cache = [
-                    self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
-                ]
-                active_batch.v_cache = [
-                    self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
-                ]
-                active_batch.decode_attn_mask = self._compact_decode_mask_to_kv_lens(
-                    active_batch.decode_attn_mask,
-                    active_batch.kv_lens,
+                active_batch.decode_attn_mask = None
+                self._ensure_dynamic_kv_prealloc_capacity(
+                    active_batch,
+                    min_capacity=int(active_batch.kv_lens.max().item()) + 1,
                 )
             active_batch.x = None
             active_batch.x_lens = None
@@ -3087,59 +3458,81 @@ class GPTSoVITSRuntime:
                     if not pooled_compacted:
                         active_batch.kv_cache_pooled = False
                     if (not active_batch.kv_cache_pooled) and active_batch.k_cache is not None and active_batch.v_cache is not None:
-                        for cache_index in range(len(active_batch.k_cache)):
-                            active_batch.k_cache[cache_index] = torch.index_select(
-                                active_batch.k_cache[cache_index],
-                                dim=0,
-                                index=keep_tensor,
-                            )
-                            active_batch.v_cache[cache_index] = torch.index_select(
-                                active_batch.v_cache[cache_index],
-                                dim=0,
-                                index=keep_tensor,
-                            )
-                        active_batch.k_cache = [
-                            self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
-                        ]
-                        active_batch.v_cache = [
-                            self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
-                        ]
-                        active_batch.decode_attn_mask = self._build_decode_mask_from_kv_lens(
-                            active_batch.kv_lens,
-                            device=active_batch.k_cache[0].device,
+                        self._rebuild_nonpooled_active_batch_cache_after_subset(
+                            active_batch,
+                            keep_tensor=keep_tensor,
                         )
                     xy_pos_started = time.perf_counter()
                     active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
                     self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
                     _record_stage("pooled", active_batch)
                     return active_batch, finished_items
-            batched_decode_attn_mask = None
-            if active_batch.decode_attn_mask is not None:
+            if self._uses_dynamic_kv_prealloc(active_batch):
+                next_kv_lens = active_batch.kv_lens + 1
+                self._ensure_dynamic_kv_prealloc_capacity(
+                    active_batch,
+                    min_capacity=int(next_kv_lens.max().item()),
+                )
                 batched_decode_attn_mask = self._time_t2s_call(
-                    lambda: self._materialize_decode_mask_for_active_batch(active_batch),
+                    lambda: self._build_decode_mask_from_kv_lens(next_kv_lens, device=timing_device or active_batch.xy_pos.device),
                     pending_cuda_timings=pending_cuda_timings,
                     stat_key="dynamic_materialize_decode_mask_ms",
                     device=timing_device,
                 )
-                if not batched_decode_attn_mask.any().item():
-                    batched_decode_attn_mask = None
-            xy_dec, active_batch.k_cache, active_batch.v_cache = self._time_t2s_call(
-                lambda: model.t2s_transformer.decode_next_token(
-                    active_batch.xy_pos,
-                    active_batch.k_cache,
-                    active_batch.v_cache,
-                    batched_decode_attn_mask,
-                ),
-                pending_cuda_timings=pending_cuda_timings,
-                stat_key="dynamic_decode_kernel_ms",
-                device=timing_device,
-            )
-            active_batch.decode_attn_mask = self._time_t2s_call(
-                lambda: self._advance_decode_mask(active_batch.decode_attn_mask, active_batch.kv_lens),
-                pending_cuda_timings=pending_cuda_timings,
-                stat_key="dynamic_advance_decode_mask_ms",
-                device=timing_device,
-            )
+                xy_dec, active_batch.k_cache, active_batch.v_cache = self._time_t2s_call(
+                    lambda: model.decode_next_token_prealloc_runtime(
+                        active_batch.xy_pos,
+                        active_batch.k_cache,
+                        active_batch.v_cache,
+                        active_batch.kv_lens,
+                        batched_decode_attn_mask,
+                    ),
+                    pending_cuda_timings=pending_cuda_timings,
+                    stat_key="dynamic_decode_kernel_ms",
+                    device=timing_device,
+                )
+                self._merge_numeric_t2s_stats(
+                    stats,
+                    self._map_prealloc_profile_to_dynamic_stats(
+                        getattr(model, "get_last_prealloc_decode_profile", lambda: {})(),
+                    ),
+                )
+                active_batch.decode_attn_mask = None
+            else:
+                batched_decode_attn_mask = None
+                if active_batch.decode_attn_mask is not None:
+                    batched_decode_attn_mask = self._time_t2s_call(
+                        lambda: self._materialize_decode_mask_for_active_batch(active_batch),
+                        pending_cuda_timings=pending_cuda_timings,
+                        stat_key="dynamic_materialize_decode_mask_ms",
+                        device=timing_device,
+                    )
+                    if not batched_decode_attn_mask.any().item():
+                        batched_decode_attn_mask = None
+                dynamic_decode_fn = getattr(model, "decode_next_token_dynamic_runtime", None)
+                if not callable(dynamic_decode_fn):
+                    dynamic_decode_fn = model.t2s_transformer.decode_next_token
+                xy_dec, active_batch.k_cache, active_batch.v_cache = self._time_t2s_call(
+                    lambda: dynamic_decode_fn(
+                        active_batch.xy_pos,
+                        active_batch.k_cache,
+                        active_batch.v_cache,
+                        batched_decode_attn_mask,
+                    ),
+                    pending_cuda_timings=pending_cuda_timings,
+                    stat_key="dynamic_decode_kernel_ms",
+                    device=timing_device,
+                )
+                self._merge_numeric_t2s_stats(
+                    stats,
+                    getattr(model, "get_last_dynamic_decode_profile", lambda: {})(),
+                )
+                active_batch.decode_attn_mask = self._time_t2s_call(
+                    lambda: self._advance_decode_mask(active_batch.decode_attn_mask, active_batch.kv_lens),
+                    pending_cuda_timings=pending_cuda_timings,
+                    stat_key="dynamic_advance_decode_mask_ms",
+                    device=timing_device,
+                )
 
         logits = self._time_t2s_call(
             lambda: model.ar_predict_layer(xy_dec[:, -1]),
@@ -3194,20 +3587,10 @@ class GPTSoVITSRuntime:
             if not pooled_compacted:
                 active_batch.kv_cache_pooled = False
         if (not active_batch.kv_cache_pooled) and active_batch.k_cache is not None and active_batch.v_cache is not None:
-            for cache_index in range(len(active_batch.k_cache)):
-                active_batch.k_cache[cache_index] = torch.index_select(active_batch.k_cache[cache_index], dim=0, index=keep_tensor)
-                active_batch.v_cache[cache_index] = torch.index_select(active_batch.v_cache[cache_index], dim=0, index=keep_tensor)
-            if active_batch.kv_lens is not None:
-                active_batch.k_cache = [
-                    self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
-                ]
-                active_batch.v_cache = [
-                    self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
-                ]
-                active_batch.decode_attn_mask = self._compact_decode_mask_to_kv_lens(
-                    active_batch.decode_attn_mask,
-                    active_batch.kv_lens,
-                )
+            self._rebuild_nonpooled_active_batch_cache_after_subset(
+                active_batch,
+                keep_tensor=keep_tensor,
+            )
 
         xy_pos_started = time.perf_counter()
         active_batch.xy_pos = self._build_next_xy_pos(model, active_batch.y_sequences)
@@ -3271,12 +3654,14 @@ class GPTSoVITSRuntime:
                     batch_index,
                     int(kv_len),
                     pooled=bool(left_batch.kv_cache_pooled),
+                    left_aligned=bool(getattr(left_batch, "kv_cache_left_aligned", False)),
                 )
                 merged_layer_v[batch_index : batch_index + 1, -kv_len:, :] = self._extract_cache_row(
                     left_batch.v_cache[layer_index],
                     batch_index,
                     int(kv_len),
                     pooled=bool(left_batch.kv_cache_pooled),
+                    left_aligned=bool(getattr(left_batch, "kv_cache_left_aligned", False)),
                 )
             for batch_index, kv_len in enumerate(right_batch.kv_lens.tolist()):
                 if kv_len <= 0:
@@ -3287,12 +3672,14 @@ class GPTSoVITSRuntime:
                     batch_index,
                     int(kv_len),
                     pooled=bool(right_batch.kv_cache_pooled),
+                    left_aligned=bool(getattr(right_batch, "kv_cache_left_aligned", False)),
                 )
                 merged_layer_v[target_index : target_index + 1, -kv_len:, :] = self._extract_cache_row(
                     right_batch.v_cache[layer_index],
                     batch_index,
                     int(kv_len),
                     pooled=bool(right_batch.kv_cache_pooled),
+                    left_aligned=bool(getattr(right_batch, "kv_cache_left_aligned", False)),
                 )
             merged_k_cache.append(merged_layer_k)
             merged_v_cache.append(merged_layer_v)
@@ -3326,8 +3713,13 @@ class GPTSoVITSRuntime:
             kv_cache_pooled=False,
             kv_cache_capacity=0,
             kv_cache_batch_capacity=0,
+            kv_cache_left_aligned=False,
         )
-        self._pack_active_batch_into_pool(model, merged_batch)
+        if not self._pack_active_batch_into_pool(model, merged_batch):
+            self._ensure_dynamic_kv_prealloc_capacity(
+                merged_batch,
+                min_capacity=int(merged_batch.kv_lens.max().item()) + 1,
+            )
         return merged_batch
 
     def _run_continuous_batch_scheduler(
@@ -3375,6 +3767,19 @@ class GPTSoVITSRuntime:
             "dynamic_materialize_decode_mask_ms": 0.0,
             "dynamic_decode_kernel_ms": 0.0,
             "dynamic_advance_decode_mask_ms": 0.0,
+            "dynamic_profiled_decode_calls": 0,
+            "dynamic_profiled_layer_calls": 0,
+            "dynamic_qkv_linear_ms": 0.0,
+            "dynamic_kv_append_ms": 0.0,
+            "dynamic_kv_context_ms": 0.0,
+            "dynamic_sdpa_ms": 0.0,
+            "dynamic_out_proj_ms": 0.0,
+            "dynamic_attn_residual_ms": 0.0,
+            "dynamic_norm1_ms": 0.0,
+            "dynamic_ffn_ms": 0.0,
+            "dynamic_ffn_residual_ms": 0.0,
+            "dynamic_norm2_ms": 0.0,
+            "dynamic_layer_total_ms": 0.0,
             "ar_predict_layer_ms": 0.0,
             "sampling_total_ms": 0.0,
             "sampling_history_stack_pad_ms": 0.0,
@@ -6915,6 +7320,12 @@ class GPTSoVITSRuntime:
         all_bert_features = torch.cat([prompt_bert_features, target_bert_features], dim=1)
         _sync_runtime_device(device)
         tensorize_ms = (time.perf_counter() - tensorize_start) * 1000.0
+        prompt_text_pos, prompt_audio_pos, prompt_prefix_cache_hit = self._get_or_build_prompt_prefix_position_cache(
+            pipeline.t2s_model.model,
+            prompt_phones=prompt_phones_tensor,
+            prompt_bert_features=prompt_bert_features,
+            prompt_semantic=prompt_semantic,
+        )
 
         prepare_profile = {
             "prompt_text_features_ms": float(prompt_result.total_ms),
@@ -7096,6 +7507,7 @@ class GPTSoVITSRuntime:
             "ref_spec_post_resample_ms": float(bundle_profile.get("ref_spec_post_resample_ms", 0.0)),
             "ref_audio_bundle_ms": ref_audio_bundle_ms,
             "tensorize_ms": tensorize_ms,
+            "prompt_prefix_tensor_cache_hit": float(1.0 if prompt_prefix_cache_hit else 0.0),
             "total_ms": (time.perf_counter() - prepare_sync_start) * 1000.0,
             "wall_total_ms": (time.perf_counter() - prepare_start) * 1000.0,
         }
@@ -7146,6 +7558,8 @@ class GPTSoVITSRuntime:
                         early_stop_num=int(spec.early_stop_num),
                         ready_step=int(spec.ready_step),
                         prepare_profile=dict(prepare_profile),
+                        prompt_text_pos=prompt_text_pos,
+                        prompt_audio_pos=prompt_audio_pos,
                     )
                 )
             return GPTSoVITSMultiSegmentRequestState(
@@ -7193,6 +7607,8 @@ class GPTSoVITSRuntime:
             early_stop_num=int(spec.early_stop_num),
             ready_step=int(spec.ready_step),
             prepare_profile=prepare_profile,
+            prompt_text_pos=prompt_text_pos,
+            prompt_audio_pos=prompt_audio_pos,
         )
 
     def _build_request_state_from_prepare_phases(
@@ -7338,20 +7754,10 @@ class GPTSoVITSRuntime:
 
         packed_into_pool = bool(self._pack_active_batch_into_pool(model, active_batch))
         if not packed_into_pool:
-            active_batch.decode_attn_mask = F.pad(
-                active_batch.key_padding_mask.unsqueeze(1).unsqueeze(1),
-                (0, 1),
-                value=False,
-            )
-            active_batch.k_cache = [
-                self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
-            ]
-            active_batch.v_cache = [
-                self._compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
-            ]
-            active_batch.decode_attn_mask = self._compact_decode_mask_to_kv_lens(
-                active_batch.decode_attn_mask,
-                active_batch.kv_lens,
+            active_batch.decode_attn_mask = None
+            self._ensure_dynamic_kv_prealloc_capacity(
+                active_batch,
+                min_capacity=int(active_batch.kv_lens.max().item()) + 1,
             )
 
         active_batch.x = None
@@ -7410,13 +7816,34 @@ class GPTSoVITSRuntime:
                         active_batch.kv_lens,
                         batched_decode_attn_mask,
                     )
+                elif self._uses_dynamic_kv_prealloc(active_batch):
+                    next_kv_lens = active_batch.kv_lens + 1
+                    self._ensure_dynamic_kv_prealloc_capacity(
+                        active_batch,
+                        min_capacity=int(next_kv_lens.max().item()),
+                    )
+                    batched_decode_attn_mask = self._build_decode_mask_from_kv_lens(
+                        next_kv_lens,
+                        device=active_batch.xy_pos.device,
+                    )
+                    xy_dec, active_batch.k_cache, active_batch.v_cache = model.decode_next_token_prealloc_runtime(
+                        active_batch.xy_pos,
+                        active_batch.k_cache,
+                        active_batch.v_cache,
+                        active_batch.kv_lens,
+                        batched_decode_attn_mask,
+                    )
+                    active_batch.decode_attn_mask = None
                 else:
                     batched_decode_attn_mask = None
                     if active_batch.decode_attn_mask is not None:
                         batched_decode_attn_mask = self._materialize_decode_mask_for_active_batch(active_batch)
                         if not batched_decode_attn_mask.any().item():
                             batched_decode_attn_mask = None
-                    xy_dec, active_batch.k_cache, active_batch.v_cache = model.t2s_transformer.decode_next_token(
+                    dynamic_decode_fn = getattr(model, "decode_next_token_dynamic_runtime", None)
+                    if not callable(dynamic_decode_fn):
+                        dynamic_decode_fn = model.t2s_transformer.decode_next_token
+                    xy_dec, active_batch.k_cache, active_batch.v_cache = dynamic_decode_fn(
                         active_batch.xy_pos,
                         active_batch.k_cache,
                         active_batch.v_cache,

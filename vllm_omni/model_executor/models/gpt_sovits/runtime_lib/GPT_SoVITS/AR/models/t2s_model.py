@@ -390,6 +390,7 @@ class Text2SemanticDecoder(nn.Module):
         self.last_infer_stats = {}
         self._compiled_decode_next_token_prealloc = None
         self._last_prealloc_decode_profile = {}
+        self._last_dynamic_decode_profile = {}
 
     def _set_last_infer_stats(self, stats):
         self.last_infer_stats = stats
@@ -403,9 +404,24 @@ class Text2SemanticDecoder(nn.Module):
     def _set_last_prealloc_decode_profile(self, stats):
         self._last_prealloc_decode_profile = dict(stats)
 
+    def get_last_dynamic_decode_profile(self):
+        return dict(self._last_dynamic_decode_profile)
+
+    def _set_last_dynamic_decode_profile(self, stats):
+        self._last_dynamic_decode_profile = dict(stats)
+
     @staticmethod
     def _profile_prealloc_decode_enabled() -> bool:
         return os.environ.get("GPTSOVITS_PROFILE_T2S_PREALLOC_DECODE", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _profile_dynamic_decode_enabled() -> bool:
+        return os.environ.get("GPTSOVITS_PROFILE_T2S_DYNAMIC_DECODE", "0").strip().lower() in {
             "1",
             "true",
             "yes",
@@ -817,6 +833,161 @@ class Text2SemanticDecoder(nn.Module):
             self._compiled_decode_next_token_prealloc = None
             print(f"Compiled T2S prealloc decode disabled after runtime failure: {exc}")
             return self.decode_next_token_prealloc(x, k_cache, v_cache, kv_lens, attn_mask)
+
+    def _decode_block_next_token_dynamic_profiled(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        layer_k_cache: torch.Tensor,
+        layer_v_cache: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        *,
+        records: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        device = x.device
+        q, k, v = self._profile_t2s_call(
+            lambda: F.linear(x, layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias).chunk(3, dim=-1),
+            records=records,
+            stat_key="dynamic_qkv_linear_ms",
+            device=device,
+        )
+        next_k_cache, next_v_cache = self._profile_t2s_call(
+            lambda: (
+                torch.cat([layer_k_cache, k], dim=1),
+                torch.cat([layer_v_cache, v], dim=1),
+            ),
+            records=records,
+            stat_key="dynamic_kv_append_ms",
+            device=device,
+        )
+
+        batch_size = q.shape[0]
+        q_len = q.shape[1]
+        kv_len = next_k_cache.shape[1]
+        q, k_context, v_context = self._profile_t2s_call(
+            lambda: (
+                q.view(batch_size, q_len, self.num_head, -1).transpose(1, 2),
+                next_k_cache.view(batch_size, kv_len, self.num_head, -1).transpose(1, 2),
+                next_v_cache.view(batch_size, kv_len, self.num_head, -1).transpose(1, 2),
+            ),
+            records=records,
+            stat_key="dynamic_kv_context_ms",
+            device=device,
+        )
+
+        attn = self._profile_t2s_call(
+            lambda: F.scaled_dot_product_attention(q, k_context, v_context, (~attn_mask) if attn_mask is not None else None),
+            records=records,
+            stat_key="dynamic_sdpa_ms",
+            device=device,
+        )
+        attn = self._profile_t2s_call(
+            lambda: attn.transpose(1, 2).reshape(batch_size, q_len, -1),
+            records=records,
+            stat_key="dynamic_out_proj_ms",
+            device=device,
+        )
+        attn = self._profile_t2s_call(
+            lambda: F.linear(attn, layer.self_attn.out_proj.weight, layer.self_attn.out_proj.bias),
+            records=records,
+            stat_key="dynamic_out_proj_ms",
+            device=device,
+        )
+        x = self._profile_t2s_call(
+            lambda: x + attn,
+            records=records,
+            stat_key="dynamic_attn_residual_ms",
+            device=device,
+        )
+        x = self._profile_t2s_call(
+            lambda: F.layer_norm(x, [self.model_dim], layer.norm1.weight, layer.norm1.bias, layer.norm1.eps),
+            records=records,
+            stat_key="dynamic_norm1_ms",
+            device=device,
+        )
+        ffn_hidden = self._profile_t2s_call(
+            lambda: F.relu(F.linear(x, layer.linear1.weight, layer.linear1.bias)),
+            records=records,
+            stat_key="dynamic_ffn_ms",
+            device=device,
+        )
+        ffn_out = self._profile_t2s_call(
+            lambda: F.linear(ffn_hidden, layer.linear2.weight, layer.linear2.bias),
+            records=records,
+            stat_key="dynamic_ffn_ms",
+            device=device,
+        )
+        x = self._profile_t2s_call(
+            lambda: x + ffn_out,
+            records=records,
+            stat_key="dynamic_ffn_residual_ms",
+            device=device,
+        )
+        x = self._profile_t2s_call(
+            lambda: F.layer_norm(x, [self.model_dim], layer.norm2.weight, layer.norm2.bias, layer.norm2.eps),
+            records=records,
+            stat_key="dynamic_norm2_ms",
+            device=device,
+        )
+        return x, next_k_cache, next_v_cache
+
+    @torch.inference_mode()
+    def decode_next_token_dynamic_profiled(
+        self,
+        x: torch.Tensor,
+        k_cache: List[torch.Tensor],
+        v_cache: List[torch.Tensor],
+        attn_mask: Optional[torch.Tensor] = None,
+    ):
+        stats: dict[str, float | int] = {
+            "dynamic_profiled_decode_calls": 1,
+            "dynamic_profiled_layer_calls": 0,
+            "dynamic_qkv_linear_ms": 0.0,
+            "dynamic_kv_append_ms": 0.0,
+            "dynamic_kv_context_ms": 0.0,
+            "dynamic_sdpa_ms": 0.0,
+            "dynamic_out_proj_ms": 0.0,
+            "dynamic_attn_residual_ms": 0.0,
+            "dynamic_norm1_ms": 0.0,
+            "dynamic_ffn_ms": 0.0,
+            "dynamic_ffn_residual_ms": 0.0,
+            "dynamic_norm2_ms": 0.0,
+            "dynamic_layer_total_ms": 0.0,
+        }
+        records: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] = []
+        layer_loop_started = time.perf_counter()
+        for layer_index in range(self.num_layers):
+            x, k_cache[layer_index], v_cache[layer_index] = self._profile_t2s_call(
+                lambda current_index=layer_index: self._decode_block_next_token_dynamic_profiled(
+                    self.h.layers[current_index],
+                    x,
+                    k_cache[current_index],
+                    v_cache[current_index],
+                    attn_mask,
+                    records=records,
+                ),
+                records=records,
+                stat_key="dynamic_layer_total_ms",
+                device=x.device,
+            )
+            stats["dynamic_profiled_layer_calls"] = int(stats.get("dynamic_profiled_layer_calls", 0)) + 1
+        self._flush_t2s_profile_records(stats, records, device=x.device)
+        stats["dynamic_layer_total_ms"] = float((time.perf_counter() - layer_loop_started) * 1000.0)
+        self._set_last_dynamic_decode_profile(stats)
+        return x, k_cache, v_cache
+
+    @torch.inference_mode()
+    def decode_next_token_dynamic_runtime(
+        self,
+        x: torch.Tensor,
+        k_cache: List[torch.Tensor],
+        v_cache: List[torch.Tensor],
+        attn_mask: Optional[torch.Tensor] = None,
+    ):
+        if self._profile_dynamic_decode_enabled():
+            return self.decode_next_token_dynamic_profiled(x, k_cache, v_cache, attn_mask)
+        self._set_last_dynamic_decode_profile({})
+        return self.t2s_transformer.decode_next_token(x, k_cache, v_cache, attn_mask)
 
     def make_input_data(self, x, x_lens, y, y_lens, bert_feature):
         x = self.ar_text_embedding(x)
