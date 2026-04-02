@@ -6,6 +6,7 @@ import time
 from typing import Any, Callable, List, Optional
 
 import torch
+import torch._dynamo
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn import functional as F
@@ -105,6 +106,97 @@ def scaled_dot_product_attention(
             attn_weight.masked_fill_(attn_mask, 0)
 
     return attn_weight @ value
+
+
+def _get_decode_nomask_sdpa_backend_impl() -> SDPBackend | None:
+    raw_value = os.environ.get("GPTSOVITS_T2S_DECODE_NOMASK_SDPA_BACKEND", "efficient").strip().lower()
+    backend_mapping = {
+        "auto": None,
+        "efficient": SDPBackend.EFFICIENT_ATTENTION,
+        "flash": SDPBackend.FLASH_ATTENTION,
+        "math": SDPBackend.MATH,
+    }
+    return backend_mapping.get(raw_value, SDPBackend.EFFICIENT_ATTENTION)
+
+
+def _run_decode_sdpa_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    backend = _get_decode_nomask_sdpa_backend_impl()
+    if attn_mask is None and query.device.type == "cuda" and backend is not None:
+        with sdpa_kernel(backends=[backend]):
+            return F.scaled_dot_product_attention(query, key, value, None)
+    return F.scaled_dot_product_attention(query, key, value, attn_mask)
+
+
+def decode_next_token_prealloc_functional(
+    x: torch.Tensor,
+    k_cache: List[torch.Tensor],
+    v_cache: List[torch.Tensor],
+    kv_lens: torch.Tensor,
+    batch_index: torch.Tensor,
+    next_max_kv_len: int,
+    sdpa_attn_mask: Optional[torch.Tensor],
+    num_heads: int,
+    hidden_dim: int,
+    qkv_ws,
+    qkv_bs,
+    out_ws,
+    out_bs,
+    norm1_ws,
+    norm1_bs,
+    norm1_eps,
+    ffn1_ws,
+    ffn1_bs,
+    ffn2_ws,
+    ffn2_bs,
+    norm2_ws,
+    norm2_bs,
+    norm2_eps,
+):
+    num_layers = len(qkv_ws)
+    for layer_index in range(num_layers):
+        q, k, v = F.linear(x, qkv_ws[layer_index], qkv_bs[layer_index]).chunk(3, dim=-1)
+        k_cache[layer_index][batch_index, kv_lens, :] = k[:, 0, :]
+        v_cache[layer_index][batch_index, kv_lens, :] = v[:, 0, :]
+
+        batch_size = q.shape[0]
+        q_heads = q.view(batch_size, 1, num_heads, -1).transpose(1, 2)
+        k_heads = (
+            k_cache[layer_index][:, :next_max_kv_len, :]
+            .view(batch_size, next_max_kv_len, num_heads, -1)
+            .transpose(1, 2)
+        )
+        v_heads = (
+            v_cache[layer_index][:, :next_max_kv_len, :]
+            .view(batch_size, next_max_kv_len, num_heads, -1)
+            .transpose(1, 2)
+        )
+
+        attn = _run_decode_sdpa_impl(q_heads, k_heads, v_heads, sdpa_attn_mask)
+        attn = attn.transpose(1, 2).reshape(batch_size, 1, -1)
+        attn = F.linear(attn, out_ws[layer_index], out_bs[layer_index])
+
+        x = x + attn
+        x = F.layer_norm(
+            x,
+            [hidden_dim],
+            norm1_ws[layer_index],
+            norm1_bs[layer_index],
+            norm1_eps[layer_index],
+        )
+        x = x + F.linear(F.relu(F.linear(x, ffn1_ws[layer_index], ffn1_bs[layer_index])), ffn2_ws[layer_index], ffn2_bs[layer_index])
+        x = F.layer_norm(
+            x,
+            [hidden_dim],
+            norm2_ws[layer_index],
+            norm2_bs[layer_index],
+            norm2_eps[layer_index],
+        )
+    return x, k_cache, v_cache
 
 
 @torch.jit.script
@@ -257,6 +349,48 @@ class T2SBlock:
         )
         return x, k_cache, v_cache
 
+    def decode_next_token_prealloc(
+        self,
+        x: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        kv_lens: torch.Tensor,
+        sdpa_attn_mask: Optional[torch.Tensor],
+        batch_index: torch.Tensor,
+        next_max_kv_len: int,
+    ):
+        q, k, v = F.linear(x, self.qkv_w, self.qkv_b).chunk(3, dim=-1)
+
+        k_cache[batch_index, kv_lens, :] = k[:, 0, :]
+        v_cache[batch_index, kv_lens, :] = v[:, 0, :]
+
+        batch_size = q.shape[0]
+        q = q.view(batch_size, 1, self.num_heads, -1).transpose(1, 2)
+        k = k_cache[:, :next_max_kv_len, :].view(batch_size, next_max_kv_len, self.num_heads, -1).transpose(1, 2)
+        v = v_cache[:, :next_max_kv_len, :].view(batch_size, next_max_kv_len, self.num_heads, -1).transpose(1, 2)
+
+        attn = F.scaled_dot_product_attention(q, k, v, sdpa_attn_mask)
+        attn = attn.transpose(1, 2).reshape(batch_size, 1, -1)
+        attn = F.linear(attn, self.out_w, self.out_b)
+
+        x = x + attn
+        x = F.layer_norm(
+            x,
+            [self.hidden_dim],
+            self.norm_w1,
+            self.norm_b1,
+            self.norm_eps1,
+        )
+        x = x + self.mlp.forward(x)
+        x = F.layer_norm(
+            x,
+            [self.hidden_dim],
+            self.norm_w2,
+            self.norm_b2,
+            self.norm_eps2,
+        )
+        return x, k_cache, v_cache
+
 
 @torch.jit.script
 class T2STransformer:
@@ -290,6 +424,28 @@ class T2STransformer:
         for i in range(self.num_blocks):
             x, k_cache[i], v_cache[i] = self.blocks[i].decode_next_token(
                 x, k_cache[i], v_cache[i], attn_mask, torch_sdpa
+            )
+        return x, k_cache, v_cache
+
+    def decode_next_token_prealloc(
+        self,
+        x: torch.Tensor,
+        k_cache: List[torch.Tensor],
+        v_cache: List[torch.Tensor],
+        kv_lens: torch.Tensor,
+        sdpa_attn_mask: Optional[torch.Tensor],
+        batch_index: torch.Tensor,
+        next_max_kv_len: int,
+    ):
+        for i in range(self.num_blocks):
+            x, k_cache[i], v_cache[i] = self.blocks[i].decode_next_token_prealloc(
+                x,
+                k_cache[i],
+                v_cache[i],
+                kv_lens,
+                sdpa_attn_mask,
+                batch_index,
+                next_max_kv_len,
             )
         return x, k_cache, v_cache
 
@@ -389,9 +545,23 @@ class Text2SemanticDecoder(nn.Module):
 
         self.t2s_transformer = T2STransformer(self.num_layers, blocks)
         self.last_infer_stats = {}
-        self._compiled_decode_next_token_prealloc_with_metadata = None
+        self._compiled_decode_next_token_prealloc = None
         self._last_prealloc_decode_profile = {}
         self._last_dynamic_decode_profile = {}
+        self._prealloc_decode_qkv_ws = tuple(layer.self_attn.in_proj_weight for layer in self.h.layers)
+        self._prealloc_decode_qkv_bs = tuple(layer.self_attn.in_proj_bias for layer in self.h.layers)
+        self._prealloc_decode_out_ws = tuple(layer.self_attn.out_proj.weight for layer in self.h.layers)
+        self._prealloc_decode_out_bs = tuple(layer.self_attn.out_proj.bias for layer in self.h.layers)
+        self._prealloc_decode_norm1_ws = tuple(layer.norm1.weight for layer in self.h.layers)
+        self._prealloc_decode_norm1_bs = tuple(layer.norm1.bias for layer in self.h.layers)
+        self._prealloc_decode_norm1_eps = tuple(float(layer.norm1.eps) for layer in self.h.layers)
+        self._prealloc_decode_ffn1_ws = tuple(layer.linear1.weight for layer in self.h.layers)
+        self._prealloc_decode_ffn1_bs = tuple(layer.linear1.bias for layer in self.h.layers)
+        self._prealloc_decode_ffn2_ws = tuple(layer.linear2.weight for layer in self.h.layers)
+        self._prealloc_decode_ffn2_bs = tuple(layer.linear2.bias for layer in self.h.layers)
+        self._prealloc_decode_norm2_ws = tuple(layer.norm2.weight for layer in self.h.layers)
+        self._prealloc_decode_norm2_bs = tuple(layer.norm2.bias for layer in self.h.layers)
+        self._prealloc_decode_norm2_eps = tuple(float(layer.norm2.eps) for layer in self.h.layers)
 
     def _set_last_infer_stats(self, stats):
         self.last_infer_stats = stats
@@ -431,14 +601,7 @@ class Text2SemanticDecoder(nn.Module):
 
     @staticmethod
     def _get_decode_nomask_sdpa_backend() -> SDPBackend | None:
-        raw_value = os.environ.get("GPTSOVITS_T2S_DECODE_NOMASK_SDPA_BACKEND", "efficient").strip().lower()
-        backend_mapping = {
-            "auto": None,
-            "efficient": SDPBackend.EFFICIENT_ATTENTION,
-            "flash": SDPBackend.FLASH_ATTENTION,
-            "math": SDPBackend.MATH,
-        }
-        return backend_mapping.get(raw_value, SDPBackend.EFFICIENT_ATTENTION)
+        return _get_decode_nomask_sdpa_backend_impl()
 
     @classmethod
     def _run_decode_sdpa(
@@ -448,11 +611,8 @@ class Text2SemanticDecoder(nn.Module):
         value: torch.Tensor,
         attn_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        backend = cls._get_decode_nomask_sdpa_backend()
-        if attn_mask is None and query.device.type == "cuda" and backend is not None:
-            with sdpa_kernel(backends=[backend]):
-                return F.scaled_dot_product_attention(query, key, value, None)
-        return F.scaled_dot_product_attention(query, key, value, attn_mask)
+        del cls
+        return _run_decode_sdpa_impl(query, key, value, attn_mask)
 
     @staticmethod
     def _profile_t2s_call(
@@ -482,6 +642,7 @@ class Text2SemanticDecoder(nn.Module):
         return result
 
     @staticmethod
+    @torch._dynamo.disable
     def _prepare_prealloc_decode_inputs(
         x: torch.Tensor,
         kv_lens: torch.LongTensor,
@@ -593,19 +754,67 @@ class Text2SemanticDecoder(nn.Module):
         next_max_kv_len: int,
         sdpa_attn_mask: Optional[torch.Tensor],
     ):
+        if not k_cache or not v_cache:
+            return x, k_cache, v_cache
+        batch_size = int(batch_index.shape[0])
         for layer_index in range(self.num_layers):
-            x = self._decode_block_next_token_prealloc(
-                self.h.layers[layer_index],
-                x,
-                k_cache[layer_index],
-                v_cache[layer_index],
-                kv_lens,
-                sdpa_attn_mask,
-                batch_index,
-                max_kv_index,
-                next_max_kv_len,
-            )
-        return x, k_cache, v_cache
+            layer_k_cache = k_cache[layer_index]
+            layer_v_cache = v_cache[layer_index]
+            if layer_k_cache.shape[0] < batch_size or layer_v_cache.shape[0] < batch_size:
+                raise ValueError(
+                    f"prealloc KV cache batch capacity不足: batch={batch_size}, "
+                    f"k_cache_batch={layer_k_cache.shape[0]}, v_cache_batch={layer_v_cache.shape[0]}"
+                )
+            if max_kv_index >= layer_k_cache.shape[1] or max_kv_index >= layer_v_cache.shape[1]:
+                raise ValueError(
+                    f"prealloc KV cache seq capacity不足: write_index={max_kv_index}, "
+                    f"k_cache_seq={layer_k_cache.shape[1]}, v_cache_seq={layer_v_cache.shape[1]}"
+                )
+        return decode_next_token_prealloc_functional(
+            x,
+            k_cache,
+            v_cache,
+            kv_lens,
+            batch_index,
+            next_max_kv_len,
+            sdpa_attn_mask,
+            self.num_head,
+            self.model_dim,
+            self._prealloc_decode_qkv_ws,
+            self._prealloc_decode_qkv_bs,
+            self._prealloc_decode_out_ws,
+            self._prealloc_decode_out_bs,
+            self._prealloc_decode_norm1_ws,
+            self._prealloc_decode_norm1_bs,
+            self._prealloc_decode_norm1_eps,
+            self._prealloc_decode_ffn1_ws,
+            self._prealloc_decode_ffn1_bs,
+            self._prealloc_decode_ffn2_ws,
+            self._prealloc_decode_ffn2_bs,
+            self._prealloc_decode_norm2_ws,
+            self._prealloc_decode_norm2_bs,
+            self._prealloc_decode_norm2_eps,
+        )
+
+    def _get_prealloc_decode_functional_args(self):
+        return (
+            self.num_head,
+            self.model_dim,
+            self._prealloc_decode_qkv_ws,
+            self._prealloc_decode_qkv_bs,
+            self._prealloc_decode_out_ws,
+            self._prealloc_decode_out_bs,
+            self._prealloc_decode_norm1_ws,
+            self._prealloc_decode_norm1_bs,
+            self._prealloc_decode_norm1_eps,
+            self._prealloc_decode_ffn1_ws,
+            self._prealloc_decode_ffn1_bs,
+            self._prealloc_decode_ffn2_ws,
+            self._prealloc_decode_ffn2_bs,
+            self._prealloc_decode_norm2_ws,
+            self._prealloc_decode_norm2_bs,
+            self._prealloc_decode_norm2_eps,
+        )
 
     def _decode_block_next_token_prealloc_profiled(
         self,
@@ -855,7 +1064,7 @@ class Text2SemanticDecoder(nn.Module):
             kv_lens,
             attn_mask,
         )
-        runtime = getattr(self, "_compiled_decode_next_token_prealloc_with_metadata", None)
+        runtime = getattr(self, "_compiled_decode_next_token_prealloc", None)
         if runtime is None:
             return self._decode_next_token_prealloc_with_metadata(
                 prepared_x,
@@ -874,12 +1083,12 @@ class Text2SemanticDecoder(nn.Module):
                 v_cache,
                 kv_lens,
                 batch_index,
-                max_kv_index,
                 next_max_kv_len,
                 sdpa_attn_mask,
+                *self._get_prealloc_decode_functional_args(),
             )
         except Exception as exc:
-            self._compiled_decode_next_token_prealloc_with_metadata = None
+            self._compiled_decode_next_token_prealloc = None
             print(f"Compiled T2S prealloc decode disabled after runtime failure: {exc}")
             return self._decode_next_token_prealloc_with_metadata(
                 prepared_x,
