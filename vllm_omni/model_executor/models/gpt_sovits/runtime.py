@@ -2204,11 +2204,12 @@ class GPTSoVITSRuntime:
         if value is None:
             return None
         normalized = value.detach().to(device="cpu").contiguous()
+        normalized_bytes = normalized.view(torch.uint8).numpy().tobytes()
         return (
             str(value.device),
             str(value.dtype),
             tuple(int(item) for item in value.shape),
-            hashlib.sha1(normalized.numpy().tobytes()).hexdigest(),
+            hashlib.sha1(normalized_bytes).hexdigest(),
         )
 
     def _build_t2s_prompt_prefix_cache_key(
@@ -2511,10 +2512,10 @@ class GPTSoVITSRuntime:
         if kv_lens.numel() <= 0:
             return None
         target_len = int(kv_lens.max().item()) + 1
-        mask = torch.ones((int(kv_lens.shape[0]), 1, 1, target_len), dtype=torch.bool, device=device)
-        for batch_index, kv_len in enumerate(kv_lens.tolist()):
-            current_len = kv_len + 1
-            mask[batch_index, :, :, -current_len:] = False
+        current_lens = (kv_lens.to(device=device, dtype=torch.long) + 1).view(-1, 1, 1, 1)
+        positions = torch.arange(target_len, device=device, dtype=torch.long).view(1, 1, 1, target_len)
+        left_padding = target_len - current_lens
+        mask = positions < left_padding
         if not mask.any().item():
             return None
         return mask
@@ -3309,6 +3310,49 @@ class GPTSoVITSRuntime:
                     list(range(len(active_batch.states))),
                     self._append_sampled_token_sequences(active_batch.y_sequences, sampled_token_tensor),
                 )
+            if (
+                all(state.early_stop_num == -1 for state in active_batch.states)
+                and int(active_batch.step_indices[0].item()) + 1 < max_steps
+            ):
+                eos_sample_mask = sampled_token_tensor.eq(model.EOS)
+                eos_argmax_mask = (~eos_sample_mask) & argmax_token_tensor.eq(model.EOS)
+                finished_mask = eos_sample_mask | eos_argmax_mask
+                if bool(finished_mask.any().item()):
+                    finished_index_tensor = finished_mask.nonzero(as_tuple=False).view(-1)
+                    keep_index_tensor = (~finished_mask).nonzero(as_tuple=False).view(-1)
+                    prefix_lens = active_batch.prefix_lens.tolist()
+                    step_index = int(active_batch.step_indices[0].item())
+                    keep_indices = [int(item) for item in keep_index_tensor.tolist()]
+                    if keep_indices:
+                        kept_histories = [active_batch.y_sequences[index] for index in keep_indices]
+                        kept_sampled_tokens = sampled_token_tensor.index_select(
+                            0,
+                            keep_index_tensor.to(device=sampled_token_tensor.device, dtype=torch.long),
+                        )
+                        updated_sequences = self._append_sampled_token_sequences(kept_histories, kept_sampled_tokens)
+                    else:
+                        updated_sequences = []
+                    for finished_index in finished_index_tensor.tolist():
+                        state = active_batch.states[int(finished_index)]
+                        prefix_len = int(prefix_lens[int(finished_index)])
+                        finish_reason = (
+                            "eos_sample" if bool(eos_sample_mask[int(finished_index)].item()) else "eos_argmax"
+                        )
+                        finished_items.append(
+                            GPTSoVITSARFinishedItem(
+                                request_id=str(state.request_id),
+                                semantic_tokens=active_batch.y_sequences[int(finished_index)][prefix_len:].clone(),
+                                finish_idx=step_index,
+                                finish_reason=finish_reason,
+                            )
+                        )
+                    self._accumulate_t2s_stat(
+                        stats,
+                        "sampling_finish_scan_ms",
+                        (time.perf_counter() - finish_scan_started) * 1000.0,
+                    )
+                    self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
+                    return finished_items, keep_indices, updated_sequences
             self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", (time.perf_counter() - finish_scan_started) * 1000.0)
             sampled_items = [sampled_tensor[index : index + 1] for index in range(sampled_tensor.shape[0])]
             argmax_tokens = [int(item) for item in argmax_tensor.tolist()]

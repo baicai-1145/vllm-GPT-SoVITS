@@ -1,6 +1,7 @@
 import warnings
 
 warnings.filterwarnings("ignore")
+import contextlib
 import math
 import os
 import threading
@@ -93,6 +94,36 @@ def _vits_decoder_cudagraph_shape_whitelist() -> set[str]:
     if not raw_value:
         return set()
     return {item.strip() for item in raw_value.split(",") if item.strip()}
+
+
+def _vits_decoder_tf32_enabled() -> bool:
+    return os.environ.get("GPTSOVITS_VITS_DECODER_TF32", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
+@contextlib.contextmanager
+def _vits_decoder_tf32_context(x: torch.Tensor):
+    if (
+        not _vits_decoder_tf32_enabled()
+        or x.device.type != "cuda"
+        or x.dtype != torch.float32
+    ):
+        yield
+        return
+    prev_matmul = torch.backends.cuda.matmul.allow_tf32
+    prev_cudnn = torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev_matmul
+        torch.backends.cudnn.allow_tf32 = prev_cudnn
 
 
 class StochasticDurationPredictor(nn.Module):
@@ -1291,7 +1322,8 @@ class SynthesizerTrn(nn.Module):
             static_g = cuda_graph_entry["g"]
             if static_g is not None and g is not None:
                 static_g.copy_(g)
-            cuda_graph_entry["graph"].replay()
+            with _vits_decoder_tf32_context(x):
+                cuda_graph_entry["graph"].replay()
             runtime_stats["decoder_runtime_profiled_calls"] = 0
             runtime_stats["decoder_runtime_compiled_calls"] = 1
             runtime_stats["decoder_runtime_eager_calls"] = 0
@@ -1316,7 +1348,8 @@ class SynthesizerTrn(nn.Module):
                 runtime_stats["decoder_runtime_path"] = "compiled_static_bucket"
                 self._set_last_decoder_profile({})
                 self._set_last_decoder_runtime_stats(runtime_stats)
-                return static_runtime(x, g=g)
+                with _vits_decoder_tf32_context(x):
+                    return static_runtime(x, g=g)
             runtime_stats["decoder_runtime_static_bucket_hits"] = 0
             runtime_stats["decoder_runtime_static_bucket_misses"] = 1
             if static_bucket_key not in self._compiled_dec_static_bucket_failures:
@@ -1356,7 +1389,8 @@ class SynthesizerTrn(nn.Module):
             runtime_stats["decoder_runtime_path"] = "compiled"
             self._set_last_decoder_profile({})
             self._set_last_decoder_runtime_stats(runtime_stats)
-            return runtime_dec(x, g=g)
+            with _vits_decoder_tf32_context(x):
+                return runtime_dec(x, g=g)
         runtime_stats["decoder_runtime_profiled_calls"] = 0
         runtime_stats["decoder_runtime_compiled_calls"] = 0
         runtime_stats["decoder_runtime_eager_calls"] = 1
@@ -1366,7 +1400,8 @@ class SynthesizerTrn(nn.Module):
         runtime_stats["decoder_runtime_path"] = "eager"
         self._set_last_decoder_profile({})
         self._set_last_decoder_runtime_stats(runtime_stats)
-        return self.dec(x, g=g)
+        with _vits_decoder_tf32_context(x):
+            return self.dec(x, g=g)
 
     def forward(self, ssl, y, y_lengths, text, text_lengths, sv_emb=None):
         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
