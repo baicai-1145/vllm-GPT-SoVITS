@@ -1539,6 +1539,16 @@ class GPTSoVITSRuntime:
             return maybe_relative_path
         return os.path.join(self.project_root, maybe_relative_path)
 
+    @staticmethod
+    def _prepare_g2pw_single_request_direct_enabled() -> bool:
+        return os.environ.get("GPTSOVITS_PREPARE_G2PW_SINGLE_REQUEST_DIRECT", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+            "",
+        }
+
     def _ensure_import_path(self) -> None:
         project_root = self.project_root
         package_root = os.path.join(project_root, "GPT_SoVITS")
@@ -6385,7 +6395,11 @@ class GPTSoVITSRuntime:
         target_has_pending = self._prepare_result_has_pending_g2pw(target_segments)
         self._ensure_pipeline()
         g2pw_batch_worker = self._get_runtime_prepare_g2pw_batch_worker()
-        if g2pw_batch_worker is not None and (prompt_has_pending or target_has_pending):
+        prefer_direct_pair_batch = (
+            bool(coordinator.enable_g2pw_pair_batch)
+            and self._prepare_g2pw_single_request_direct_enabled()
+        )
+        if g2pw_batch_worker is not None and (prompt_has_pending or target_has_pending) and not prefer_direct_pair_batch:
             resolved_batches, batch_profiles, worker_profile, submit_at, started_at, finished_at = (
                 await g2pw_batch_worker.submit_async([prompt_segments or [], target_segments or []])
             )
@@ -6397,6 +6411,7 @@ class GPTSoVITSRuntime:
                 "g2pw_pair_gate_wait_ms": 0.0,
                 "g2pw_pair_executor_queue_ms": 0.0,
                 "g2pw_pair_compute_ms": float(pair_compute_ms),
+                "g2pw_pair_single_request_direct_path": 0.0,
                 "g2pw_pair_stage_overhead_ms": max(
                     0.0,
                     (pair_finished_at - pair_submit_at) * 1000.0 - float(pair_compute_ms),
@@ -6461,6 +6476,7 @@ class GPTSoVITSRuntime:
                     "g2pw_pair_gate_wait_ms": max(0.0, (gate_acquired_at - gate_wait_start) * 1000.0),
                     "g2pw_pair_executor_queue_ms": float(profiled.queue_ms),
                     "g2pw_pair_compute_ms": float(profiled.run_ms),
+                    "g2pw_pair_single_request_direct_path": float(1.0 if prefer_direct_pair_batch else 0.0),
                     "g2pw_pair_stage_overhead_ms": max(
                         0.0,
                         (pair_finished_at - pair_submit_at) * 1000.0
