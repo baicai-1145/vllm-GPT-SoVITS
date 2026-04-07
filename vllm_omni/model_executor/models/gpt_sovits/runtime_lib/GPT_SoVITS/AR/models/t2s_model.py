@@ -2,6 +2,7 @@
 # reference: https://github.com/lifeiteng/vall-e
 import math
 import os
+import threading
 import time
 from typing import Any, Callable, List, Optional
 
@@ -35,6 +36,20 @@ default_config = {
     "phoneme_vocab_size": 512,
     "EOS": 1024,
 }
+
+_PREALLOC_BATCH_INDEX_CACHE: dict[tuple[str, int], torch.LongTensor] = {}
+_PREALLOC_BATCH_INDEX_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_prealloc_batch_index(batch_size: int, device: torch.device) -> torch.LongTensor:
+    key = (str(device), int(batch_size))
+    with _PREALLOC_BATCH_INDEX_CACHE_LOCK:
+        cached = _PREALLOC_BATCH_INDEX_CACHE.get(key)
+        if cached is not None:
+            return cached
+        batch_index = torch.arange(int(batch_size), device=device, dtype=torch.long)
+        _PREALLOC_BATCH_INDEX_CACHE[key] = batch_index
+        return batch_index
 
 
 class _MulticlassAccuracy(nn.Module):
@@ -130,6 +145,39 @@ def _run_decode_sdpa_impl(
         with sdpa_kernel(backends=[backend]):
             return F.scaled_dot_product_attention(query, key, value, None)
     return F.scaled_dot_product_attention(query, key, value, attn_mask)
+
+
+def _prealloc_decode_cudagraph_enabled_impl() -> bool:
+    return os.environ.get("GPTSOVITS_T2S_PREALLOC_CUDAGRAPH", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _prealloc_decode_cudagraph_min_hits_impl() -> int:
+    try:
+        return max(1, int(os.environ.get("GPTSOVITS_T2S_PREALLOC_CUDAGRAPH_MIN_HITS", "2")))
+    except Exception:
+        return 2
+
+
+def _prealloc_decode_cudagraph_max_entries_impl() -> int:
+    try:
+        return max(1, int(os.environ.get("GPTSOVITS_T2S_PREALLOC_CUDAGRAPH_MAX_ENTRIES", "128")))
+    except Exception:
+        return 128
+
+
+def _prealloc_decode_cudagraph_bucket_tokens_impl() -> int:
+    raw_value = os.environ.get("GPTSOVITS_T2S_PREALLOC_CUDAGRAPH_BUCKET_TOKENS")
+    if raw_value is None:
+        raw_value = os.environ.get("GPTSOVITS_ENGINE_KV_POOL_SEQ_RESERVE_TOKENS", "32")
+    try:
+        return max(1, int(raw_value))
+    except Exception:
+        return 32
 
 
 def decode_next_token_prealloc_functional(
@@ -562,6 +610,10 @@ class Text2SemanticDecoder(nn.Module):
         self._prealloc_decode_norm2_ws = tuple(layer.norm2.weight for layer in self.h.layers)
         self._prealloc_decode_norm2_bs = tuple(layer.norm2.bias for layer in self.h.layers)
         self._prealloc_decode_norm2_eps = tuple(float(layer.norm2.eps) for layer in self.h.layers)
+        self._prealloc_decode_cudagraphs = {}
+        self._prealloc_decode_cudagraph_seen = {}
+        self._prealloc_decode_cudagraph_failures = set()
+        self._prealloc_decode_cudagraph_lock = threading.Lock()
 
     def _set_last_infer_stats(self, stats):
         self.last_infer_stats = stats
@@ -580,6 +632,22 @@ class Text2SemanticDecoder(nn.Module):
 
     def _set_last_dynamic_decode_profile(self, stats):
         self._last_dynamic_decode_profile = dict(stats)
+
+    @staticmethod
+    def _prealloc_decode_cudagraph_enabled() -> bool:
+        return _prealloc_decode_cudagraph_enabled_impl()
+
+    @staticmethod
+    def _prealloc_decode_cudagraph_min_hits() -> int:
+        return _prealloc_decode_cudagraph_min_hits_impl()
+
+    @staticmethod
+    def _prealloc_decode_cudagraph_max_entries() -> int:
+        return _prealloc_decode_cudagraph_max_entries_impl()
+
+    @staticmethod
+    def _prealloc_decode_cudagraph_bucket_tokens() -> int:
+        return _prealloc_decode_cudagraph_bucket_tokens_impl()
 
     @staticmethod
     def _profile_prealloc_decode_enabled() -> bool:
@@ -649,7 +717,7 @@ class Text2SemanticDecoder(nn.Module):
         attn_mask: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.LongTensor, int, int, Optional[torch.Tensor]]:
         stable_x = x.clone(memory_format=torch.contiguous_format)
-        batch_index = torch.arange(stable_x.shape[0], device=stable_x.device, dtype=torch.long)
+        batch_index = _get_cached_prealloc_batch_index(int(stable_x.shape[0]), stable_x.device)
         max_kv_index = int(kv_lens.max().item())
         next_max_kv_len = max_kv_index + 1
         sdpa_attn_mask = None if attn_mask is None else ~attn_mask
@@ -664,6 +732,214 @@ class Text2SemanticDecoder(nn.Module):
                 return f"kv_{lower}_{upper}"
             lower = upper + 1
         return f"kv_{boundaries[-1] + 1}_plus"
+
+    @staticmethod
+    def _tensor_storage_ptr(tensor: torch.Tensor) -> int:
+        try:
+            return int(tensor.untyped_storage().data_ptr())
+        except Exception:
+            return int(tensor.data_ptr())
+
+    @classmethod
+    def _prealloc_cudagraph_bucket_size(cls, next_max_kv_len: int, capacity: int) -> int:
+        bucket_tokens = cls._prealloc_decode_cudagraph_bucket_tokens()
+        bucket_size = int(((max(1, next_max_kv_len) + bucket_tokens - 1) // bucket_tokens) * bucket_tokens)
+        return min(max(1, int(capacity)), bucket_size)
+
+    def _prealloc_cudagraph_key(
+        self,
+        x: torch.Tensor,
+        k_cache: List[torch.Tensor],
+        v_cache: List[torch.Tensor],
+        bucket_size: int,
+    ) -> tuple[object, ...]:
+        first_k = k_cache[0]
+        first_v = v_cache[0]
+        return (
+            int(bucket_size),
+            tuple(int(dim) for dim in x.shape),
+            str(x.dtype),
+            str(x.device),
+            tuple(int(dim) for dim in first_k.shape),
+            tuple(int(dim) for dim in first_v.shape),
+            self._tensor_storage_ptr(first_k),
+            self._tensor_storage_ptr(first_v),
+        )
+
+    def _capture_prealloc_decode_cudagraph(
+        self,
+        *,
+        key: tuple[object, ...],
+        x: torch.Tensor,
+        k_cache: List[torch.Tensor],
+        v_cache: List[torch.Tensor],
+        kv_lens: torch.LongTensor,
+        bucket_size: int,
+        stats: dict[str, Any],
+    ) -> None:
+        if key in self._prealloc_decode_cudagraphs or key in self._prealloc_decode_cudagraph_failures:
+            return
+        if len(self._prealloc_decode_cudagraphs) >= self._prealloc_decode_cudagraph_max_entries():
+            return
+
+        functional_args = self._get_prealloc_decode_functional_args()
+        runtime_variants = [
+            (
+                "eager",
+                lambda static_x, static_k_cache, static_v_cache, static_kv_lens, static_batch_index, static_mask: decode_next_token_prealloc_functional(
+                    static_x,
+                    static_k_cache,
+                    static_v_cache,
+                    static_kv_lens,
+                    static_batch_index,
+                    bucket_size,
+                    static_mask,
+                    *functional_args,
+                ),
+            )
+        ]
+
+        with self._prealloc_decode_cudagraph_lock:
+            if key in self._prealloc_decode_cudagraphs or key in self._prealloc_decode_cudagraph_failures:
+                return
+
+            last_exc = None
+            for runtime_name, runtime_fn in runtime_variants:
+                try:
+                    started_at = time.perf_counter()
+                    static_x = torch.empty_like(x)
+                    static_x.copy_(x)
+                    static_kv_lens = torch.empty_like(kv_lens)
+                    static_kv_lens.copy_(kv_lens)
+                    static_batch_index = torch.zeros((1,), dtype=torch.long, device=x.device)
+                    static_positions = torch.arange(bucket_size, device=x.device, dtype=torch.long)
+                    static_mask = torch.empty((1, 1, 1, bucket_size), dtype=torch.bool, device=x.device)
+                    static_mask[0, 0, 0, :].copy_(static_positions >= int(kv_lens[0].item()) + 1)
+
+                    pool = None
+                    try:
+                        from vllm.platforms import current_platform
+
+                        pool = current_platform.get_global_graph_pool()
+                    except Exception:
+                        pool = None
+
+                    with torch.no_grad():
+                        _ = runtime_fn(
+                            static_x,
+                            k_cache,
+                            v_cache,
+                            static_kv_lens,
+                            static_batch_index,
+                            static_mask,
+                        )
+                    torch.cuda.synchronize(x.device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.no_grad():
+                        with torch.cuda.graph(graph, pool=pool):
+                            static_out = runtime_fn(
+                                static_x,
+                                k_cache,
+                                v_cache,
+                                static_kv_lens,
+                                static_batch_index,
+                                static_mask,
+                            )
+                    self._prealloc_decode_cudagraphs[key] = {
+                        "graph": graph,
+                        "x": static_x,
+                        "kv_lens": static_kv_lens,
+                        "mask": static_mask,
+                        "positions": static_positions,
+                        "out": static_out[0],
+                        "bucket_size": int(bucket_size),
+                        "path": runtime_name,
+                    }
+                    stats["pooled_prealloc_cudagraph_captures"] = int(stats.get("pooled_prealloc_cudagraph_captures", 0)) + 1
+                    stats["pooled_prealloc_cudagraph_capture_ms"] = float(
+                        stats.get("pooled_prealloc_cudagraph_capture_ms", 0.0)
+                    ) + ((time.perf_counter() - started_at) * 1000.0)
+                    stats["pooled_prealloc_cudagraph_path"] = runtime_name
+                    return
+                except Exception as exc:
+                    last_exc = exc
+
+            self._prealloc_decode_cudagraph_failures.add(key)
+            if last_exc is not None:
+                stats["pooled_prealloc_cudagraph_last_error"] = str(last_exc)
+
+    def _maybe_decode_next_token_prealloc_cudagraph(
+        self,
+        x: torch.Tensor,
+        k_cache: List[torch.Tensor],
+        v_cache: List[torch.Tensor],
+        kv_lens: torch.LongTensor,
+        attn_mask: Optional[torch.Tensor],
+    ):
+        if not self._prealloc_decode_cudagraph_enabled():
+            return None
+        if x.device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        if attn_mask is not None:
+            return None
+        if x.ndim != 3 or x.shape[0] != 1 or x.shape[1] != 1:
+            return None
+        if kv_lens.numel() != 1 or not k_cache or not v_cache:
+            return None
+        if any(int(layer.shape[0]) != 1 for layer in k_cache) or any(int(layer.shape[0]) != 1 for layer in v_cache):
+            return None
+
+        cache_capacity = min(int(layer.shape[1]) for layer in k_cache)
+        next_max_kv_len = int(kv_lens[0].item()) + 1
+        if next_max_kv_len <= 0 or next_max_kv_len > cache_capacity:
+            return None
+
+        bucket_size = self._prealloc_cudagraph_bucket_size(next_max_kv_len, cache_capacity)
+        if bucket_size < next_max_kv_len:
+            return None
+        key = self._prealloc_cudagraph_key(x, k_cache, v_cache, bucket_size)
+        stats: dict[str, Any] = {
+            "pooled_prealloc_cudagraph_attempts": 1,
+            "pooled_prealloc_cudagraph_hits": 0,
+            "pooled_prealloc_cudagraph_misses": 0,
+            "pooled_prealloc_cudagraph_captures": 0,
+            "pooled_prealloc_cudagraph_capture_ms": 0.0,
+            "pooled_prealloc_cudagraph_bucket_size": int(bucket_size),
+            "pooled_prealloc_cudagraph_next_kv_len": int(next_max_kv_len),
+        }
+
+        entry = self._prealloc_decode_cudagraphs.get(key)
+        if entry is None:
+            seen_hits = int(self._prealloc_decode_cudagraph_seen.get(key, 0)) + 1
+            self._prealloc_decode_cudagraph_seen[key] = seen_hits
+            if (
+                seen_hits >= self._prealloc_decode_cudagraph_min_hits()
+                and key not in self._prealloc_decode_cudagraph_failures
+            ):
+                self._capture_prealloc_decode_cudagraph(
+                    key=key,
+                    x=x,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    kv_lens=kv_lens,
+                    bucket_size=bucket_size,
+                    stats=stats,
+                )
+                entry = self._prealloc_decode_cudagraphs.get(key)
+
+        if entry is None:
+            stats["pooled_prealloc_cudagraph_misses"] = 1
+            self._set_last_prealloc_decode_profile(stats)
+            return None
+
+        entry["x"].copy_(x)
+        entry["kv_lens"].copy_(kv_lens)
+        entry["mask"][0, 0, 0, :].copy_(entry["positions"] >= next_max_kv_len)
+        entry["graph"].replay()
+        stats["pooled_prealloc_cudagraph_hits"] = 1
+        stats["pooled_prealloc_cudagraph_path"] = entry.get("path", "unknown")
+        self._set_last_prealloc_decode_profile(stats)
+        return entry["out"], k_cache, v_cache
 
     @staticmethod
     def _flush_t2s_profile_records(
@@ -827,6 +1103,7 @@ class Text2SemanticDecoder(nn.Module):
         batch_index: torch.LongTensor,
         max_kv_index: int,
         next_max_kv_len: int,
+        shape_label: str,
         *,
         stats: dict[str, float | int],
         records: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]],
@@ -877,11 +1154,15 @@ class Text2SemanticDecoder(nn.Module):
             stat_key=(
                 "pooled_prealloc_sdpa_ms",
                 f"pooled_prealloc_sdpa_{kv_bucket}_ms",
+                f"pooled_prealloc_sdpa_{shape_label}_ms",
             ),
             device=device,
         )
         stats[f"pooled_prealloc_sdpa_{kv_bucket}_calls"] = int(
             stats.get(f"pooled_prealloc_sdpa_{kv_bucket}_calls", 0)
+        ) + 1
+        stats[f"pooled_prealloc_sdpa_{shape_label}_calls"] = int(
+            stats.get(f"pooled_prealloc_sdpa_{shape_label}_calls", 0)
         ) + 1
         attn = self._profile_t2s_call(
             lambda: attn.transpose(1, 2).reshape(batch_size, 1, -1),
@@ -921,7 +1202,11 @@ class Text2SemanticDecoder(nn.Module):
         ffn_hidden = self._profile_t2s_call(
             lambda: F.relu(F.linear(x, layer.linear1.weight, layer.linear1.bias)),
             records=records,
-            stat_key=("pooled_prealloc_ffn_ms", "pooled_prealloc_ffn_up_ms"),
+            stat_key=(
+                "pooled_prealloc_ffn_ms",
+                "pooled_prealloc_ffn_up_ms",
+                f"pooled_prealloc_ffn_{shape_label}_ms",
+            ),
             device=device,
         )
         ffn_out = self._profile_t2s_call(
@@ -931,13 +1216,21 @@ class Text2SemanticDecoder(nn.Module):
                 layer.linear2.bias,
             ),
             records=records,
-            stat_key=("pooled_prealloc_ffn_ms", "pooled_prealloc_ffn_down_ms"),
+            stat_key=(
+                "pooled_prealloc_ffn_ms",
+                "pooled_prealloc_ffn_down_ms",
+                f"pooled_prealloc_ffn_{shape_label}_ms",
+            ),
             device=device,
         )
         x = self._profile_t2s_call(
             lambda: x + ffn_out,
             records=records,
-            stat_key=("pooled_prealloc_ffn_ms", "pooled_prealloc_ffn_residual_ms"),
+            stat_key=(
+                "pooled_prealloc_ffn_ms",
+                "pooled_prealloc_ffn_residual_ms",
+                f"pooled_prealloc_ffn_{shape_label}_ms",
+            ),
             device=device,
         )
         x = self._profile_t2s_call(
@@ -1016,6 +1309,7 @@ class Text2SemanticDecoder(nn.Module):
         records: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] = []
         layer_loop_started = time.perf_counter()
         kv_bucket = self._prealloc_kv_bucket_label(next_max_kv_len)
+        shape_label = f"b{batch_size}_max{next_max_kv_len}"
         for layer_index in range(self.num_layers):
             stats[f"pooled_prealloc_layer_total_{kv_bucket}_calls"] = int(
                 stats.get(f"pooled_prealloc_layer_total_{kv_bucket}_calls", 0)
@@ -1031,6 +1325,7 @@ class Text2SemanticDecoder(nn.Module):
                     batch_index,
                     max_kv_index,
                     next_max_kv_len,
+                    shape_label,
                     stats=stats,
                     records=records,
                 ),
@@ -1059,6 +1354,15 @@ class Text2SemanticDecoder(nn.Module):
         if self._profile_prealloc_decode_enabled():
             return self.decode_next_token_prealloc_profiled(x, k_cache, v_cache, kv_lens, attn_mask)
         self._set_last_prealloc_decode_profile({})
+        cudagraph_result = self._maybe_decode_next_token_prealloc_cudagraph(
+            x,
+            k_cache,
+            v_cache,
+            kv_lens,
+            attn_mask,
+        )
+        if cudagraph_result is not None:
+            return cudagraph_result
         prepared_x, batch_index, max_kv_index, next_max_kv_len, sdpa_attn_mask = self._prepare_prealloc_decode_inputs(
             x,
             kv_lens,

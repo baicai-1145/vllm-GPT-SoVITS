@@ -864,6 +864,7 @@ def test_batched_sample_uniform_records_fine_grained_stats(tmp_path):
 
 def test_sample_active_batch_requests_uses_runtime_native_uniform_fast_path(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._build_next_xy_pos_from_sampled_tokens = Mock(return_value=torch.zeros((2, 1, 1), dtype=torch.float32))  # type: ignore[method-assign]
     runtime._batched_sample_uniform = Mock(  # type: ignore[method-assign]
         return_value=(
             torch.tensor([[7], [8]], dtype=torch.long),
@@ -884,7 +885,7 @@ def test_sample_active_batch_requests_uses_runtime_native_uniform_fast_path(tmp_
         prefix_lens=torch.tensor([1, 1], dtype=torch.long),
     )
 
-    finished, keep_indices, updated_sequences = runtime._sample_active_batch_requests(
+    finished, keep_indices, updated_sequences, _, _ = runtime._sample_active_batch_requests(
         SimpleNamespace(EOS=1024),
         active_batch,
         torch.zeros((2, 1025), dtype=torch.float32),
@@ -899,6 +900,7 @@ def test_sample_active_batch_requests_uses_runtime_native_uniform_fast_path(tmp_
 
 def test_sample_active_batch_requests_records_single_request_sampling_stats(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._build_next_xy_pos_from_sampled_tokens = Mock(return_value=torch.zeros((1, 1, 1), dtype=torch.float32))  # type: ignore[method-assign]
     runtime._sample_single_request = Mock(  # type: ignore[method-assign]
         return_value=(
             torch.tensor([[7]], dtype=torch.long),
@@ -916,7 +918,7 @@ def test_sample_active_batch_requests_records_single_request_sampling_stats(tmp_
     )
     stats: dict[str, float | int] = {}
 
-    finished, keep_indices, updated_sequences = runtime._sample_active_batch_requests(
+    finished, keep_indices, updated_sequences, _, _ = runtime._sample_active_batch_requests(
         SimpleNamespace(EOS=1024),
         active_batch,
         torch.zeros((1, 1025), dtype=torch.float32),
@@ -934,6 +936,7 @@ def test_sample_active_batch_requests_records_single_request_sampling_stats(tmp_
 
 def test_sample_active_batch_requests_grouped_path_updates_histories(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._build_next_xy_pos_from_sampled_tokens = Mock(return_value=torch.zeros((2, 1, 1), dtype=torch.float32))  # type: ignore[method-assign]
     runtime._batched_sample_by_group = Mock(  # type: ignore[method-assign]
         return_value=(
             [
@@ -957,7 +960,7 @@ def test_sample_active_batch_requests_grouped_path_updates_histories(tmp_path):
         prefix_lens=torch.tensor([1, 1], dtype=torch.long),
     )
 
-    finished, keep_indices, updated_sequences = runtime._sample_active_batch_requests(
+    finished, keep_indices, updated_sequences, _, _ = runtime._sample_active_batch_requests(
         SimpleNamespace(EOS=1024),
         active_batch,
         torch.zeros((2, 1025), dtype=torch.float32),
@@ -4683,6 +4686,8 @@ def test_decode_active_batch_falls_back_from_pooled_cache_when_decode_headroom_e
             [],
             [0, 1],
             [torch.tensor([5, 9], dtype=torch.long), torch.tensor([6, 8], dtype=torch.long)],
+            None,
+            None,
         )
     )
     runtime._build_next_xy_pos = Mock(return_value=torch.ones((2, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
@@ -4752,7 +4757,7 @@ def test_decode_active_batch_keeps_dynamic_prealloc_layout_after_subset(tmp_path
         ar_predict_layer=Mock(return_value=torch.tensor([[0.1, 0.2], [0.3, 0.4]], dtype=torch.float32)),
     )
     runtime._sample_active_batch_requests = Mock(  # type: ignore[method-assign]
-        return_value=([], [1], [torch.tensor([7, 8], dtype=torch.long)])
+        return_value=([], [1], [torch.tensor([7, 8], dtype=torch.long)], None, None)
     )
     runtime._build_next_xy_pos = Mock(return_value=torch.ones((1, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
 
@@ -4812,7 +4817,7 @@ def test_decode_active_batch_maps_dynamic_prealloc_profile_into_dynamic_stats(tm
         ar_predict_layer=Mock(return_value=torch.tensor([[0.1, 0.9]], dtype=torch.float32)),
     )
     runtime._sample_active_batch_requests = Mock(  # type: ignore[method-assign]
-        return_value=([], [0], [torch.tensor([5, 6, 7], dtype=torch.long)])
+        return_value=([], [0], [torch.tensor([5, 6, 7], dtype=torch.long)], None, None)
     )
     runtime._build_next_xy_pos = Mock(return_value=torch.ones((1, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
     stats: dict[str, float | int] = {}
@@ -4840,6 +4845,7 @@ def test_decode_active_batch_merges_profiled_prealloc_decode_stats(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     pool = SimpleNamespace(
         max_seq_len=8,
+        max_batch_size=1,
         state=SimpleNamespace(enabled=True),
         build_decode_mask=Mock(return_value=torch.zeros((1, 1, 1, 3), dtype=torch.bool)),
         set_active_rows=Mock(),
@@ -4881,7 +4887,7 @@ def test_decode_active_batch_merges_profiled_prealloc_decode_stats(tmp_path):
         ar_predict_layer=Mock(return_value=torch.tensor([[0.1, 0.9]], dtype=torch.float32)),
     )
     runtime._sample_active_batch_requests = Mock(  # type: ignore[method-assign]
-        return_value=([], [0], [torch.tensor([5, 6, 7], dtype=torch.long)])
+        return_value=([], [0], [torch.tensor([5, 6, 7], dtype=torch.long)], None, None)
     )
     runtime._build_next_xy_pos = Mock(return_value=torch.ones((1, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
     stats: dict[str, float | int] = {}
@@ -4942,7 +4948,7 @@ def test_decode_active_batch_merges_profiled_dynamic_decode_stats(tmp_path):
         ar_predict_layer=Mock(return_value=torch.tensor([[0.1, 0.9]], dtype=torch.float32)),
     )
     runtime._sample_active_batch_requests = Mock(  # type: ignore[method-assign]
-        return_value=([], [0], [torch.tensor([5, 6, 7], dtype=torch.long)])
+        return_value=([], [0], [torch.tensor([5, 6, 7], dtype=torch.long)], None, None)
     )
     runtime._build_next_xy_pos = Mock(return_value=torch.ones((1, 1, 4), dtype=torch.float32))  # type: ignore[method-assign]
     stats: dict[str, float | int] = {}
@@ -4963,6 +4969,20 @@ def test_decode_active_batch_merges_profiled_dynamic_decode_stats(tmp_path):
     assert float(stats["dynamic_qkv_linear_ms"]) == 11.5
     assert float(stats["dynamic_sdpa_ms"]) == 22.0
     assert float(stats["dynamic_layer_total_ms"]) == 44.0
+
+
+def test_pooled_prealloc_cudagraph_defaults_to_off(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("GPTSOVITS_T2S_POOLED_CUDAGRAPH", raising=False)
+    assert GPTSoVITSRuntime._pooled_prealloc_cudagraph_enabled() is False
+
+    monkeypatch.setenv("GPTSOVITS_T2S_POOLED_CUDAGRAPH", "1")
+    assert GPTSoVITSRuntime._pooled_prealloc_cudagraph_enabled() is True
+
+
+def test_round_up_bucket_clamps_to_max():
+    assert GPTSoVITSRuntime._round_up_bucket(129, 32, max_value=200) == 160
+    assert GPTSoVITSRuntime._round_up_bucket(199, 32, max_value=200) == 200
+    assert GPTSoVITSRuntime._round_up_bucket(281, 32, max_value=288) == 288
 
 
 def test_runtime_build_next_xy_pos_single_request_fast_path_matches_expected(tmp_path):
@@ -5169,6 +5189,24 @@ def test_t2s_kv_cache_pool_build_decode_mask_skips_single_request_padding():
     assert torch.equal(mask[1, 0, 0], torch.tensor([False, False, False], dtype=torch.bool))
 
 
+def test_t2s_kv_cache_pool_build_decode_mask_skips_uniform_batch_padding():
+    _ensure_vendored_gpt_sovits_import_path()
+    from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.TTS_infer_pack.t2s_kv_cache_pool import (
+        T2SKVCachePool,
+    )
+
+    pool = T2SKVCachePool(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        num_layers=1,
+        hidden_dim=2,
+        max_batch_size=4,
+        max_seq_len=8,
+    )
+
+    assert pool.build_decode_mask(torch.tensor([3, 3, 3], dtype=torch.long)) is None
+
+
 def test_t2s_prepare_prealloc_decode_inputs_stabilizes_x_and_hoists_metadata():
     _ensure_vendored_gpt_sovits_import_path()
     from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.AR.models.t2s_model import (
@@ -5188,10 +5226,47 @@ def test_t2s_prepare_prealloc_decode_inputs_stabilizes_x_and_hoists_metadata():
 
     assert torch.equal(stable_x, x)
     assert stable_x.is_contiguous()
+    assert stable_x.data_ptr() != x.data_ptr()
     assert torch.equal(batch_index, torch.tensor([0], dtype=torch.long))
     assert max_kv_index == 5
     assert next_max_kv_len == 6
     assert torch.equal(sdpa_attn_mask, torch.tensor([[[[True, True, True, False, False, False]]]], dtype=torch.bool))
+
+
+def test_t2s_prepare_prealloc_decode_inputs_clones_contiguous_x_and_reuses_cached_batch_index():
+    _ensure_vendored_gpt_sovits_import_path()
+    from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.AR.models.t2s_model import (
+        Text2SemanticDecoder,
+    )
+
+    x = torch.randn((2, 1, 8), dtype=torch.float32).contiguous()
+    kv_lens = torch.tensor([5, 5], dtype=torch.long)
+
+    stable_x_0, batch_index_0, max_kv_index_0, next_max_kv_len_0, sdpa_attn_mask_0 = (
+        Text2SemanticDecoder._prepare_prealloc_decode_inputs(
+            x,
+            kv_lens,
+            None,
+        )
+    )
+    stable_x_1, batch_index_1, max_kv_index_1, next_max_kv_len_1, sdpa_attn_mask_1 = (
+        Text2SemanticDecoder._prepare_prealloc_decode_inputs(
+            x,
+            kv_lens,
+            None,
+        )
+    )
+
+    assert stable_x_0 is not x
+    assert stable_x_1 is not x
+    assert stable_x_0.data_ptr() != x.data_ptr()
+    assert stable_x_1.data_ptr() != x.data_ptr()
+    assert batch_index_0 is batch_index_1
+    assert torch.equal(batch_index_0, torch.tensor([0, 1], dtype=torch.long))
+    assert max_kv_index_0 == max_kv_index_1 == 5
+    assert next_max_kv_len_0 == next_max_kv_len_1 == 6
+    assert sdpa_attn_mask_0 is None
+    assert sdpa_attn_mask_1 is None
 
 
 def test_generate_semantic_tokens_uses_runtime_native_batch_scheduler(tmp_path):

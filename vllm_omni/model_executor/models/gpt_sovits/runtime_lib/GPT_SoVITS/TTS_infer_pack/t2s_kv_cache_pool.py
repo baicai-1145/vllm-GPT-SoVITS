@@ -354,6 +354,8 @@ class T2SKVCachePool:
         if not self.can_handle(batch_size, max_kv_len):
             self.record_fallback(f"mask_overflow(batch={batch_size},seq={max_kv_len})")
             return None
+        if int(next_kv_lens.min().item()) == max_kv_len:
+            return None
         if self.decode_mask_buffer is None or self.positions is None:
             self.record_fallback("mask_buffer_missing")
             return None

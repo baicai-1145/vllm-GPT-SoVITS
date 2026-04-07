@@ -5,7 +5,7 @@ custom:
   cnhuhbert_disable_cudnn_layer_indices: ''
   device: cuda
   is_half: false
-  precision: fp32
+  precision: bf16
   t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
   version: v2ProPlus
   vits_weights_path: GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth
@@ -38,6 +38,7 @@ v2ProPlus:
   cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
   device: cuda
   is_half: false
+  precision: bf16
   t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
   version: v2ProPlus
   vits_weights_path: GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth
