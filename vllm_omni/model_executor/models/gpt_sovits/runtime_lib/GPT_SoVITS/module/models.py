@@ -699,6 +699,40 @@ class Generator(torch.nn.Module):
             xs = block_out if xs is None else xs + block_out
         return (xs / self.num_kernels).squeeze(2)
 
+    def _run_stage_resblocks_channels_last_profiled(self, x, stats, stage_index: int, device):
+        stage_prefix = f"decoder_stage_{stage_index}"
+        stage_x = self._profile_call(
+            lambda current=x: current.unsqueeze(2).contiguous(memory_format=torch.channels_last),
+            stats,
+            f"{stage_prefix}_channels_last_prepare_ms",
+            device,
+        )
+        xs = None
+        stage_base = stage_index * self.num_kernels
+        for j in range(self.num_kernels):
+            block = self.resblocks[stage_base + j]
+            block_out = self._profile_call(
+                lambda block=block, current=stage_x: block.forward_channels_last(current),
+                stats,
+                f"{stage_prefix}_resblock_{j}_ms",
+                device,
+            )
+            if xs is None:
+                xs = block_out
+            else:
+                xs = self._profile_call(
+                    lambda current=xs, block_out=block_out: current + block_out,
+                    stats,
+                    f"{stage_prefix}_resblock_accum_ms",
+                    device,
+                )
+        return self._profile_call(
+            lambda current=xs: (current / self.num_kernels).squeeze(2),
+            stats,
+            f"{stage_prefix}_resblock_avg_ms",
+            device,
+        )
+
     def forward(self, x, g=None):
         x = self.conv_pre(x)
         if g is not None:
@@ -728,6 +762,7 @@ class Generator(torch.nn.Module):
             "decoder_profiled_calls": 1,
             "decoder_num_upsamples": int(self.num_upsamples),
             "decoder_num_kernels": int(self.num_kernels),
+            "decoder_profile_channels_last_resblock_path": 0,
         }
         total_started = time.perf_counter()
         device = x.device
@@ -749,36 +784,40 @@ class Generator(torch.nn.Module):
                 f"decoder_stage_{i}_upsample_ms",
                 device,
             )
-            xs = None
-            for j in range(self.num_kernels):
-                block = self.resblocks[i * self.num_kernels + j]
-                block_out = self._run_resblock_profiled(
-                    block,
-                    x,
-                    stats,
-                    f"decoder_stage_{i}_resblock_{j}",
-                    device,
-                )
-                self._accumulate_profile_metric(
-                    stats,
-                    f"decoder_stage_{i}_resblock_{j}_ms",
-                    stats.get(f"decoder_stage_{i}_resblock_{j}_total_ms", 0.0),
-                )
-                if xs is None:
-                    xs = block_out
-                else:
-                    xs = self._profile_call(
-                        lambda current=xs, block_out=block_out: current + block_out,
+            if self._use_channels_last_resblock_runtime(x):
+                stats["decoder_profile_channels_last_resblock_path"] = 1
+                x = self._run_stage_resblocks_channels_last_profiled(x, stats, i, device)
+            else:
+                xs = None
+                for j in range(self.num_kernels):
+                    block = self.resblocks[i * self.num_kernels + j]
+                    block_out = self._run_resblock_profiled(
+                        block,
+                        x,
                         stats,
-                        f"decoder_stage_{i}_resblock_accum_ms",
+                        f"decoder_stage_{i}_resblock_{j}",
                         device,
                     )
-            x = self._profile_call(
-                lambda: xs / self.num_kernels,
-                stats,
-                f"decoder_stage_{i}_resblock_avg_ms",
-                device,
-            )
+                    self._accumulate_profile_metric(
+                        stats,
+                        f"decoder_stage_{i}_resblock_{j}_ms",
+                        stats.get(f"decoder_stage_{i}_resblock_{j}_total_ms", 0.0),
+                    )
+                    if xs is None:
+                        xs = block_out
+                    else:
+                        xs = self._profile_call(
+                            lambda current=xs, block_out=block_out: current + block_out,
+                            stats,
+                            f"decoder_stage_{i}_resblock_accum_ms",
+                            device,
+                        )
+                x = self._profile_call(
+                    lambda: xs / self.num_kernels,
+                    stats,
+                    f"decoder_stage_{i}_resblock_avg_ms",
+                    device,
+                )
             stats[f"decoder_stage_{i}_total_ms"] = float((time.perf_counter() - stage_started) * 1000.0)
         x = self._profile_call(lambda: F.leaky_relu(x), stats, "decoder_post_relu_ms", device)
         x = self._profile_call(lambda: self.conv_post(x), stats, "decoder_conv_post_ms", device)

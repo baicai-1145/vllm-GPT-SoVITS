@@ -66,3 +66,32 @@ def test_generator_channels_last_resblocks_matches_default(monkeypatch):
     actual = generator(x, g=g)
 
     assert torch.allclose(expected, actual, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_generator_forward_profiled_records_channels_last_stage_metrics(monkeypatch):
+    monkeypatch.setenv("GPTSOVITS_VITS_DECODER_CHANNELS_LAST_RESBLOCK", "1")
+    torch.manual_seed(1234)
+    generator = gpt_models.Generator(
+        initial_channel=8,
+        resblock="1",
+        resblock_kernel_sizes=[3, 7, 11],
+        resblock_dilation_sizes=[(1, 3, 5), (1, 3, 5), (1, 3, 5)],
+        upsample_rates=[2, 2],
+        upsample_initial_channel=32,
+        upsample_kernel_sizes=[4, 4],
+        gin_channels=4,
+        is_bias=True,
+    ).cuda().half().eval()
+    generator.remove_weight_norm()
+
+    x = torch.randn((2, 8, 24), device="cuda", dtype=torch.float16)
+    g = torch.randn((2, 4, 1), device="cuda", dtype=torch.float16)
+
+    _, stats = generator.forward_profiled(x, g=g)
+
+    assert int(stats["decoder_profile_channels_last_resblock_path"]) == 1
+    assert float(stats["decoder_stage_0_channels_last_prepare_ms"]) >= 0.0
+    assert float(stats["decoder_stage_0_resblock_0_ms"]) >= 0.0
+    assert float(stats["decoder_stage_0_resblock_avg_ms"]) >= 0.0
+    assert float(stats["decoder_stage_0_total_ms"]) >= 0.0

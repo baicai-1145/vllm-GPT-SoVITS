@@ -5456,6 +5456,54 @@ def test_g2pw_pinyin_defaults_to_pypinyin_when_cuda_backend_fails(monkeypatch):
     assert instance._g2pw is None
 
 
+def test_g2pw_pinyin_supports_g2pm_backend_stub(monkeypatch):
+    package_root = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "..",
+            "vllm_omni",
+            "model_executor",
+            "models",
+            "gpt_sovits",
+            "runtime_lib",
+            "GPT_SoVITS",
+        )
+    )
+    module_name = "text.g2pw.g2pw"
+
+    monkeypatch.syspath_prepend(package_root)
+    monkeypatch.setenv("GPTSOVITS_ZH_PRON_BACKEND", "g2pm")
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    g2pw_module = importlib.import_module(module_name)
+    instance = g2pw_module.G2PWPinyin(model_dir="dummy", model_source="dummy")
+
+    assert getattr(instance, "_g2pw", None) is not None
+    assert getattr(instance._g2pw, "backend", None) == "g2pm"
+    results, profile = instance._g2pw.predict_sentences_with_profile(["重庆银行的行长。"])
+    assert len(results) == 1
+    assert len(results[0]) == len("重庆银行的行长。")
+    assert profile["g2pw_predict_ms"] >= 0.0
+
+
+def test_g2pm_converter_matches_g2pw_batch_contract():
+    from text.g2pw.g2pm_api import G2PMConverter
+
+    converter = G2PMConverter(style="pinyin")
+    results, profile = converter.predict_sentences_with_profile(["重庆银行的行长。"])
+
+    assert len(results) == 1
+    assert len(results[0]) == len("重庆银行的行长。")
+    assert all(isinstance(item, str) for item in results[0])
+    assert profile["g2pw_predict_ms"] >= 0.0
+    assert profile["g2pw_runtime_total_ms"] >= 0.0
+    assert converter.prewarm(["重庆银行的行长。"], rounds=1) is True
+    assert converter.snapshot()["backend"] == "g2pm"
+
+
 def test_attach_t2s_kv_cache_pool_honors_legacy_enable_env(monkeypatch):
     from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.TTS_infer_pack.t2s_kv_cache_pool import (
         attach_t2s_kv_cache_pool,
@@ -5536,6 +5584,57 @@ def test_chinese2_init_falls_back_when_g2pw_init_fails(monkeypatch):
     assert chinese2.g2pw is None
     assert g2pw_results == []
     assert profile["g2pw_predict_ms"] == 0.0
+
+
+def test_chinese2_prepare_g2p_segments_skips_fully_deterministic_segments(monkeypatch):
+    _ensure_vendored_gpt_sovits_import_path()
+    monkeypatch.delitem(sys.modules, "text.chinese2", raising=False)
+    chinese2 = importlib.import_module("text.chinese2")
+    monkeypatch.setattr(chinese2, "is_g2pw", True)
+    monkeypatch.setattr(chinese2, "g2pw", object())
+
+    prepared_segments, batch_inputs = chinese2._prepare_g2p_segments(
+        [
+            "重庆银行行长",
+            "重庆银行的行长",
+        ]
+    )
+
+    assert prepared_segments[0]["needs_g2pw"] is False
+    assert prepared_segments[1]["needs_g2pw"] is True
+    assert batch_inputs == ["重庆银行的行长"]
+
+
+def test_chinese2_g2p_segments_batch_only_predicts_ambiguous_segments(monkeypatch):
+    _ensure_vendored_gpt_sovits_import_path()
+    monkeypatch.delitem(sys.modules, "text.chinese2", raising=False)
+    chinese2 = importlib.import_module("text.chinese2")
+    monkeypatch.setattr(chinese2, "is_g2pw", True)
+    monkeypatch.setattr(chinese2, "g2pw", object())
+    batch_calls: list[list[str]] = []
+
+    def fake_predict(batch_inputs):
+        batch_calls.append(list(batch_inputs))
+        return (
+            [
+                ["chong2", "qing4", "yin2", "hang2", "de5", "hang2", "zhang3"],
+            ],
+            {"g2pw_predict_ms": 2.0},
+        )
+
+    monkeypatch.setattr(chinese2, "_predict_g2pw_batch", fake_predict)
+
+    results_batches, profile_batches = chinese2.g2p_segments_batch(
+        [["重庆银行行长", "重庆银行的行长"]],
+        return_profiles=True,
+    )
+
+    assert batch_calls == [["重庆银行的行长"]]
+    assert len(results_batches) == 1
+    assert [item[2] for item in results_batches[0]] == ["重庆银行行长", "重庆银行的行长"]
+    assert all(results_batches[0][0][0])
+    assert all(results_batches[0][1][0])
+    assert profile_batches[0]["g2pw_predict_ms"] == pytest.approx(2.0)
 
 
 @pytest.mark.slow

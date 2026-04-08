@@ -24,6 +24,13 @@ def _env_enabled(name: str, default: str = "0") -> bool:
     }
 
 
+def _get_zh_pron_backend_name() -> str:
+    backend = os.environ.get("GPTSOVITS_ZH_PRON_BACKEND", "g2pw").strip().lower()
+    if backend in {"g2pw", "g2pm", "pypinyin"}:
+        return backend
+    return "g2pw"
+
+
 class G2PWPinyin(Pinyin):
     def __init__(
         self,
@@ -35,15 +42,18 @@ class G2PWPinyin(Pinyin):
         tone_sandhi=False,
         **kwargs,
     ):
-        backend = os.environ.get("GPTSOVITS_G2PW_BACKEND", "cuda").strip().lower()
+        zh_pron_backend = _get_zh_pron_backend_name()
+        g2pw_backend = os.environ.get("GPTSOVITS_G2PW_BACKEND", "cuda").strip().lower()
         allow_onnx_fallback = _env_enabled("GPTSOVITS_G2PW_ONNX_FALLBACK", "0")
         last_error = None
         self._g2pw = None
-        if backend in {"cuda", "auto"}:
-            try:
-                from .cuda_api import G2PWCudaConverter
+        self._zh_pron_backend_name = zh_pron_backend
 
-                self._g2pw = G2PWCudaConverter(
+        if zh_pron_backend == "g2pm":
+            try:
+                from .g2pm_api import G2PMConverter
+
+                self._g2pw = G2PMConverter(
                     model_dir=model_dir,
                     style="pinyin",
                     model_source=model_source,
@@ -51,28 +61,43 @@ class G2PWPinyin(Pinyin):
                 )
             except Exception as exc:
                 last_error = exc
-                strict_mode = _env_enabled("GPTSOVITS_G2PW_CUDA_STRICT", "0")
-                if backend == "cuda" and strict_mode:
-                    raise
-        should_try_onnx = backend == "onnx" or (self._g2pw is None and allow_onnx_fallback)
-        if self._g2pw is None and should_try_onnx:
-            try:
-                from .onnx_api import G2PWOnnxConverter
+        elif zh_pron_backend == "pypinyin":
+            self._g2pw = None
+        else:
+            if g2pw_backend in {"cuda", "auto"}:
+                try:
+                    from .cuda_api import G2PWCudaConverter
 
-                self._g2pw = G2PWOnnxConverter(
-                    model_dir=model_dir,
-                    style="pinyin",
-                    model_source=model_source,
-                    enable_non_tradional_chinese=enable_non_tradional_chinese,
-                )
-                if last_error is not None:
-                    print(f"[g2pw] cuda backend unavailable, fallback to onnx: {last_error}")
-            except Exception as exc:
-                last_error = exc
-                if backend == "onnx":
-                    raise
+                    self._g2pw = G2PWCudaConverter(
+                        model_dir=model_dir,
+                        style="pinyin",
+                        model_source=model_source,
+                        enable_non_tradional_chinese=enable_non_tradional_chinese,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    strict_mode = _env_enabled("GPTSOVITS_G2PW_CUDA_STRICT", "0")
+                    if g2pw_backend == "cuda" and strict_mode:
+                        raise
+            should_try_onnx = g2pw_backend == "onnx" or (self._g2pw is None and allow_onnx_fallback)
+            if self._g2pw is None and should_try_onnx:
+                try:
+                    from .onnx_api import G2PWOnnxConverter
+
+                    self._g2pw = G2PWOnnxConverter(
+                        model_dir=model_dir,
+                        style="pinyin",
+                        model_source=model_source,
+                        enable_non_tradional_chinese=enable_non_tradional_chinese,
+                    )
+                    if last_error is not None:
+                        print(f"[g2pw] cuda backend unavailable, fallback to onnx: {last_error}")
+                except Exception as exc:
+                    last_error = exc
+                    if g2pw_backend == "onnx":
+                        raise
         if self._g2pw is None and last_error is not None:
-            print(f"[g2pw] backend unavailable, fallback to pypinyin: {last_error}")
+            print(f"[g2pw] zh_pron backend unavailable, fallback to pypinyin: {last_error}")
         self._converter = Converter(
             self._g2pw,
             v_to_u=v_to_u,

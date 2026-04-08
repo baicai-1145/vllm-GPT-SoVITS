@@ -2,10 +2,11 @@ import os
 import re
 import threading
 import time
+from functools import lru_cache
 from typing import Dict, List, Sequence, Tuple
 
 import cn2an
-from pypinyin import lazy_pinyin, Style
+from pypinyin import lazy_pinyin, pinyin, Style
 from pypinyin.contrib.tone_convert import to_finals_tone3, to_initials
 
 from text.symbols import punctuation
@@ -123,6 +124,38 @@ def g2p(text):
     return phones, word2ph
 
 
+@lru_cache(maxsize=8192)
+def _word_pronunciation_candidates(word: str) -> Tuple[Tuple[str, ...], ...]:
+    candidates = pinyin(
+        word,
+        style=Style.TONE3,
+        heteronym=True,
+        neutral_tone_with_five=True,
+    )
+    return tuple(tuple(str(item) for item in group) for group in candidates)
+
+
+def _word_needs_g2pw(word: str, pos: str) -> bool:
+    if pos == "eng" or not word:
+        return False
+    candidates = _word_pronunciation_candidates(word)
+    if len(candidates) != len(word):
+        return False
+    for group in candidates:
+        if len(group) > 1:
+            return True
+    return False
+
+
+def _segment_needs_g2pw(seg_cut) -> bool:
+    if not is_g2pw or g2pw is None:
+        return False
+    for word, pos in seg_cut:
+        if _word_needs_g2pw(word, pos):
+            return True
+    return False
+
+
 def _prepare_g2p_segments(segments):
     prepared_segments = []
     batch_inputs = []
@@ -130,13 +163,15 @@ def _prepare_g2p_segments(segments):
         processed_segment = re.sub("[a-zA-Z]+", "", segment)
         seg_cut = psg.lcut(processed_segment)
         seg_cut = tone_modifier.pre_merge_for_modify(seg_cut)
+        needs_g2pw = _segment_needs_g2pw(seg_cut)
         prepared_segments.append(
             {
                 "segment": processed_segment,
                 "seg_cut": seg_cut,
+                "needs_g2pw": needs_g2pw,
             }
         )
-        if processed_segment:
+        if processed_segment and needs_g2pw:
             batch_inputs.append(processed_segment)
     return prepared_segments, batch_inputs
 
@@ -177,7 +212,11 @@ def _predict_g2pw_batch(batch_inputs: Sequence[str]) -> Tuple[List[List[str]], D
 
 
 def _g2pw_batch_weight(prepared_segments, batch_inputs: Sequence[str]) -> float:
-    char_count = sum(len(item["segment"]) for item in prepared_segments if item["segment"])
+    char_count = sum(
+        len(item["segment"])
+        for item in prepared_segments
+        if item.get("needs_g2pw", False) and item["segment"]
+    )
     if char_count > 0:
         return float(char_count)
     if batch_inputs:
@@ -248,6 +287,10 @@ def g2p_segments_batch(
             segment = item["segment"]
             if not segment:
                 results.append(([], [], segment))
+                continue
+            if not item.get("needs_g2pw", False):
+                phones, word2ph = _build_segment_without_g2pw(segment, item["seg_cut"])
+                results.append((phones, word2ph, segment))
                 continue
             if not is_g2pw or g2pw is None or batch_cursor >= len(g2pw_batch_results):
                 phones, word2ph = _build_segment_without_g2pw(segment, item["seg_cut"])
