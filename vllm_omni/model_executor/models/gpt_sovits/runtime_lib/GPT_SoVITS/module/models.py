@@ -106,6 +106,16 @@ def _vits_decoder_tf32_enabled() -> bool:
     }
 
 
+def _vits_decoder_channels_last_resblock_enabled() -> bool:
+    return os.environ.get("GPTSOVITS_VITS_DECODER_CHANNELS_LAST_RESBLOCK", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
 @contextlib.contextmanager
 def _vits_decoder_tf32_context(x: torch.Tensor):
     if (
@@ -671,6 +681,24 @@ class Generator(torch.nn.Module):
         stats[f"{prefix}_total_ms"] = float((time.perf_counter() - block_started) * 1000.0)
         return x
 
+    @staticmethod
+    def _use_channels_last_resblock_runtime(x: torch.Tensor) -> bool:
+        return (
+            _vits_decoder_channels_last_resblock_enabled()
+            and x.device.type == "cuda"
+            and x.dtype in {torch.float16, torch.bfloat16}
+        )
+
+    def _run_stage_resblocks_channels_last(self, x, stage_index: int):
+        stage_x = x.unsqueeze(2).contiguous(memory_format=torch.channels_last)
+        xs = None
+        stage_base = stage_index * self.num_kernels
+        for j in range(self.num_kernels):
+            block = self.resblocks[stage_base + j]
+            block_out = block.forward_channels_last(stage_x)
+            xs = block_out if xs is None else xs + block_out
+        return (xs / self.num_kernels).squeeze(2)
+
     def forward(self, x, g=None):
         x = self.conv_pre(x)
         if g is not None:
@@ -679,13 +707,16 @@ class Generator(torch.nn.Module):
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, modules.LRELU_SLOPE)
             x = self.ups[i](x)
-            xs = None
-            for j in range(self.num_kernels):
-                if xs is None:
-                    xs = self.resblocks[i * self.num_kernels + j](x)
-                else:
-                    xs += self.resblocks[i * self.num_kernels + j](x)
-            x = xs / self.num_kernels
+            if self._use_channels_last_resblock_runtime(x):
+                x = self._run_stage_resblocks_channels_last(x, i)
+            else:
+                xs = None
+                for j in range(self.num_kernels):
+                    if xs is None:
+                        xs = self.resblocks[i * self.num_kernels + j](x)
+                    else:
+                        xs += self.resblocks[i * self.num_kernels + j](x)
+                x = xs / self.num_kernels
         x = F.leaky_relu(x)
         x = self.conv_post(x)
         x = torch.tanh(x)
@@ -761,6 +792,12 @@ class Generator(torch.nn.Module):
             remove_weight_norm(l)
         for l in self.resblocks:
             l.remove_weight_norm()
+            if hasattr(l, "prepare_channels_last_runtime"):
+                l.prepare_channels_last_runtime()
+                if self.conv_pre.weight.device.type == "cuda":
+                    l.prepare_channels_last_runtime(dtype=torch.float16)
+                    if torch.cuda.is_bf16_supported():
+                        l.prepare_channels_last_runtime(dtype=torch.bfloat16)
 
 
 class DiscriminatorP(torch.nn.Module):
@@ -1191,6 +1228,7 @@ class SynthesizerTrn(nn.Module):
         self._decoder_cuda_graphs = {}
         self._decoder_cuda_graph_seen = {}
         self._decoder_cuda_graph_failures = set()
+        self._decoder_cuda_graph_failure_reasons = {}
         self._decoder_cuda_graph_lock = threading.Lock()
 
     def get_last_decoder_profile(self):
@@ -1279,10 +1317,18 @@ class SynthesizerTrn(nn.Module):
                 }
                 runtime_stats["decoder_runtime_cudagraph_capture_ms"] = float((time.perf_counter() - started_at) * 1000.0)
                 runtime_stats["decoder_runtime_cudagraph_captures"] = 1
-            except Exception:
+            except Exception as exc:
                 self._decoder_cuda_graph_failures.add(key)
+                self._decoder_cuda_graph_failure_reasons[key] = f"{type(exc).__name__}: {exc}"
+                runtime_stats["decoder_runtime_cudagraph_failure_reason"] = self._decoder_cuda_graph_failure_reasons[key]
 
-    def _decode_audio_runtime(self, x: torch.Tensor, g: torch.Tensor | None = None):
+    def _decode_audio_runtime(
+        self,
+        x: torch.Tensor,
+        g: torch.Tensor | None = None,
+        *,
+        borrow_output: bool = False,
+    ):
         runtime_dec = getattr(self, "_compiled_dec", None)
         static_bucket_key = self._decoder_static_bucket_key(x, g)
         shape_id = self._decoder_runtime_shape_id(x, g)
@@ -1318,12 +1364,18 @@ class SynthesizerTrn(nn.Module):
             self._set_last_decoder_runtime_stats(runtime_stats)
             return audio
         if cuda_graph_entry is not None:
+            started_at = time.perf_counter()
             cuda_graph_entry["x"].copy_(x)
+            runtime_stats["decoder_runtime_cudagraph_input_copy_ms"] = float((time.perf_counter() - started_at) * 1000.0)
             static_g = cuda_graph_entry["g"]
             if static_g is not None and g is not None:
+                started_at = time.perf_counter()
                 static_g.copy_(g)
+                runtime_stats["decoder_runtime_cudagraph_cond_copy_ms"] = float((time.perf_counter() - started_at) * 1000.0)
+            started_at = time.perf_counter()
             with _vits_decoder_tf32_context(x):
                 cuda_graph_entry["graph"].replay()
+            runtime_stats["decoder_runtime_cudagraph_replay_ms"] = float((time.perf_counter() - started_at) * 1000.0)
             runtime_stats["decoder_runtime_profiled_calls"] = 0
             runtime_stats["decoder_runtime_compiled_calls"] = 1
             runtime_stats["decoder_runtime_eager_calls"] = 0
@@ -1334,8 +1386,15 @@ class SynthesizerTrn(nn.Module):
             runtime_stats["decoder_runtime_cudagraph_shape_hist"] = {shape_id: 1}
             runtime_stats["decoder_runtime_path"] = "compiled_cudagraph"
             self._set_last_decoder_profile({})
+            if borrow_output:
+                runtime_stats["decoder_runtime_output_borrowed"] = 1
+                self._set_last_decoder_runtime_stats(runtime_stats)
+                return cuda_graph_entry["out"]
+            started_at = time.perf_counter()
+            output = cuda_graph_entry["out"].clone()
+            runtime_stats["decoder_runtime_cudagraph_output_clone_ms"] = float((time.perf_counter() - started_at) * 1000.0)
             self._set_last_decoder_runtime_stats(runtime_stats)
-            return cuda_graph_entry["out"].clone()
+            return output
         if runtime_dec is not None and _vits_static_bucket_compile_enabled():
             static_runtime = self._compiled_dec_static_buckets.get(static_bucket_key)
             if static_runtime is not None:
@@ -1385,6 +1444,10 @@ class SynthesizerTrn(nn.Module):
             if runtime_stats["decoder_runtime_cudagraph_misses"]:
                 runtime_stats["decoder_runtime_cudagraph_miss_shape_hist"] = {shape_id: 1}
             self._maybe_capture_decoder_cuda_graph(static_bucket_key, shape_id, runtime_dec, x, g, runtime_stats)
+            if static_bucket_key in self._decoder_cuda_graph_failure_reasons:
+                runtime_stats["decoder_runtime_cudagraph_failure_reason"] = self._decoder_cuda_graph_failure_reasons[
+                    static_bucket_key
+                ]
             runtime_stats["decoder_runtime_path_hist"] = {"compiled": 1}
             runtime_stats["decoder_runtime_path"] = "compiled"
             self._set_last_decoder_profile({})

@@ -2704,13 +2704,119 @@ def test_decode_prepared_request_fragment_merges_decoder_runtime_path_stats(tmp_
     )
 
     profile = runtime.get_last_vits_decode_profile()
-    vits_model.get_last_decoder_runtime_stats.assert_called_once()
+    assert vits_model.get_last_decoder_runtime_stats.call_count >= 1
     assert int(profile["decoder_runtime_calls"]) == 1
     assert bool(profile["decoder_runtime_compiled_available"]) is True
     assert int(profile["decoder_runtime_profiled_calls"]) == 1
     assert profile["decoder_runtime_path"] == "profiled_eager"
     assert profile["decoder_runtime_x_shape"] == [1, 1, 3]
     assert profile["decoder_runtime_g_shape"] == [1, 2, 3]
+
+
+def test_decode_prepared_request_fragment_clones_borrowed_decoder_output(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    audio_batch = torch.tensor([[[0.1, 0.2, 0.3, 0.4]]], dtype=torch.float32)
+    y_mask = torch.tensor([[[1.0, 1.0, 1.0, 0.0]]], dtype=torch.float32)
+    vits_model = SimpleNamespace(
+        get_last_decoder_runtime_stats=Mock(return_value={"decoder_runtime_output_borrowed": 1}),
+    )
+    pipeline = SimpleNamespace(configs=SimpleNamespace(sampling_rate=32000, use_vocoder=False, device="cpu"))
+    prompt_context = {
+        "device": torch.device("cpu"),
+        "vits_model": vits_model,
+        "ge": torch.ones((1, 2, 1), dtype=torch.float32),
+    }
+    runtime._build_refer_spec_from_prepared = Mock(return_value=SimpleNamespace(spec_audio=torch.ones((1, 704, 4), dtype=torch.float32)))  # type: ignore[method-assign]
+    runtime._run_vits_non_vocoder_decode = Mock(return_value=(audio_batch, y_mask))  # type: ignore[method-assign]
+    runtime._measure_vits_audio_lengths = Mock(return_value=torch.tensor([3], dtype=torch.long))  # type: ignore[method-assign]
+
+    audio_fragment, output_sr = runtime._decode_prepared_request_fragment(
+        pipeline,
+        SimpleNamespace(
+            semantic_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+            phones=torch.tensor([10, 11], dtype=torch.long),
+            refer_audio_spec=torch.ones((1, 704, 4), dtype=torch.float32),
+            refer_audio_16k=torch.zeros((0,), dtype=torch.float32),
+            speed_factor=1.0,
+            sample_steps=32,
+        ),
+        prompt_context=prompt_context,
+    )
+
+    audio_batch[0, 0, 0] = 9.9
+    assert audio_fragment.tolist() == pytest.approx([0.1, 0.2, 0.3])
+    assert output_sr == 32000
+
+
+def test_decode_prepared_requests_batched_non_vocoder_clones_borrowed_decoder_output(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    audio_batch = torch.tensor(
+        [
+            [[0.1, 0.2, 0.3, 0.4]],
+            [[1.1, 1.2, 1.3, 1.4]],
+        ],
+        dtype=torch.float32,
+    )
+    y_mask = torch.tensor(
+        [
+            [[1.0, 1.0, 1.0, 0.0]],
+            [[1.0, 1.0, 0.0, 0.0]],
+        ],
+        dtype=torch.float32,
+    )
+    vits_model = SimpleNamespace(
+        get_last_decoder_runtime_stats=Mock(return_value={"decoder_runtime_output_borrowed": 1}),
+    )
+    pipeline = SimpleNamespace(configs=SimpleNamespace(sampling_rate=32000, use_vocoder=False, device="cpu"))
+    prompt_context = {
+        "device": torch.device("cpu"),
+        "vits_model": vits_model,
+        "ge": torch.ones((1, 2, 1), dtype=torch.float32),
+    }
+    runtime._run_vits_non_vocoder_decode = Mock(return_value=(audio_batch, y_mask))  # type: ignore[method-assign]
+    runtime._measure_vits_audio_lengths = Mock(return_value=torch.tensor([3, 2], dtype=torch.long))  # type: ignore[method-assign]
+
+    decoded = runtime._decode_prepared_requests_batched_non_vocoder(
+        pipeline,
+        [
+            GPTSoVITSDecodePreparedRequest(
+                request_id="a",
+                semantic_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+                phones=torch.tensor([1, 2], dtype=torch.long),
+                prompt_phones=torch.tensor([2], dtype=torch.long),
+                prompt_semantic=torch.tensor([3], dtype=torch.long),
+                refer_audio_spec=torch.tensor([0.1], dtype=torch.float32),
+                refer_audio_16k=torch.tensor([0.2], dtype=torch.float32),
+                raw_audio=torch.tensor([0.3], dtype=torch.float32),
+                raw_sr=16000,
+                speed_factor=1.0,
+                fragment_interval=0.3,
+                sample_steps=32,
+                super_sampling=False,
+            ),
+            GPTSoVITSDecodePreparedRequest(
+                request_id="b",
+                semantic_tokens=torch.tensor([4, 5], dtype=torch.long),
+                phones=torch.tensor([3], dtype=torch.long),
+                prompt_phones=torch.tensor([2], dtype=torch.long),
+                prompt_semantic=torch.tensor([3], dtype=torch.long),
+                refer_audio_spec=torch.tensor([0.1], dtype=torch.float32),
+                refer_audio_16k=torch.tensor([0.2], dtype=torch.float32),
+                raw_audio=torch.tensor([0.3], dtype=torch.float32),
+                raw_sr=16000,
+                speed_factor=1.0,
+                fragment_interval=0.3,
+                sample_steps=32,
+                super_sampling=False,
+            ),
+        ],
+        prompt_context=prompt_context,
+    )
+
+    audio_batch[0, 0, 0] = 9.9
+    audio_batch[1, 0, 0] = 8.8
+    assert decoded[0].audio_fragment.tolist() == pytest.approx([0.1, 0.2, 0.3])
+    assert decoded[1].audio_fragment.tolist() == pytest.approx([1.1, 1.2])
 
 
 def test_decode_prepared_request_vocoder_fragment_uses_native_components(tmp_path):

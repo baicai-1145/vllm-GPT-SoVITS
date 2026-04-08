@@ -9908,7 +9908,7 @@ class GPTSoVITSRuntime:
             device=m_p.device,
         )
         audio = self._time_vits_call(
-            lambda: vits_model._decode_audio_runtime((z * y_mask)[:, :, :], g=ge),
+            lambda: vits_model._decode_audio_runtime((z * y_mask)[:, :, :], g=ge, borrow_output=True),
             profile=profile,
             stat_key="non_vocoder_decode_audio_ms",
             device=z.device,
@@ -10415,8 +10415,12 @@ class GPTSoVITSRuntime:
             stat_key="non_vocoder_measure_audio_lengths_ms",
             device=device,
         )
+        decoder_runtime_stats = getattr(vits_model, "get_last_decoder_runtime_stats", lambda: {})()
+        borrow_output = bool(decoder_runtime_stats.get("decoder_runtime_output_borrowed"))
         audio_fragment = self._time_vits_call(
-            lambda: audio_batch[0, 0, : int(audio_lengths[0].item())].detach(),
+            lambda: audio_batch[0, 0, : int(audio_lengths[0].item())].detach().clone()
+            if borrow_output
+            else audio_batch[0, 0, : int(audio_lengths[0].item())].detach(),
             profile=profile,
             stat_key="non_vocoder_trim_audio_ms",
             device=device,
@@ -10523,10 +10527,21 @@ class GPTSoVITSRuntime:
             stat_key="non_vocoder_measure_audio_lengths_ms",
             device=device,
         )
-        audio_fragments = [
-            audio_batch[batch_index, 0, : int(audio_lengths[batch_index].item())].detach()
-            for batch_index in range(batch_size)
-        ]
+        decoder_runtime_stats = getattr(vits_model, "get_last_decoder_runtime_stats", lambda: {})()
+        borrow_output = bool(decoder_runtime_stats.get("decoder_runtime_output_borrowed"))
+        audio_fragments = self._time_vits_call(
+            lambda: [
+                (
+                    audio_batch[batch_index, 0, : int(audio_lengths[batch_index].item())].detach().clone()
+                    if borrow_output
+                    else audio_batch[batch_index, 0, : int(audio_lengths[batch_index].item())].detach()
+                )
+                for batch_index in range(batch_size)
+            ],
+            profile=profile,
+            stat_key="non_vocoder_trim_audio_ms",
+            device=device,
+        )
         if profile is not None:
             profile["non_vocoder_output_samples"] = int(sum(int(fragment.shape[-1]) for fragment in audio_fragments))
             self._merge_last_vits_decode_profile(profile)

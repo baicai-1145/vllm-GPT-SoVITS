@@ -17,6 +17,21 @@ import torch.distributions as D
 LRELU_SLOPE = 0.1
 
 
+def _conv2d_spec_from_conv1d(conv: nn.Conv1d, *, dtype: torch.dtype | None = None) -> dict[str, torch.Tensor | tuple[int, int]]:
+    target_dtype = dtype or conv.weight.dtype
+    weight = conv.weight.detach().to(device=conv.weight.device, dtype=target_dtype)
+    bias = None
+    if conv.bias is not None:
+        bias = conv.bias.detach().to(device=conv.weight.device, dtype=target_dtype)
+    return {
+        "weight": weight.unsqueeze(2).contiguous(memory_format=torch.channels_last),
+        "bias": bias,
+        "stride": (1, conv.stride[0]),
+        "padding": (0, conv.padding[0]),
+        "dilation": (1, conv.dilation[0]),
+    }
+
+
 class LayerNorm(nn.Module):
     def __init__(self, channels, eps=1e-5):
         super().__init__()
@@ -289,6 +304,47 @@ class ResBlock1(torch.nn.Module):
             ]
         )
         self.convs2.apply(init_weights)
+        self._channels_last_runtime = {}
+
+    def _clear_channels_last_runtime(self):
+        self._channels_last_runtime = {}
+
+    def prepare_channels_last_runtime(self, *, dtype: torch.dtype | None = None):
+        conv = self.convs1[0]
+        target_dtype = dtype or conv.weight.dtype
+        key = (str(conv.weight.device), str(target_dtype))
+        if key in self._channels_last_runtime:
+            return
+        self._channels_last_runtime[key] = (
+            [_conv2d_spec_from_conv1d(conv, dtype=target_dtype) for conv in self.convs1],
+            [_conv2d_spec_from_conv1d(conv, dtype=target_dtype) for conv in self.convs2],
+        )
+
+    def forward_channels_last(self, x, x_mask=None):
+        if x.dim() != 4:
+            raise ValueError(f"ResBlock1.forward_channels_last expects 4D input, got shape={tuple(x.shape)}")
+        key = (str(x.device), str(x.dtype))
+        if key not in self._channels_last_runtime:
+            self.prepare_channels_last_runtime(dtype=x.dtype)
+        convs1, convs2 = self._channels_last_runtime[key]
+        mask = x_mask
+        if mask is not None and mask.dim() == 3:
+            mask = mask.unsqueeze(2)
+        if mask is not None and not mask.is_contiguous(memory_format=torch.channels_last):
+            mask = mask.contiguous(memory_format=torch.channels_last)
+        for c1, c2 in zip(convs1, convs2):
+            xt = F.leaky_relu(x, LRELU_SLOPE)
+            if mask is not None:
+                xt = xt * mask
+            xt = F.conv2d(xt, c1["weight"], c1["bias"], stride=c1["stride"], padding=c1["padding"], dilation=c1["dilation"])
+            xt = F.leaky_relu(xt, LRELU_SLOPE)
+            if mask is not None:
+                xt = xt * mask
+            xt = F.conv2d(xt, c2["weight"], c2["bias"], stride=c2["stride"], padding=c2["padding"], dilation=c2["dilation"])
+            x = xt + x
+        if mask is not None:
+            x = x * mask
+        return x
 
     def forward(self, x, x_mask=None):
         for c1, c2 in zip(self.convs1, self.convs2):
@@ -310,6 +366,7 @@ class ResBlock1(torch.nn.Module):
             remove_weight_norm(l)
         for l in self.convs2:
             remove_weight_norm(l)
+        self._clear_channels_last_runtime()
 
 
 class ResBlock2(torch.nn.Module):
@@ -340,6 +397,47 @@ class ResBlock2(torch.nn.Module):
             ]
         )
         self.convs.apply(init_weights)
+        self._channels_last_runtime = {}
+
+    def _clear_channels_last_runtime(self):
+        self._channels_last_runtime = {}
+
+    def prepare_channels_last_runtime(self, *, dtype: torch.dtype | None = None):
+        conv = self.convs[0]
+        target_dtype = dtype or conv.weight.dtype
+        key = (str(conv.weight.device), str(target_dtype))
+        if key in self._channels_last_runtime:
+            return
+        self._channels_last_runtime[key] = [_conv2d_spec_from_conv1d(conv, dtype=target_dtype) for conv in self.convs]
+
+    def forward_channels_last(self, x, x_mask=None):
+        if x.dim() != 4:
+            raise ValueError(f"ResBlock2.forward_channels_last expects 4D input, got shape={tuple(x.shape)}")
+        key = (str(x.device), str(x.dtype))
+        if key not in self._channels_last_runtime:
+            self.prepare_channels_last_runtime(dtype=x.dtype)
+        convs = self._channels_last_runtime[key]
+        mask = x_mask
+        if mask is not None and mask.dim() == 3:
+            mask = mask.unsqueeze(2)
+        if mask is not None and not mask.is_contiguous(memory_format=torch.channels_last):
+            mask = mask.contiguous(memory_format=torch.channels_last)
+        for conv in convs:
+            xt = F.leaky_relu(x, LRELU_SLOPE)
+            if mask is not None:
+                xt = xt * mask
+            xt = F.conv2d(
+                xt,
+                conv["weight"],
+                conv["bias"],
+                stride=conv["stride"],
+                padding=conv["padding"],
+                dilation=conv["dilation"],
+            )
+            x = xt + x
+        if mask is not None:
+            x = x * mask
+        return x
 
     def forward(self, x, x_mask=None):
         for c in self.convs:
@@ -355,6 +453,7 @@ class ResBlock2(torch.nn.Module):
     def remove_weight_norm(self):
         for l in self.convs:
             remove_weight_norm(l)
+        self._clear_channels_last_runtime()
 
 
 class Log(nn.Module):
