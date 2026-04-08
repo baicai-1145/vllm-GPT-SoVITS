@@ -237,8 +237,8 @@ class G2PWRuntimeWrapper:
         self.batch_pending_peak = 0
         self.closed = False
         self._ensure_capacity(
-            batch_size=max(1, _env_int("GPTSOVITS_G2PW_CUDA_MAX_BATCH_SIZE", 256)),
-            seq_len=max(1, _env_int("GPTSOVITS_G2PW_CUDA_MAX_SEQ_LEN", 128)),
+            batch_size=max(1, _env_int("GPTSOVITS_G2PW_CUDA_MAX_BATCH_SIZE", 16)),
+            seq_len=max(1, _env_int("GPTSOVITS_G2PW_CUDA_MAX_SEQ_LEN", 16)),
         )
         self.direct_max_rows = max(
             1,
@@ -797,7 +797,7 @@ class G2PWRuntimeWrapper:
 
 class G2PWRuntimePool:
     def __init__(self) -> None:
-        self.worker_count = max(1, _env_int("GPTSOVITS_G2PW_CUDA_WORKERS", 2))
+        self.worker_count = max(1, _env_int("GPTSOVITS_G2PW_CUDA_WORKERS", 1))
         self.shards = [G2PWRuntimeWrapper(shard_index=index) for index in range(self.worker_count)]
         self.lock = threading.Lock()
 

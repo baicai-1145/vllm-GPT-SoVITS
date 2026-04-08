@@ -1550,6 +1550,8 @@ class GPTSoVITSRuntime:
             tuple[Any, ...],
             tuple[float, torch.Tensor, torch.Tensor],
         ] = OrderedDict()
+        self._prepare_model_offload_lock = threading.RLock()
+        self._prepare_model_offload_users = 0
 
     def _resolve_path(self, maybe_relative_path: str) -> str:
         if os.path.isabs(maybe_relative_path):
@@ -1565,6 +1567,73 @@ class GPTSoVITSRuntime:
             "off",
             "",
         }
+
+    @staticmethod
+    def _prepare_model_cpu_offload_enabled() -> bool:
+        return os.environ.get("GPTSOVITS_PREPARE_MODEL_CPU_OFFLOAD", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _prepare_model_offload_targets(pipeline: Any) -> list[Any]:
+        return [
+            module
+            for module in (
+                getattr(pipeline, "bert_model", None),
+                getattr(pipeline, "cnhuhbert_model", None),
+            )
+            if module is not None
+        ]
+
+    @staticmethod
+    def _module_device(module: Any) -> torch.device | None:
+        if module is None:
+            return None
+        for tensor in list(getattr(module, "parameters", lambda: [])()) + list(getattr(module, "buffers", lambda: [])()):
+            return tensor.device
+        return None
+
+    def _set_prepare_models_device(self, pipeline: Any, device: torch.device | str) -> None:
+        target_device = torch.device(device)
+        modules = self._prepare_model_offload_targets(pipeline)
+        if not modules:
+            return
+        if not any(self._module_device(module) != target_device for module in modules):
+            return
+        for module in modules:
+            module.to(device=target_device)
+        if target_device.type == "cpu" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+    def _offload_prepare_models_if_idle(self, pipeline: Any) -> None:
+        if not self._prepare_model_cpu_offload_enabled():
+            return
+        with self._prepare_model_offload_lock:
+            if self._prepare_model_offload_users != 0:
+                return
+            self._set_prepare_models_device(pipeline, "cpu")
+
+    @contextmanager
+    def _prepare_models_active(self):
+        if not self._prepare_model_cpu_offload_enabled():
+            yield
+            return
+        pipeline = self._ensure_pipeline()
+        with self._prepare_model_offload_lock:
+            if self._prepare_model_offload_users == 0:
+                self._set_prepare_models_device(pipeline, getattr(getattr(pipeline, "configs", None), "device", "cpu"))
+            self._prepare_model_offload_users += 1
+        try:
+            yield
+        finally:
+            with self._prepare_model_offload_lock:
+                self._prepare_model_offload_users = max(0, self._prepare_model_offload_users - 1)
+                if self._prepare_model_offload_users == 0:
+                    self._set_prepare_models_device(pipeline, "cpu")
 
     def _ensure_import_path(self) -> None:
         project_root = self.project_root
@@ -1673,6 +1742,7 @@ class GPTSoVITSRuntime:
             self._bind_pipeline_components(pipeline)
             self._config = config
             self._pipeline = pipeline
+            self._offload_prepare_models_if_idle(pipeline)
             logger.info(
                 "Initialized GPT-SoVITS runtime from %s using config %s",
                 self.project_root,
@@ -8253,15 +8323,16 @@ class GPTSoVITSRuntime:
         self,
         prepared_cpu_stage: GPTSoVITSPreparedCpuStage,
     ) -> GPTSoVITSPreparedAudioPhase:
-        coordinator = self._ensure_prepare_coordinator()
-        phase_one = self._run_awaitable_sync(
-            self._prepare_gpu_audio_phase_async(coordinator, prepared_cpu_stage)
-        )
-        return GPTSoVITSPreparedAudioPhase(
-            request_id=prepared_cpu_stage.request_id,
-            prepared_cpu_stage=prepared_cpu_stage,
-            phase_one=phase_one,
-        )
+        with self._prepare_models_active():
+            coordinator = self._ensure_prepare_coordinator()
+            phase_one = self._run_awaitable_sync(
+                self._prepare_gpu_audio_phase_async(coordinator, prepared_cpu_stage)
+            )
+            return GPTSoVITSPreparedAudioPhase(
+                request_id=prepared_cpu_stage.request_id,
+                prepared_cpu_stage=prepared_cpu_stage,
+                phase_one=phase_one,
+            )
 
     def prepare_request_gpu_audio_phases(
         self,
@@ -8269,34 +8340,35 @@ class GPTSoVITSRuntime:
     ) -> list[GPTSoVITSPreparedAudioPhase]:
         if not prepared_cpu_stages:
             return []
-        coordinator = self._ensure_prepare_coordinator()
+        with self._prepare_models_active():
+            coordinator = self._ensure_prepare_coordinator()
 
-        async def _gather_phase_ones():
-            if coordinator.enable_g2pw_audio_batch_merge and len(prepared_cpu_stages) > 1:
-                return await self._prepare_gpu_audio_phase_batch_async(coordinator, prepared_cpu_stages)
-            return await asyncio.gather(
-                *[
-                    self._prepare_gpu_audio_phase_async(coordinator, prepared_cpu_stage)
-                    for prepared_cpu_stage in prepared_cpu_stages
-                ],
-                return_exceptions=True,
-            )
-
-        phase_one_results = self._run_awaitable_sync(_gather_phase_ones())
-        if len(phase_one_results) != len(prepared_cpu_stages):
-            raise ValueError("GPT-SoVITS batch prepare audio phase count mismatch")
-        prepared_audio_phases: list[GPTSoVITSPreparedAudioPhase] = []
-        for prepared_cpu_stage, phase_one in zip(prepared_cpu_stages, phase_one_results):
-            if isinstance(phase_one, Exception):
-                raise phase_one
-            prepared_audio_phases.append(
-                GPTSoVITSPreparedAudioPhase(
-                    request_id=prepared_cpu_stage.request_id,
-                    prepared_cpu_stage=prepared_cpu_stage,
-                    phase_one=phase_one,
+            async def _gather_phase_ones():
+                if coordinator.enable_g2pw_audio_batch_merge and len(prepared_cpu_stages) > 1:
+                    return await self._prepare_gpu_audio_phase_batch_async(coordinator, prepared_cpu_stages)
+                return await asyncio.gather(
+                    *[
+                        self._prepare_gpu_audio_phase_async(coordinator, prepared_cpu_stage)
+                        for prepared_cpu_stage in prepared_cpu_stages
+                    ],
+                    return_exceptions=True,
                 )
-            )
-        return prepared_audio_phases
+
+            phase_one_results = self._run_awaitable_sync(_gather_phase_ones())
+            if len(phase_one_results) != len(prepared_cpu_stages):
+                raise ValueError("GPT-SoVITS batch prepare audio phase count mismatch")
+            prepared_audio_phases: list[GPTSoVITSPreparedAudioPhase] = []
+            for prepared_cpu_stage, phase_one in zip(prepared_cpu_stages, phase_one_results):
+                if isinstance(phase_one, Exception):
+                    raise phase_one
+                prepared_audio_phases.append(
+                    GPTSoVITSPreparedAudioPhase(
+                        request_id=prepared_cpu_stage.request_id,
+                        prepared_cpu_stage=prepared_cpu_stage,
+                        phase_one=phase_one,
+                    )
+                )
+            return prepared_audio_phases
 
     async def _prepare_gpu_text_phase_async(
         self,
@@ -8329,15 +8401,16 @@ class GPTSoVITSRuntime:
         self,
         prepared_audio_phase: GPTSoVITSPreparedAudioPhase,
     ) -> GPTSoVITSPreparedTextPhase:
-        coordinator = self._ensure_prepare_coordinator()
-        phase_two = self._run_awaitable_sync(
-            self._prepare_gpu_text_phase_async(coordinator, prepared_audio_phase)
-        )
-        return GPTSoVITSPreparedTextPhase(
-            request_id=prepared_audio_phase.request_id,
-            prepared_audio_phase=prepared_audio_phase,
-            phase_two=phase_two,
-        )
+        with self._prepare_models_active():
+            coordinator = self._ensure_prepare_coordinator()
+            phase_two = self._run_awaitable_sync(
+                self._prepare_gpu_text_phase_async(coordinator, prepared_audio_phase)
+            )
+            return GPTSoVITSPreparedTextPhase(
+                request_id=prepared_audio_phase.request_id,
+                prepared_audio_phase=prepared_audio_phase,
+                phase_two=phase_two,
+            )
 
     def prepare_request_gpu_text_phases(
         self,
@@ -8345,30 +8418,31 @@ class GPTSoVITSRuntime:
     ) -> list[GPTSoVITSPreparedTextPhase]:
         if not prepared_audio_phases:
             return []
-        coordinator = self._ensure_prepare_coordinator()
-        async def _gather_phase_twos():
-            return await asyncio.gather(
-                *[
-                    self._prepare_gpu_text_phase_async(coordinator, prepared_audio_phase)
-                    for prepared_audio_phase in prepared_audio_phases
-                ],
-                return_exceptions=True,
-            )
-        phase_two_results = self._run_awaitable_sync(_gather_phase_twos())
-        if len(phase_two_results) != len(prepared_audio_phases):
-            raise ValueError("GPT-SoVITS batch prepare text phase count mismatch")
-        prepared_text_phases: list[GPTSoVITSPreparedTextPhase] = []
-        for prepared_audio_phase, phase_two in zip(prepared_audio_phases, phase_two_results):
-            if isinstance(phase_two, Exception):
-                raise phase_two
-            prepared_text_phases.append(
-                GPTSoVITSPreparedTextPhase(
-                    request_id=prepared_audio_phase.request_id,
-                    prepared_audio_phase=prepared_audio_phase,
-                    phase_two=phase_two,
+        with self._prepare_models_active():
+            coordinator = self._ensure_prepare_coordinator()
+            async def _gather_phase_twos():
+                return await asyncio.gather(
+                    *[
+                        self._prepare_gpu_text_phase_async(coordinator, prepared_audio_phase)
+                        for prepared_audio_phase in prepared_audio_phases
+                    ],
+                    return_exceptions=True,
                 )
-            )
-        return prepared_text_phases
+            phase_two_results = self._run_awaitable_sync(_gather_phase_twos())
+            if len(phase_two_results) != len(prepared_audio_phases):
+                raise ValueError("GPT-SoVITS batch prepare text phase count mismatch")
+            prepared_text_phases: list[GPTSoVITSPreparedTextPhase] = []
+            for prepared_audio_phase, phase_two in zip(prepared_audio_phases, phase_two_results):
+                if isinstance(phase_two, Exception):
+                    raise phase_two
+                prepared_text_phases.append(
+                    GPTSoVITSPreparedTextPhase(
+                        request_id=prepared_audio_phase.request_id,
+                        prepared_audio_phase=prepared_audio_phase,
+                        phase_two=phase_two,
+                    )
+                )
+            return prepared_text_phases
 
     async def _prepare_ref_spec_phase_async(
         self,
@@ -8979,11 +9053,15 @@ class GPTSoVITSRuntime:
         return self.prepare_request_spec(spec)
 
     def prepare_request_spec(self, spec: GPTSoVITSRequestSpec) -> GPTSoVITSPreparedRequest:
-        prepared_cpu_stage = self.prepare_request_spec_cpu_stage(spec)
-        prepared_audio_phase = self.prepare_request_gpu_audio_phase(prepared_cpu_stage)
-        prepared_ref_spec_phase = self.prepare_request_ref_spec_phase(prepared_audio_phase)
-        prepared_text_phase = self.prepare_request_gpu_text_phase(prepared_audio_phase)
-        return self.build_prepared_request_from_phases(prepared_text_phase, prepared_ref_spec_phase=prepared_ref_spec_phase)
+        with self._prepare_models_active():
+            prepared_cpu_stage = self.prepare_request_spec_cpu_stage(spec)
+            prepared_audio_phase = self.prepare_request_gpu_audio_phase(prepared_cpu_stage)
+            prepared_ref_spec_phase = self.prepare_request_ref_spec_phase(prepared_audio_phase)
+            prepared_text_phase = self.prepare_request_gpu_text_phase(prepared_audio_phase)
+            return self.build_prepared_request_from_phases(
+                prepared_text_phase,
+                prepared_ref_spec_phase=prepared_ref_spec_phase,
+            )
 
     def prepare_requests(self, requests: list[dict[str, Any]]) -> list[GPTSoVITSPreparedRequest]:
         if not requests:
@@ -9000,34 +9078,35 @@ class GPTSoVITSRuntime:
     def prepare_request_specs(self, specs: list[GPTSoVITSRequestSpec]) -> list[GPTSoVITSPreparedRequest]:
         if not specs:
             return []
-        prepared_cpu_stages = self.prepare_request_spec_cpu_stages(specs)
-        audio_phase_start = time.perf_counter()
-        prepared_audio_phases = self.prepare_request_gpu_audio_phases(prepared_cpu_stages)
-        audio_phase_wall_ms = max(0.0, (time.perf_counter() - audio_phase_start) * 1000.0)
-        prepared_ref_spec_phases = self.prepare_request_ref_spec_phases(prepared_audio_phases)
-        text_phase_start = time.perf_counter()
-        prepared_text_phases = self.prepare_request_gpu_text_phases(prepared_audio_phases)
-        text_phase_wall_ms = max(0.0, (time.perf_counter() - text_phase_start) * 1000.0)
-        if len(prepared_text_phases) != len(prepared_ref_spec_phases):
-            raise ValueError("GPT-SoVITS batch prepare text/ref-spec phase count mismatch")
+        with self._prepare_models_active():
+            prepared_cpu_stages = self.prepare_request_spec_cpu_stages(specs)
+            audio_phase_start = time.perf_counter()
+            prepared_audio_phases = self.prepare_request_gpu_audio_phases(prepared_cpu_stages)
+            audio_phase_wall_ms = max(0.0, (time.perf_counter() - audio_phase_start) * 1000.0)
+            prepared_ref_spec_phases = self.prepare_request_ref_spec_phases(prepared_audio_phases)
+            text_phase_start = time.perf_counter()
+            prepared_text_phases = self.prepare_request_gpu_text_phases(prepared_audio_phases)
+            text_phase_wall_ms = max(0.0, (time.perf_counter() - text_phase_start) * 1000.0)
+            if len(prepared_text_phases) != len(prepared_ref_spec_phases):
+                raise ValueError("GPT-SoVITS batch prepare text/ref-spec phase count mismatch")
 
-        prepared: list[GPTSoVITSPreparedRequest] = []
-        extra_profile = {
-            "engine_prepare_audio_phase_mode": 1.0,
-            "engine_prepare_audio_phase_wall_ms": float(audio_phase_wall_ms),
-            "engine_prepare_audio_phase_batch_size": float(len(prepared_audio_phases)),
-            "engine_prepare_text_phase_wall_ms": float(text_phase_wall_ms),
-            "engine_prepare_text_phase_batch_size": float(len(prepared_text_phases)),
-        }
-        for prepared_text_phase, prepared_ref_spec_phase in zip(prepared_text_phases, prepared_ref_spec_phases):
-            prepared.append(
-                self.build_prepared_request_from_phases(
-                    prepared_text_phase,
-                    prepared_ref_spec_phase=prepared_ref_spec_phase,
-                    extra_profile=extra_profile,
+            prepared: list[GPTSoVITSPreparedRequest] = []
+            extra_profile = {
+                "engine_prepare_audio_phase_mode": 1.0,
+                "engine_prepare_audio_phase_wall_ms": float(audio_phase_wall_ms),
+                "engine_prepare_audio_phase_batch_size": float(len(prepared_audio_phases)),
+                "engine_prepare_text_phase_wall_ms": float(text_phase_wall_ms),
+                "engine_prepare_text_phase_batch_size": float(len(prepared_text_phases)),
+            }
+            for prepared_text_phase, prepared_ref_spec_phase in zip(prepared_text_phases, prepared_ref_spec_phases):
+                prepared.append(
+                    self.build_prepared_request_from_phases(
+                        prepared_text_phase,
+                        prepared_ref_spec_phase=prepared_ref_spec_phase,
+                        extra_profile=extra_profile,
+                    )
                 )
-            )
-        return prepared
+            return prepared
 
     def _build_ar_session_from_prepared(self, prepared: GPTSoVITSPreparedRequest) -> GPTSoVITSARSession:
         pipeline = self._ensure_pipeline()
