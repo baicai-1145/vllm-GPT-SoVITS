@@ -1,0 +1,6 @@
+[submodule "vllm_omni/model_executor/models/gpt_sovits/runtime_lib/third_party/g2pw-cu"]
+	path = vllm_omni/model_executor/models/gpt_sovits/runtime_lib/third_party/g2pw-cu
+	url = https://github.com/baicai-1145/g2pw-cu.git
+[submodule "vllm_omni/model_executor/models/gpt_sovits/runtime_lib/third_party/split-lang"]
+	path = vllm_omni/model_executor/models/gpt_sovits/runtime_lib/third_party/split-lang
+	url = https://github.com/baicai-1145/split-lang.git

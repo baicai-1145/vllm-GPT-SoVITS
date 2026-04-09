@@ -27,6 +27,9 @@ Linked instead of copied:
 - `GPT_SoVITS/pretrained_models`
 - `GPT_SoVITS/text/G2PWModel`
 - `GPT_SoVITS/text/ja_userdic`
+
+Git submodules:
+
 - `third_party/g2pw-cu`
 - `third_party/split-lang`
 
@@ -37,8 +40,15 @@ developer machine with:
 bash tools/dev/setup_gptsovits_runtime_links.sh
 ```
 
-They are local external dependencies for development convenience, not Git
-submodules of this repository.
+Only the three GPT-SoVITS asset paths above are local development links. The
+two `third_party` repositories are real Git submodules of this repository and
+should be initialized with:
+
+```bash
+git submodule update --init --recursive -- \
+  vllm_omni/model_executor/models/gpt_sovits/runtime_lib/third_party/g2pw-cu \
+  vllm_omni/model_executor/models/gpt_sovits/runtime_lib/third_party/split-lang
+```
 
 Override the source GPT-SoVITS checkout with `GPT_SOVITS_LINK_SOURCE_ROOT=/abs/path`
 when it is not located at `/root/GPT-SoVITS`.
