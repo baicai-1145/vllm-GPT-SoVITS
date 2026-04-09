@@ -466,7 +466,7 @@ def _apply_build_metadata_to_latest_only(
 
 def _sort_records_for_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Sort so that same test configuration is grouped, newest date first within each group."""
-    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
+    by_date_desc = sorted(records, key=lambda r: r.get("date") or "", reverse=True)
     return sorted(
         by_date_desc,
         key=_omni_group_key,
@@ -474,7 +474,7 @@ def _sort_records_for_summary(records: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _sort_diffusion_records_for_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
+    by_date_desc = sorted(records, key=lambda r: r.get("date") or "", reverse=True)
     return sorted(by_date_desc, key=_diffusion_group_key)
 
 

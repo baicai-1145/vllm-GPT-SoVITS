@@ -13,21 +13,21 @@ if now_dir not in sys.path:
     sys.path.insert(0, now_dir)
 
 import re
+
 import torch
-from text.LangSegmenter import LangSegmenter
-from text import chinese
-from typing import Dict, List, Optional, Tuple
-from text.cleaner import clean_text
 from text import cleaned_text_to_sequence
+from text.cleaner import clean_text
+from text.LangSegmenter import LangSegmenter
+from tools.i18n.i18n import I18nAuto, scan_language_list
 from transformers import AutoModelForMaskedLM, AutoTokenizer
-from TTS_infer_pack.text_segmentation_method import split_big_text, splits, get_method as get_seg_method
+
 from TTS_infer_pack.prepare_bert_batch_worker import PrepareBertBatchWorker, PrepareBertBatchWorkerPool
 from TTS_infer_pack.text_cpu_preprocess import (
     preprocess_text_segments_payload,
     preprocess_text_segments_payload_batch,
 )
-
-from tools.i18n.i18n import I18nAuto, scan_language_list
+from TTS_infer_pack.text_segmentation_method import get_method as get_seg_method
+from TTS_infer_pack.text_segmentation_method import split_big_text, splits
 
 language = os.environ.get("language", "Auto")
 language = sys.argv[-1] if sys.argv[-1] in scan_language_list() else language
@@ -36,7 +36,13 @@ punctuation = set(["!", "?", "…", ",", ".", "-"])
 
 
 def _verbose_text_preprocess() -> bool:
-    return os.environ.get("GPTSOVITS_VERBOSE_TEXT_PREPROCESS", "0").strip().lower() not in {"0", "false", "no", "off", ""}
+    return os.environ.get("GPTSOVITS_VERBOSE_TEXT_PREPROCESS", "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
 
 
 def get_first(text: str) -> str:
@@ -94,7 +100,7 @@ class StageLimiter:
                 self.inflight = max(0, self.inflight - 1)
             self.semaphore.release()
 
-    def snapshot(self) -> Dict[str, int]:
+    def snapshot(self) -> dict[str, int]:
         with self.lock:
             return {
                 "slots": self.slots,
@@ -106,8 +112,8 @@ class StageLimiter:
 @dataclass
 class PreparedTextSegment:
     language: str
-    phones: List[int]
-    word2ph: Optional[List[int]]
+    phones: list[int]
+    word2ph: list[int] | None
     norm_text: str
     needs_g2pw: bool = False
 
@@ -129,7 +135,7 @@ class TextPreprocessor:
         self.bert_stage_limiter = bert_stage_limiter
         self.bert_batch_worker = bert_batch_worker
 
-    def snapshot(self) -> Dict[str, object]:
+    def snapshot(self) -> dict[str, object]:
         return {
             "device": str(self.device),
             "bert_stage_limiter": (
@@ -138,7 +144,7 @@ class TextPreprocessor:
             "bert_batch_worker": None if self.bert_batch_worker is None else dict(self.bert_batch_worker.snapshot()),
         }
 
-    def preprocess(self, text: str, lang: str, text_split_method: str, version: str = "v2") -> List[Dict]:
+    def preprocess(self, text: str, lang: str, text_split_method: str, version: str = "v2") -> list[dict]:
         print(f"############ {i18n('切分文本')} ############")
         text = self.replace_consecutive_punctuation(text)
         texts = self.pre_seg_text(text, lang, text_split_method)
@@ -199,12 +205,12 @@ class TextPreprocessor:
         return texts
 
     def segment_and_extract_feature_for_text(
-        self, text: str, language: str, version: str = "v1", profile: Dict | None = None
-    ) -> Tuple[list, torch.Tensor, str]:
+        self, text: str, language: str, version: str = "v1", profile: dict | None = None
+    ) -> tuple[list, torch.Tensor, str]:
         prepared_segments = self.preprocess_text_segments(text, language, version)
         return self.build_phones_and_bert_from_segments(prepared_segments, profile=profile)
 
-    def _split_text_by_language(self, text: str, language: str) -> Tuple[List[str], List[str]]:
+    def _split_text_by_language(self, text: str, language: str) -> tuple[list[str], list[str]]:
         textlist = []
         langlist = []
         if language == "all_zh":
@@ -255,7 +261,7 @@ class TextPreprocessor:
         return textlist, langlist
 
     def get_phones_and_bert(
-        self, text: str, language: str, version: str, final: bool = False, profile: Dict | None = None
+        self, text: str, language: str, version: str, final: bool = False, profile: dict | None = None
     ):
         prepared_segments = self.preprocess_text_segments(text, language, version, final=final)
         return self.build_phones_and_bert_from_segments(prepared_segments, profile=profile)
@@ -265,7 +271,7 @@ class TextPreprocessor:
         text: str,
         language: str,
         text_split_method: str | None,
-    ) -> List[str]:
+    ) -> list[str]:
         raw_text = str(text).strip("\n")
         if not raw_text:
             return []
@@ -281,7 +287,7 @@ class TextPreprocessor:
         version: str,
         text_split_method: str | None = None,
         final: bool = False,
-    ) -> List[PreparedTextSegment]:
+    ) -> list[PreparedTextSegment]:
         split_texts = self._split_texts_for_runtime(text, language, text_split_method)
         if not split_texts:
             return []
@@ -291,20 +297,20 @@ class TextPreprocessor:
         payload_batches = preprocess_text_segments_payload_batch(
             [(item_text, language, version, final) for item_text in split_texts]
         )
-        prepared_segments: List[PreparedTextSegment] = []
+        prepared_segments: list[PreparedTextSegment] = []
         for payloads in payload_batches:
             prepared_segments.extend(self._payloads_to_prepared_segments(payloads))
         return prepared_segments
 
     def preprocess_text_segments_batch(
         self,
-        items: List[Tuple[str, str] | Tuple[str, str, str]],
+        items: list[tuple[str, str] | tuple[str, str, str]],
         version: str,
         final: bool = False,
-    ) -> List[List[PreparedTextSegment]]:
-        expanded_items: List[Tuple[str, str, str, bool]] = []
-        root_indices: List[int] = []
-        results: List[List[PreparedTextSegment]] = [[] for _ in items]
+    ) -> list[list[PreparedTextSegment]]:
+        expanded_items: list[tuple[str, str, str, bool]] = []
+        root_indices: list[int] = []
+        results: list[list[PreparedTextSegment]] = [[] for _ in items]
         for index, item in enumerate(items):
             if len(item) == 2:
                 text, language = item
@@ -324,8 +330,8 @@ class TextPreprocessor:
 
     @staticmethod
     def _payloads_to_prepared_segments(
-        payloads: List[Dict[str, object]],
-    ) -> List[PreparedTextSegment]:
+        payloads: list[dict[str, object]],
+    ) -> list[PreparedTextSegment]:
         return [
             PreparedTextSegment(
                 language=str(payload["language"]),
@@ -339,9 +345,9 @@ class TextPreprocessor:
 
     def resolve_g2pw_segments(
         self,
-        prepared_segments: List[PreparedTextSegment],
-        profile: Dict | None = None,
-    ) -> List[PreparedTextSegment]:
+        prepared_segments: list[PreparedTextSegment],
+        profile: dict | None = None,
+    ) -> list[PreparedTextSegment]:
         zh_indices = [index for index, segment in enumerate(prepared_segments) if bool(segment.needs_g2pw)]
         if not zh_indices:
             return prepared_segments
@@ -362,9 +368,9 @@ class TextPreprocessor:
 
     def resolve_g2pw_segments_batch(
         self,
-        prepared_segment_batches: List[List[PreparedTextSegment]],
-        profiles: List[Dict | None] | None = None,
-    ) -> List[List[PreparedTextSegment]]:
+        prepared_segment_batches: list[list[PreparedTextSegment]],
+        profiles: list[dict | None] | None = None,
+    ) -> list[list[PreparedTextSegment]]:
         if not prepared_segment_batches:
             return prepared_segment_batches
         zh_indices_batches = [
@@ -383,9 +389,9 @@ class TextPreprocessor:
             normalized_segment_batches,
             return_profiles=True,
         )
-        resolved_batches: List[List[PreparedTextSegment]] = []
+        resolved_batches: list[list[PreparedTextSegment]] = []
         if profiles is None:
-            profile_list: List[Dict | None] = [None] * len(prepared_segment_batches)
+            profile_list: list[dict | None] = [None] * len(prepared_segment_batches)
         else:
             profile_list = list(profiles)
             if len(profile_list) < len(prepared_segment_batches):
@@ -409,13 +415,13 @@ class TextPreprocessor:
 
     def build_phones_and_bert_from_segments(
         self,
-        prepared_segments: List[PreparedTextSegment],
-        profile: Dict | None = None,
-    ) -> Tuple[list, torch.Tensor, str]:
+        prepared_segments: list[PreparedTextSegment],
+        profile: dict | None = None,
+    ) -> tuple[list, torch.Tensor, str]:
         prepared_segments = self.resolve_g2pw_segments(prepared_segments, profile=profile)
-        phones_list: List[List[int]] = []
-        bert_list: List[torch.Tensor] = []
-        norm_text_list: List[str] = []
+        phones_list: list[list[int]] = []
+        bert_list: list[torch.Tensor] = []
+        norm_text_list: list[str] = []
         for segment in prepared_segments:
             bert = self.get_bert_inf(
                 segment.phones,
@@ -432,23 +438,25 @@ class TextPreprocessor:
         norm_text = "".join(norm_text_list)
         return phones, bert, norm_text
 
-    def _accumulate_profile(self, profile: Dict | None, key: str, value: float) -> None:
+    def _accumulate_profile(self, profile: dict | None, key: str, value: float) -> None:
         if profile is None:
             return
         profile[key] = float(profile.get(key, 0.0)) + float(value)
 
-    def _update_profile_peak(self, profile: Dict | None, key: str, value: float) -> None:
+    def _update_profile_peak(self, profile: dict | None, key: str, value: float) -> None:
         if profile is None:
             return
         profile[key] = float(max(float(profile.get(key, 0.0)), float(value)))
 
-    def _merge_g2pw_profile(self, profile: Dict | None, g2pw_profile: Dict[str, float]) -> None:
+    def _merge_g2pw_profile(self, profile: dict | None, g2pw_profile: dict[str, float]) -> None:
         self._accumulate_profile(profile, "g2pw_prepare_ms", g2pw_profile.get("g2pw_prepare_ms", 0.0))
         self._accumulate_profile(profile, "g2pw_predict_ms", g2pw_profile.get("g2pw_predict_ms", 0.0))
         self._accumulate_profile(profile, "g2pw_post_ms", g2pw_profile.get("g2pw_post_ms", 0.0))
         self._accumulate_profile(profile, "g2pw_total_ms", g2pw_profile.get("g2pw_total_ms", 0.0))
         self._accumulate_profile(profile, "g2pw_runtime_total_ms", g2pw_profile.get("g2pw_runtime_total_ms", 0.0))
-        self._accumulate_profile(profile, "g2pw_runtime_queue_wait_ms", g2pw_profile.get("g2pw_runtime_queue_wait_ms", 0.0))
+        self._accumulate_profile(
+            profile, "g2pw_runtime_queue_wait_ms", g2pw_profile.get("g2pw_runtime_queue_wait_ms", 0.0)
+        )
         self._accumulate_profile(
             profile,
             "g2pw_runtime_collect_wait_ms",
@@ -471,7 +479,7 @@ class TextPreprocessor:
             g2pw_profile.get("g2pw_runtime_pool_workers", 0.0),
         )
 
-    def _merge_bert_worker_profile(self, profile: Dict | None, worker_profile: Dict[str, float]) -> None:
+    def _merge_bert_worker_profile(self, profile: dict | None, worker_profile: dict[str, float]) -> None:
         self._accumulate_profile(profile, "bert_wait_ms", worker_profile.get("bert_wait_ms", 0.0))
         self._accumulate_profile(profile, "bert_admission_wait_ms", worker_profile.get("bert_admission_wait_ms", 0.0))
         self._accumulate_profile(profile, "bert_queue_wait_ms", worker_profile.get("bert_queue_wait_ms", 0.0))
@@ -494,7 +502,9 @@ class TextPreprocessor:
         self._accumulate_profile(profile, "bert_tokenize_ms", worker_profile.get("bert_tokenize_ms", 0.0))
         self._accumulate_profile(profile, "bert_scatter_ms", worker_profile.get("bert_scatter_ms", 0.0))
         self._accumulate_profile(profile, "bert_calls", worker_profile.get("bert_calls", 1.0))
-        self._update_profile_peak(profile, "bert_stage_inflight_peak", worker_profile.get("bert_stage_inflight_peak", 0.0))
+        self._update_profile_peak(
+            profile, "bert_stage_inflight_peak", worker_profile.get("bert_stage_inflight_peak", 0.0)
+        )
         self._update_profile_peak(profile, "bert_batch_size_peak", worker_profile.get("bert_batch_size", 0.0))
         self._update_profile_peak(profile, "bert_batch_tokens_peak", worker_profile.get("bert_batch_tokens", 0.0))
         self._update_profile_peak(
@@ -507,12 +517,14 @@ class TextPreprocessor:
             "bert_pending_depth_on_collect_peak",
             worker_profile.get("bert_pending_depth_on_collect", 0.0),
         )
-        self._update_profile_peak(profile, "bert_high_pressure_mode_peak", worker_profile.get("bert_high_pressure_mode", 0.0))
+        self._update_profile_peak(
+            profile, "bert_high_pressure_mode_peak", worker_profile.get("bert_high_pressure_mode", 0.0)
+        )
         if profile is not None:
             profile["bert_stage_slots"] = float(worker_profile.get("bert_stage_slots", 0.0))
             profile["bert_batch_window_ms"] = float(worker_profile.get("bert_batch_window_ms", 0.0))
 
-    def _mark_bert_submit_offsets(self, profile: Dict | None) -> None:
+    def _mark_bert_submit_offsets(self, profile: dict | None) -> None:
         if profile is None:
             return
         branch_start_ts = float(profile.get("_branch_start_ts", 0.0) or 0.0)
@@ -523,7 +535,7 @@ class TextPreprocessor:
             profile["bert_submit_offset_first_ms"] = float(offset_ms)
         profile["bert_submit_offset_last_ms"] = float(offset_ms)
 
-    def get_bert_feature(self, text: str, word2ph: list, profile: Dict | None = None) -> torch.Tensor:
+    def get_bert_feature(self, text: str, word2ph: list, profile: dict | None = None) -> torch.Tensor:
         if self.bert_batch_worker is not None:
             self._mark_bert_submit_offsets(profile)
             feature, worker_profile = self.bert_batch_worker.submit(text, word2ph)
@@ -574,10 +586,10 @@ class TextPreprocessor:
     def get_bert_inf(
         self,
         phones: list,
-        word2ph: Optional[list],
+        word2ph: list | None,
         norm_text: str,
         language: str,
-        profile: Dict | None = None,
+        profile: dict | None = None,
     ):
         language = language.replace("all_", "")
         if language == "zh":
@@ -594,12 +606,12 @@ class TextPreprocessor:
 
     async def build_phones_and_bert_from_segments_async(
         self,
-        prepared_segments: List[PreparedTextSegment],
-        profile: Dict | None = None,
-    ) -> Tuple[list, torch.Tensor, str]:
+        prepared_segments: list[PreparedTextSegment],
+        profile: dict | None = None,
+    ) -> tuple[list, torch.Tensor, str]:
         prepared_segments = self.resolve_g2pw_segments(prepared_segments, profile=profile)
         segment_jobs = self._build_async_segment_jobs(prepared_segments, profile)
-        pending_items: List[Tuple[List[torch.Tensor | None], int, Dict | None, asyncio.Future]] = []
+        pending_items: list[tuple[list[torch.Tensor | None], int, dict | None, asyncio.Future]] = []
         for segment_index, segment in enumerate(prepared_segments):
             if segment.language.replace("all_", "") != "zh" or self.bert_batch_worker is None:
                 continue
@@ -616,7 +628,9 @@ class TextPreprocessor:
 
         if pending_items:
             pending_results = await asyncio.gather(*[future for _, _, _, future in pending_items])
-            for (bert_list, bert_index, item_profile, _), (feature, worker_profile) in zip(pending_items, pending_results):
+            for (bert_list, bert_index, item_profile, _), (feature, worker_profile) in zip(
+                pending_items, pending_results
+            ):
                 self._merge_bert_worker_profile(item_profile, worker_profile)
                 bert_list[bert_index] = feature.to(self.device)
 
@@ -624,12 +638,12 @@ class TextPreprocessor:
 
     def _build_async_segment_jobs(
         self,
-        prepared_segments: List[PreparedTextSegment],
-        profile: Dict | None,
-    ) -> Dict[str, List]:
-        phones_list: List[List[int]] = []
-        bert_list: List[torch.Tensor | None] = []
-        norm_text_list: List[str] = []
+        prepared_segments: list[PreparedTextSegment],
+        profile: dict | None,
+    ) -> dict[str, list]:
+        phones_list: list[list[int]] = []
+        bert_list: list[torch.Tensor | None] = []
+        norm_text_list: list[str] = []
 
         for segment in prepared_segments:
             phones_list.append(segment.phones)
@@ -657,7 +671,7 @@ class TextPreprocessor:
         }
 
     @staticmethod
-    def _finalize_async_segment_jobs(segment_jobs: Dict[str, List]) -> Tuple[list, torch.Tensor, str]:
+    def _finalize_async_segment_jobs(segment_jobs: dict[str, list]) -> tuple[list, torch.Tensor, str]:
         bert = torch.cat([feature for feature in segment_jobs["bert_list"] if feature is not None], dim=1)
         phones = sum(segment_jobs["phones_list"], [])
         norm_text = "".join(segment_jobs["norm_text_list"])
@@ -665,16 +679,16 @@ class TextPreprocessor:
 
     async def build_phones_and_bert_pair_from_segments_async(
         self,
-        prompt_segments: List[PreparedTextSegment],
-        target_segments: List[PreparedTextSegment],
-        prompt_profile: Dict | None = None,
-        target_profile: Dict | None = None,
-    ) -> Tuple[Tuple[list, torch.Tensor, str], Tuple[list, torch.Tensor, str]]:
+        prompt_segments: list[PreparedTextSegment],
+        target_segments: list[PreparedTextSegment],
+        prompt_profile: dict | None = None,
+        target_profile: dict | None = None,
+    ) -> tuple[tuple[list, torch.Tensor, str], tuple[list, torch.Tensor, str]]:
         prompt_segments = self.resolve_g2pw_segments(prompt_segments, profile=prompt_profile)
         target_segments = self.resolve_g2pw_segments(target_segments, profile=target_profile)
         prompt_jobs = self._build_async_segment_jobs(prompt_segments, prompt_profile)
         target_jobs = self._build_async_segment_jobs(target_segments, target_profile)
-        pending_items: List[Tuple[List[torch.Tensor | None], int, Dict | None, asyncio.Future]] = []
+        pending_items: list[tuple[list[torch.Tensor | None], int, dict | None, asyncio.Future]] = []
 
         for segment_jobs, prepared_segments, profile in (
             (prompt_jobs, prompt_segments, prompt_profile),

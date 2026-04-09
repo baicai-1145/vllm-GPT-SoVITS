@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Tuple
 
 from pypinyin import Style, pinyin
 
@@ -23,28 +22,28 @@ class G2PMConverter:
         model_dir: str = "G2PWModel/",
         style: str = "pinyin",
         model_source: str | None = None,
-        enable_non_tradional_chinese: bool = False,
+        enable_non_traditional_chinese: bool = False,
     ) -> None:
-        del model_dir, model_source, enable_non_tradional_chinese
+        del model_dir, model_source, enable_non_traditional_chinese
         if style != "pinyin":
             raise ValueError(f"G2PMConverter currently only supports style='pinyin', got {style!r}")
         self.backend = "g2pm"
         self.providers = ["g2pm-stub-pypinyin"]
         self._prewarmed = False
 
-    def _predict_impl(self, sentences: List[str]) -> List[List[str]]:
-        results: List[List[str]] = []
+    def _predict_impl(self, sentences: list[str]) -> list[list[str]]:
+        results: list[list[str]] = []
         for sent in sentences:
             tone3 = pinyin(sent, neutral_tone_with_five=True, style=Style.TONE3)
             results.append([item[0] if item else "" for item in tone3])
         return results
 
-    def __call__(self, sentences: List[str]) -> List[List[str]]:
+    def __call__(self, sentences: list[str]) -> list[list[str]]:
         if isinstance(sentences, str):
             sentences = [sentences]
         return self._predict_impl(list(sentences))
 
-    def predict_sentences_with_profile(self, sentences: List[str]) -> Tuple[List[List[str]], Dict[str, float]]:
+    def predict_sentences_with_profile(self, sentences: list[str]) -> tuple[list[list[str]], dict[str, float]]:
         if isinstance(sentences, str):
             sentences = [sentences]
         started = time.perf_counter()
@@ -65,7 +64,7 @@ class G2PMConverter:
         self._prewarmed = True
         return True
 
-    def snapshot(self) -> Dict[str, object]:
+    def snapshot(self) -> dict[str, object]:
         return {
             "backend": self.backend,
             "providers": list(self.providers),

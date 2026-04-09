@@ -1038,13 +1038,9 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
         for new_req in scheduler_output.scheduled_new_reqs:
-            payload_info = deserialize_additional_information(
-                getattr(new_req, "model_intermediate_buffer", None)
-            )
+            payload_info = deserialize_additional_information(getattr(new_req, "model_intermediate_buffer", None))
             if not payload_info:
-                payload_info = deserialize_additional_information(
-                    getattr(new_req, "additional_information", None)
-                )
+                payload_info = deserialize_additional_information(getattr(new_req, "additional_information", None))
             if isinstance(payload_info, dict) and payload_info:
                 self._update_intermediate_buffer(new_req.req_id, payload_info)
 

@@ -18,7 +18,6 @@ https://zh.wikipedia.org/wiki/中文数字#現代中文
 
 import re
 from collections import OrderedDict
-from typing import List
 
 DIGITS = {str(i): tran for i, tran in enumerate("零一二三四五六七八九")}
 UNITS = OrderedDict(
@@ -257,7 +256,9 @@ def replace_to_range(match) -> str:
 
 
 RE_VERSION_NUM = re.compile(r"((\d+)(\.\d+)(\.\d+)?(\.\d+)+)")
-def replace_vrsion_num(match) -> str:
+
+
+def replace_version_num(match) -> str:
     """
     Args:
         match (re.Match)
@@ -273,8 +274,7 @@ def replace_vrsion_num(match) -> str:
     return result
 
 
-
-def _get_value(value_string: str, use_zero: bool = True) -> List[str]:
+def _get_value(value_string: str, use_zero: bool = True) -> list[str]:
     stripped = value_string.lstrip("0")
     if len(stripped) == 0:
         return []

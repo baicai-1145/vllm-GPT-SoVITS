@@ -7,7 +7,6 @@
 """Residual vector quantizer implementation."""
 
 from dataclasses import dataclass, field
-import typing as tp
 
 import torch
 from torch import nn
@@ -20,7 +19,7 @@ class QuantizedResult:
     quantized: torch.Tensor
     codes: torch.Tensor
     bandwidth: torch.Tensor  # bandwidth in kb/s used, per batch item.
-    penalty: tp.Optional[torch.Tensor] = None
+    penalty: torch.Tensor | None = None
     metrics: dict = field(default_factory=dict)
 
 
@@ -69,18 +68,18 @@ class ResidualVectorQuantizer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        n_q: tp.Optional[int] = None,
-        layers: tp.Optional[list] = None,
+        n_q: int | None = None,
+        layers: list | None = None,
     ) -> QuantizedResult:
         """Residual vector quantization on the given input tensor.
         Args:
             x (torch.Tensor): Input tensor.
             n_q (int): Number of quantizer used to quantize. Default: All quantizers.
-            layers (list): Layer that need to return quantized. Defalt: None.
+            layers (list): Layer that need to return quantized. Default: None.
         Returns:
             QuantizedResult:
                 The quantized (or approximately quantized) representation with
-                the associated numbert quantizers and layer quantized required to return.
+                the associated number quantizers and layer quantized required to return.
         """
         n_q = n_q if n_q else self.n_q
         if layers and max(layers) >= n_q:
@@ -90,7 +89,7 @@ class ResidualVectorQuantizer(nn.Module):
         quantized, codes, commit_loss, quantized_list = self.vq(x, n_q=n_q, layers=layers)
         return quantized, codes, torch.mean(commit_loss), quantized_list
 
-    def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None, st: tp.Optional[int] = None) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, n_q: int | None = None, st: int | None = None) -> torch.Tensor:
         """Encode a given input tensor with the specified sample rate at the given bandwidth.
         The RVQ encode method sets the appropriate number of quantizer to use
         and returns indices for each quantizer.

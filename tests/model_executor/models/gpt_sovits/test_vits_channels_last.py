@@ -6,14 +6,8 @@ from pathlib import Path
 import pytest
 import torch
 
-
 RUNTIME_LIB_ROOT = (
-    Path(__file__).resolve().parents[4]
-    / "vllm_omni"
-    / "model_executor"
-    / "models"
-    / "gpt_sovits"
-    / "runtime_lib"
+    Path(__file__).resolve().parents[4] / "vllm_omni" / "model_executor" / "models" / "gpt_sovits" / "runtime_lib"
 )
 GPT_SOVITS_ROOT = RUNTIME_LIB_ROOT / "GPT_SoVITS"
 for path in (RUNTIME_LIB_ROOT, GPT_SOVITS_ROOT):
@@ -33,9 +27,7 @@ def test_resblock1_forward_channels_last_matches_forward():
 
     x = torch.randn((2, 32, 128), device="cuda", dtype=torch.float16)
     expected = block(x)
-    actual = block.forward_channels_last(
-        x.unsqueeze(2).contiguous(memory_format=torch.channels_last)
-    ).squeeze(2)
+    actual = block.forward_channels_last(x.unsqueeze(2).contiguous(memory_format=torch.channels_last)).squeeze(2)
 
     assert torch.allclose(expected, actual, atol=5e-3, rtol=5e-3)
 
@@ -44,17 +36,22 @@ def test_resblock1_forward_channels_last_matches_forward():
 def test_generator_channels_last_resblocks_matches_default(monkeypatch):
     monkeypatch.setenv("GPTSOVITS_VITS_DECODER_CHANNELS_LAST_RESBLOCK", "1")
     torch.manual_seed(1234)
-    generator = gpt_models.Generator(
-        initial_channel=8,
-        resblock="1",
-        resblock_kernel_sizes=[3, 7, 11],
-        resblock_dilation_sizes=[(1, 3, 5), (1, 3, 5), (1, 3, 5)],
-        upsample_rates=[2, 2],
-        upsample_initial_channel=32,
-        upsample_kernel_sizes=[4, 4],
-        gin_channels=4,
-        is_bias=True,
-    ).cuda().half().eval()
+    generator = (
+        gpt_models.Generator(
+            initial_channel=8,
+            resblock="1",
+            resblock_kernel_sizes=[3, 7, 11],
+            resblock_dilation_sizes=[(1, 3, 5), (1, 3, 5), (1, 3, 5)],
+            upsample_rates=[2, 2],
+            upsample_initial_channel=32,
+            upsample_kernel_sizes=[4, 4],
+            gin_channels=4,
+            is_bias=True,
+        )
+        .cuda()
+        .half()
+        .eval()
+    )
     generator.remove_weight_norm()
 
     x = torch.randn((2, 8, 24), device="cuda", dtype=torch.float16)
@@ -72,17 +69,22 @@ def test_generator_channels_last_resblocks_matches_default(monkeypatch):
 def test_generator_forward_profiled_records_channels_last_stage_metrics(monkeypatch):
     monkeypatch.setenv("GPTSOVITS_VITS_DECODER_CHANNELS_LAST_RESBLOCK", "1")
     torch.manual_seed(1234)
-    generator = gpt_models.Generator(
-        initial_channel=8,
-        resblock="1",
-        resblock_kernel_sizes=[3, 7, 11],
-        resblock_dilation_sizes=[(1, 3, 5), (1, 3, 5), (1, 3, 5)],
-        upsample_rates=[2, 2],
-        upsample_initial_channel=32,
-        upsample_kernel_sizes=[4, 4],
-        gin_channels=4,
-        is_bias=True,
-    ).cuda().half().eval()
+    generator = (
+        gpt_models.Generator(
+            initial_channel=8,
+            resblock="1",
+            resblock_kernel_sizes=[3, 7, 11],
+            resblock_dilation_sizes=[(1, 3, 5), (1, 3, 5), (1, 3, 5)],
+            upsample_rates=[2, 2],
+            upsample_initial_channel=32,
+            upsample_kernel_sizes=[4, 4],
+            gin_channels=4,
+            is_bias=True,
+        )
+        .cuda()
+        .half()
+        .eval()
+    )
     generator.remove_weight_norm()
 
     x = torch.randn((2, 8, 24), device="cuda", dtype=torch.float16)

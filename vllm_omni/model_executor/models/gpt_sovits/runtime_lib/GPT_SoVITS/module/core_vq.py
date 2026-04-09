@@ -33,15 +33,15 @@
 
 import typing as tp
 
-from einops import rearrange, repeat
 import torch
-from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
-
-from module.distrib import broadcast_tensors, is_distributed
-from module.ddp_utils import SyncFunction
+import torch.nn.functional as F
+from einops import rearrange
+from torch import nn
 from tqdm import tqdm
+
+from module.ddp_utils import SyncFunction
+from module.distrib import broadcast_tensors, is_distributed
 
 
 def default(val: tp.Any, d: tp.Any) -> tp.Any:
@@ -75,7 +75,7 @@ def sample_vectors(samples, num: int):
 
 def kmeans(samples, num_clusters: int, num_iters: int = 10, frames_to_use: int = 10_000, batch_size: int = 64):
     N, D = samples.shape
-    dtype, device = samples.dtype, samples.device
+    _dtype, device = samples.dtype, samples.device
 
     if frames_to_use < N:
         indices = torch.randperm(N, device=device)[:frames_to_use]
@@ -97,7 +97,7 @@ def kmeans(samples, num_clusters: int, num_iters: int = 10, frames_to_use: int =
         buckets = torch.cat(all_assignments, dim=0)  # [N]
         bins = torch.bincount(buckets, minlength=num_clusters)
         zero_mask = bins == 0
-        bins_min_clamped = bins.masked_fill(zero_mask, 1)
+        bins.masked_fill(zero_mask, 1)
 
         # Compute new means
         new_means = torch.zeros_like(means)
@@ -139,7 +139,7 @@ class EuclideanCodebook(nn.Module):
     ):
         super().__init__()
         self.decay = decay
-        init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = uniform_init if not kmeans_init else torch.zeros
+        init_fn: tp.Callable[..., torch.Tensor] | tp.Any = uniform_init if not kmeans_init else torch.zeros
         embed = init_fn(codebook_size, dim)
 
         self.codebook_size = codebook_size
@@ -289,7 +289,7 @@ class VectorQuantization(nn.Module):
         self,
         dim: int,
         codebook_size: int,
-        codebook_dim: tp.Optional[int] = None,
+        codebook_dim: int | None = None,
         decay: float = 0.99,
         epsilon: float = 1e-5,
         kmeans_init: bool = True,
@@ -365,7 +365,7 @@ class ResidualVectorQuantization(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([VectorQuantization(**kwargs) for _ in range(num_quantizers)])
 
-    def forward(self, x, n_q: tp.Optional[int] = None, layers: tp.Optional[list] = None):
+    def forward(self, x, n_q: int | None = None, layers: list | None = None):
         quantized_out = 0.0
         residual = x
 
@@ -388,7 +388,7 @@ class ResidualVectorQuantization(nn.Module):
         out_losses, out_indices = map(torch.stack, (all_losses, all_indices))
         return quantized_out, out_indices, out_losses, out_quantized
 
-    def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None, st: tp.Optional[int] = None) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, n_q: int | None = None, st: int | None = None) -> torch.Tensor:
         residual = x
         all_indices = []
         n_q = n_q or len(self.layers)

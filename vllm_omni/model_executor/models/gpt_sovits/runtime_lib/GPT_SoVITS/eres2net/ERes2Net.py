@@ -8,17 +8,18 @@ The local feature fusion (LFF) fuses the features within one single residual blo
 The global feature fusion (GFF) takes acoustic features of different scales as input to aggregate global signal.
 """
 
-import torch
 import math
+
+import pooling_layers as pooling_layers
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pooling_layers as pooling_layers
 from fusion import AFF
 
 
 class ReLU(nn.Hardtanh):
     def __init__(self, inplace=False):
-        super(ReLU, self).__init__(0, 20, inplace)
+        super().__init__(0, 20, inplace)
 
     def __repr__(self):
         inplace_str = "inplace" if self.inplace else ""
@@ -29,7 +30,7 @@ class BasicBlockERes2Net(nn.Module):
     expansion = 2
 
     def __init__(self, in_planes, planes, stride=1, baseWidth=32, scale=2):
-        super(BasicBlockERes2Net, self).__init__()
+        super().__init__()
         width = int(math.floor(planes * (baseWidth / 64.0)))
         self.conv1 = nn.Conv2d(in_planes, width * scale, kernel_size=1, stride=stride, bias=False)
         self.bn1 = nn.BatchNorm2d(width * scale)
@@ -89,7 +90,7 @@ class BasicBlockERes2Net_diff_AFF(nn.Module):
     expansion = 2
 
     def __init__(self, in_planes, planes, stride=1, baseWidth=32, scale=2):
-        super(BasicBlockERes2Net_diff_AFF, self).__init__()
+        super().__init__()
         width = int(math.floor(planes * (baseWidth / 64.0)))
         self.conv1 = nn.Conv2d(in_planes, width * scale, kernel_size=1, stride=stride, bias=False)
         self.bn1 = nn.BatchNorm2d(width * scale)
@@ -163,7 +164,7 @@ class ERes2Net(nn.Module):
         pooling_func="TSTP",
         two_emb_layer=False,
     ):
-        super(ERes2Net, self).__init__()
+        super().__init__()
         self.in_planes = m_channels
         self.feat_dim = feat_dim
         self.embedding_size = embedding_size
@@ -261,4 +262,4 @@ if __name__ == "__main__":
     print(out.shape)  # torch.Size([10, 192])
 
     num_params = sum(param.numel() for param in model.parameters())
-    print("{} M".format(num_params / 1e6))  # 6.61M
+    print(f"{num_params / 1e6} M")  # 6.61M

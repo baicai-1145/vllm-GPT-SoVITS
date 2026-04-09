@@ -2,9 +2,9 @@ import importlib.util
 import os
 import sysconfig
 import threading
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
-
+from typing import Any
 
 _ROOT_DIR = Path(__file__).resolve().parents[2]
 _SOURCE_PATH = Path(__file__).resolve().with_name("split_fastpath.cpp")

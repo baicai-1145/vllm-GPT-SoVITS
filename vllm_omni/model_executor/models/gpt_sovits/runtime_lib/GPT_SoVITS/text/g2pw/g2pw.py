@@ -1,13 +1,13 @@
 # This code is modified from https://github.com/mozillazg/pypinyin-g2pW
 
-import pickle
 import os
+import pickle
 
 from pypinyin.constants import RE_HANS
+from pypinyin.contrib.tone_convert import to_tone
+from pypinyin.converter import UltimateConverter
 from pypinyin.core import Pinyin, Style
 from pypinyin.seg.simpleseg import simple_seg
-from pypinyin.converter import UltimateConverter
-from pypinyin.contrib.tone_convert import to_tone
 
 current_file_path = os.path.dirname(__file__)
 CACHE_PATH = os.path.join(current_file_path, "polyphonic.pickle")
@@ -36,7 +36,7 @@ class G2PWPinyin(Pinyin):
         self,
         model_dir="G2PWModel/",
         model_source=None,
-        enable_non_tradional_chinese=True,
+        enable_non_traditional_chinese=True,
         v_to_u=False,
         neutral_tone_with_five=False,
         tone_sandhi=False,
@@ -57,7 +57,7 @@ class G2PWPinyin(Pinyin):
                     model_dir=model_dir,
                     style="pinyin",
                     model_source=model_source,
-                    enable_non_tradional_chinese=enable_non_tradional_chinese,
+                    enable_non_traditional_chinese=enable_non_traditional_chinese,
                 )
             except Exception as exc:
                 last_error = exc
@@ -72,7 +72,7 @@ class G2PWPinyin(Pinyin):
                         model_dir=model_dir,
                         style="pinyin",
                         model_source=model_source,
-                        enable_non_tradional_chinese=enable_non_tradional_chinese,
+                        enable_non_traditional_chinese=enable_non_traditional_chinese,
                     )
                 except Exception as exc:
                     last_error = exc
@@ -88,7 +88,7 @@ class G2PWPinyin(Pinyin):
                         model_dir=model_dir,
                         style="pinyin",
                         model_source=model_source,
-                        enable_non_tradional_chinese=enable_non_tradional_chinese,
+                        enable_non_traditional_chinese=enable_non_traditional_chinese,
                     )
                     if last_error is not None:
                         print(f"[g2pw] cuda backend unavailable, fallback to onnx: {last_error}")
@@ -117,7 +117,7 @@ class G2PWPinyin(Pinyin):
 
 class Converter(UltimateConverter):
     def __init__(self, g2pw_instance, v_to_u=False, neutral_tone_with_five=False, tone_sandhi=False, **kwargs):
-        super(Converter, self).__init__(
+        super().__init__(
             v_to_u=v_to_u, neutral_tone_with_five=neutral_tone_with_five, tone_sandhi=tone_sandhi, **kwargs
         )
 
@@ -144,16 +144,16 @@ class Converter(UltimateConverter):
         pinyins = []
 
         if self._g2pw is None:
-            return super(Converter, self).convert(han, Style.TONE, heteronym, errors, strict, **kwargs)
+            return super().convert(han, Style.TONE, heteronym, errors, strict, **kwargs)
 
         g2pw_pinyin = self._g2pw(han)
 
         if not g2pw_pinyin:  # g2pw 不支持的汉字改为使用 pypinyin 原有逻辑
-            return super(Converter, self).convert(han, Style.TONE, heteronym, errors, strict, **kwargs)
+            return super().convert(han, Style.TONE, heteronym, errors, strict, **kwargs)
 
         for i, item in enumerate(g2pw_pinyin[0]):
             if item is None:  # g2pw 不支持的汉字改为使用 pypinyin 原有逻辑
-                py = super(Converter, self).convert(han[i], Style.TONE, heteronym, errors, strict, **kwargs)
+                py = super().convert(han[i], Style.TONE, heteronym, errors, strict, **kwargs)
                 pinyins.extend(py)
             else:
                 pinyins.append([to_tone(item)])

@@ -16,11 +16,6 @@ Credits
     This code is modified from https://github.com/GitYCC/g2pW
 """
 
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Tuple
-
 import numpy as np
 
 from .utils import tokenize_and_map
@@ -30,17 +25,17 @@ ANCHOR_CHAR = "▁"
 
 def prepare_onnx_input(
     tokenizer,
-    labels: List[str],
-    char2phonemes: Dict[str, List[int]],
-    chars: List[str],
-    texts: List[str],
-    query_ids: List[int],
+    labels: list[str],
+    char2phonemes: dict[str, list[int]],
+    chars: list[str],
+    texts: list[str],
+    query_ids: list[int],
     use_mask: bool = False,
     window_size: int = None,
     max_len: int = 512,
-    char2id: Optional[Dict[str, int]] = None,
-    char_phoneme_masks: Optional[Dict[str, List[int]]] = None,
-) -> Dict[str, np.array]:
+    char2id: dict[str, int] | None = None,
+    char_phoneme_masks: dict[str, list[int]] | None = None,
+) -> dict[str, np.array]:
     if window_size is not None:
         truncated_texts, truncated_query_ids = _truncate_texts(
             window_size=window_size, texts=texts, query_ids=query_ids
@@ -58,8 +53,7 @@ def prepare_onnx_input(
     if use_mask:
         if char_phoneme_masks is None:
             char_phoneme_masks = {
-                char: [1 if i in char2phonemes[char] else 0 for i in range(len(labels))]
-                for char in char2phonemes
+                char: [1 if i in char2phonemes[char] else 0 for i in range(len(labels))] for char in char2phonemes
             }
     else:
         full_phoneme_mask = [1] * len(labels)
@@ -157,7 +151,7 @@ def prepare_onnx_input(
     return outputs
 
 
-def _truncate_texts(window_size: int, texts: List[str], query_ids: List[int]) -> Tuple[List[str], List[int]]:
+def _truncate_texts(window_size: int, texts: list[str], query_ids: list[int]) -> tuple[list[str], list[int]]:
     truncated_texts = []
     truncated_query_ids = []
     for text, query_id in zip(texts, query_ids):
@@ -172,7 +166,7 @@ def _truncate_texts(window_size: int, texts: List[str], query_ids: List[int]) ->
 
 
 def _truncate(
-    max_len: int, text: str, query_id: int, tokens: List[str], text2token: List[int], token2text: List[Tuple[int]]
+    max_len: int, text: str, query_id: int, tokens: list[str], text2token: list[int], token2text: list[tuple[int]]
 ):
     truncate_len = max_len - 2
     if len(tokens) <= truncate_len:
@@ -203,7 +197,7 @@ def _truncate(
     )
 
 
-def get_phoneme_labels(polyphonic_chars: List[List[str]]) -> Tuple[List[str], Dict[str, List[int]]]:
+def get_phoneme_labels(polyphonic_chars: list[list[str]]) -> tuple[list[str], dict[str, list[int]]]:
     labels = sorted(list(set([phoneme for char, phoneme in polyphonic_chars])))
     char2phonemes = {}
     for char, phoneme in polyphonic_chars:
@@ -213,7 +207,7 @@ def get_phoneme_labels(polyphonic_chars: List[List[str]]) -> Tuple[List[str], Di
     return labels, char2phonemes
 
 
-def get_char_phoneme_labels(polyphonic_chars: List[List[str]]) -> Tuple[List[str], Dict[str, List[int]]]:
+def get_char_phoneme_labels(polyphonic_chars: list[list[str]]) -> tuple[list[str], dict[str, list[int]]]:
     labels = sorted(list(set([f"{char} {phoneme}" for char, phoneme in polyphonic_chars])))
     char2phonemes = {}
     for char, phoneme in polyphonic_chars:

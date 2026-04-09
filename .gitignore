@@ -253,3 +253,9 @@ vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/text/*.rep
 vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/text/*.pickle
 vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/text/g2pw/*.rep
 vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/text/g2pw/*.pickle
+vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/pretrained_models
+vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/text/G2PWModel
+vllm_omni/model_executor/models/gpt_sovits/runtime_lib/GPT_SoVITS/text/ja_userdic
+vllm_omni/model_executor/models/gpt_sovits/runtime_lib/third_party/g2pw-cu
+vllm_omni/model_executor/models/gpt_sovits/runtime_lib/third_party/split-lang
+/TEMP/

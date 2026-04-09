@@ -26,12 +26,17 @@ import torch
 
 from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSRuntime
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TEMP_ROOT = REPO_ROOT / "TEMP"
 DEFAULT_PROJECT_ROOT = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "gpt_sovits" / "runtime_lib"
 DEFAULT_CONFIG_PATH = (
-    REPO_ROOT / "tests" / "model_executor" / "models" / "gpt_sovits" / "fixtures" / "tts_infer_v2proplus_cuda_longprompt.yaml"
+    REPO_ROOT
+    / "tests"
+    / "model_executor"
+    / "models"
+    / "gpt_sovits"
+    / "fixtures"
+    / "tts_infer_v2proplus_cuda_longprompt.yaml"
 )
 DEFAULT_REF_AUDIO = REPO_ROOT / "test.wav"
 DEFAULT_REF_TEXT = "又或者说，你已经察觉到了…却还想拿「它」干什么好事？"
@@ -187,7 +192,10 @@ def build_argparser() -> argparse.ArgumentParser:
         "--prepared-cache",
         type=Path,
         default=None,
-        help="Optional torch cache path for the prepared decode request. If the file exists it will be loaded; otherwise it will be built and saved.",
+        help=(
+            "Optional torch cache path for the prepared decode request. "
+            "If the file exists it will be loaded; otherwise it will be built and saved."
+        ),
     )
     parser.add_argument("--segment-decode-bucketing", choices=["0", "1"], default=None)
     parser.add_argument("--segment-decode-max-batch", default=None)
@@ -199,7 +207,9 @@ def build_argparser() -> argparse.ArgumentParser:
         "--runtime-cache-root",
         type=Path,
         default=None,
-        help="Optional runtime cache root for TorchInductor/Triton. Useful when the default cache path has quota issues.",
+        help=(
+            "Optional runtime cache root for TorchInductor/Triton. Useful when the default cache path has quota issues."
+        ),
     )
     return parser
 

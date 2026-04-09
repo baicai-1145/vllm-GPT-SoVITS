@@ -44,19 +44,14 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False
             )
         except:
             traceback.print_exc()
-            print("error, %s is not in the checkpoint" % k)  # shape不对也会，比如text_embedding当cleaner修改时
+            print(f"error, {k} is not in the checkpoint")  # shape不对也会，比如text_embedding当cleaner修改时
             new_state_dict[k] = v
     if hasattr(model, "module"):
         model.module.load_state_dict(new_state_dict)
     else:
         model.load_state_dict(new_state_dict)
     print("load ")
-    logger.info(
-        "Loaded checkpoint '{}' (iteration {})".format(
-            checkpoint_path,
-            iteration,
-        )
-    )
+    logger.info(f"Loaded checkpoint '{checkpoint_path}' (iteration {iteration})")
     return model, optimizer, learning_rate, iteration
 
 
@@ -67,13 +62,13 @@ from time import time as ttime
 def my_save(fea, path):  #####fix issue: torch.save doesn't support chinese path
     dir = os.path.dirname(path)
     name = os.path.basename(path)
-    tmp_path = "%s.pth" % (ttime())
+    tmp_path = f"{ttime()}.pth"
     torch.save(fea, tmp_path)
-    shutil.move(tmp_path, "%s/%s" % (dir, name))
+    shutil.move(tmp_path, f"{dir}/{name}")
 
 
 def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path):
-    logger.info("Saving model and optimizer state at iteration {} to {}".format(iteration, checkpoint_path))
+    logger.info(f"Saving model and optimizer state at iteration {iteration} to {checkpoint_path}")
     if hasattr(model, "module"):
         state_dict = model.module.state_dict()
     else:
@@ -205,13 +200,13 @@ def get_hparams(init=True, stage=1):
         help="resume step",
     )
     # parser.add_argument('-e', '--exp_dir', type=str, required=False,default=None,help='experiment directory')
-    # parser.add_argument('-g', '--pretrained_s2G', type=str, required=False,default=None,help='pretrained sovits gererator weights')
+    # parser.add_argument('-g', '--pretrained_s2G', type=str, required=False,default=None,help='pretrained sovits generator weights')
     # parser.add_argument('-d', '--pretrained_s2D', type=str, required=False,default=None,help='pretrained sovits discriminator weights')
 
     args = parser.parse_args()
 
     config_path = args.config
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         data = f.read()
     config = json.loads(data)
 
@@ -245,24 +240,29 @@ def clean_checkpoints(path_to_models="logs/44k/", n_ckpts_to_keep=2, sort_by_tim
     import re
 
     ckpts_files = [f for f in os.listdir(path_to_models) if os.path.isfile(os.path.join(path_to_models, f))]
-    name_key = lambda _f: int(re.compile("._(\d+)\.pth").match(_f).group(1))
-    time_key = lambda _f: os.path.getmtime(os.path.join(path_to_models, _f))
+    def name_key(_f):
+        return int(re.compile(r"._(\d+)\.pth").match(_f).group(1))
+    def time_key(_f):
+        return os.path.getmtime(os.path.join(path_to_models, _f))
     sort_key = time_key if sort_by_time else name_key
-    x_sorted = lambda _x: sorted(
-        [f for f in ckpts_files if f.startswith(_x) and not f.endswith("_0.pth")],
-        key=sort_key,
-    )
+    def x_sorted(_x):
+        return sorted(
+            [f for f in ckpts_files if f.startswith(_x) and not f.endswith("_0.pth")],
+            key=sort_key,
+        )
     to_del = [
         os.path.join(path_to_models, fn) for fn in (x_sorted("G")[:-n_ckpts_to_keep] + x_sorted("D")[:-n_ckpts_to_keep])
     ]
-    del_info = lambda fn: logger.info(f".. Free up space by deleting ckpt {fn}")
-    del_routine = lambda x: [os.remove(x), del_info(x)]
-    rs = [del_routine(fn) for fn in to_del]
+    def del_info(fn):
+        return logger.info(f".. Free up space by deleting ckpt {fn}")
+    def del_routine(x):
+        return [os.remove(x), del_info(x)]
+    [del_routine(fn) for fn in to_del]
 
 
 def get_hparams_from_dir(model_dir):
     config_save_path = os.path.join(model_dir, "config.json")
-    with open(config_save_path, "r") as f:
+    with open(config_save_path) as f:
         data = f.read()
     config = json.loads(data)
 
@@ -272,7 +272,7 @@ def get_hparams_from_dir(model_dir):
 
 
 def get_hparams_from_file(config_path):
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         data = f.read()
     config = json.loads(data)
 
@@ -283,11 +283,7 @@ def get_hparams_from_file(config_path):
 def check_git_hash(model_dir):
     source_dir = os.path.dirname(os.path.realpath(__file__))
     if not os.path.exists(os.path.join(source_dir, ".git")):
-        logger.warning(
-            "{} is not a git repository, therefore hash value comparison will be ignored.".format(
-                source_dir,
-            )
-        )
+        logger.warning(f"{source_dir} is not a git repository, therefore hash value comparison will be ignored.")
         return
 
     cur_hash = subprocess.getoutput("git rev-parse HEAD")
@@ -296,12 +292,7 @@ def check_git_hash(model_dir):
     if os.path.exists(path):
         saved_hash = open(path).read()
         if saved_hash != cur_hash:
-            logger.warning(
-                "git hash values are different. {}(saved) != {}(current)".format(
-                    saved_hash[:8],
-                    cur_hash[:8],
-                )
-            )
+            logger.warning(f"git hash values are different. {saved_hash[:8]}(saved) != {cur_hash[:8]}(current)")
     else:
         open(path, "w").write(cur_hash)
 

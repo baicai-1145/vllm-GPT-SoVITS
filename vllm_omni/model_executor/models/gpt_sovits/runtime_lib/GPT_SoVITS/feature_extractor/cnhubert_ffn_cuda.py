@@ -1,14 +1,12 @@
 import os
 import pathlib
-from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.utils import cpp_extension
 
-
 _EXTENSION = None
-_EXTENSION_ERROR: Optional[Exception] = None
+_EXTENSION_ERROR: Exception | None = None
 _EXTENSION_LOAD_ATTEMPTED = False
 
 

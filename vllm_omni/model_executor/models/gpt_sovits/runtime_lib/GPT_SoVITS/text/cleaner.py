@@ -1,12 +1,13 @@
-from text import cleaned_text_to_sequence
 import os
+
+from text import cleaned_text_to_sequence
+
 # if os.environ.get("version","v1")=="v1":
 #     from text import chinese
 #     from text.symbols import symbols
 # else:
 #     from text import chinese2 as chinese
 #     from text.symbols2 import symbols
-
 from text import symbols as symbols_v1
 from text import symbols2 as symbols_v2
 
@@ -25,11 +26,9 @@ def clean_text(text, language, version=None):
     if version is None:
         version = os.environ.get("version", "v2")
     if version == "v1":
-        symbols = symbols_v1.symbols
         symbols_set = _SYMBOLS_SET_V1
         language_module_map = {"zh": "chinese", "ja": "japanese", "en": "english"}
     else:
-        symbols = symbols_v2.symbols
         symbols_set = _SYMBOLS_SET_V2
         language_module_map = {"zh": "chinese2", "ja": "japanese", "en": "english", "ko": "korean", "yue": "cantonese"}
 

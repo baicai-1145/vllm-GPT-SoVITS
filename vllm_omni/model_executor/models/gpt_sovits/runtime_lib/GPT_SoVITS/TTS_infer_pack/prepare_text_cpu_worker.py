@@ -3,8 +3,9 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Sequence, Tuple
+from typing import Any
 
 
 @dataclass
@@ -25,14 +26,14 @@ class TextCpuTask:
     done_future: asyncio.Future | None = None
     result: Any = None
     error: Exception | None = None
-    profile: Dict[str, float] = field(default_factory=dict)
+    profile: dict[str, float] = field(default_factory=dict)
 
 
 class PrepareTextCpuWorker:
     def __init__(
         self,
         process_fn: Callable[[str, str, str], Any] | None = None,
-        batch_process_fn: Callable[[Sequence[Tuple[str, str, str]]], Sequence[Any]] | None = None,
+        batch_process_fn: Callable[[Sequence[tuple[str, str, str]]], Sequence[Any]] | None = None,
         worker_count: int = 1,
         batch_window_ms: int = 0,
         max_batch_items: int = 1,
@@ -41,7 +42,7 @@ class PrepareTextCpuWorker:
         high_pressure_max_batch_items: int | None = None,
         max_pending_tasks: int = 0,
         admission_poll_ms: int = 1,
-        admission_controller: Callable[[], Dict[str, float | int | bool]] | None = None,
+        admission_controller: Callable[[], dict[str, float | int | bool]] | None = None,
         large_batch_priority: bool = True,
         min_batch_window_ms: int = 2,
         min_high_pressure_batch_window_ms: int | None = None,
@@ -54,8 +55,10 @@ class PrepareTextCpuWorker:
         self.max_batch_items = max(1, int(max_batch_items))
         self.large_batch_priority = bool(large_batch_priority)
         self.min_batch_window_ms = max(0, int(min_batch_window_ms))
-        hp_min_window_ms = self.min_batch_window_ms if min_high_pressure_batch_window_ms is None else int(
-            min_high_pressure_batch_window_ms
+        hp_min_window_ms = (
+            self.min_batch_window_ms
+            if min_high_pressure_batch_window_ms is None
+            else int(min_high_pressure_batch_window_ms)
         )
         self.min_high_pressure_batch_window_ms = max(0, hp_min_window_ms)
         self.batch_window_ms = self._resolve_effective_batch_window_ms(
@@ -71,7 +74,9 @@ class PrepareTextCpuWorker:
             else max(self.max_batch_items * 2, 64),
         )
         hp_items = self.max_batch_items if high_pressure_max_batch_items is None else int(high_pressure_max_batch_items)
-        hp_window_ms = self.batch_window_ms if high_pressure_batch_window_ms is None else int(high_pressure_batch_window_ms)
+        hp_window_ms = (
+            self.batch_window_ms if high_pressure_batch_window_ms is None else int(high_pressure_batch_window_ms)
+        )
         self.high_pressure_max_batch_items = max(self.max_batch_items, hp_items)
         self.high_pressure_batch_window_ms = self._resolve_effective_batch_window_ms(
             hp_window_ms,
@@ -84,7 +89,7 @@ class PrepareTextCpuWorker:
         self.admission_controller = admission_controller
 
         self.condition = threading.Condition()
-        self.pending_tasks: Deque[TextCpuTask] = deque()
+        self.pending_tasks: deque[TextCpuTask] = deque()
         self.pending_peak = 0
         self.total_submitted = 0
         self.total_finished = 0
@@ -126,7 +131,7 @@ class PrepareTextCpuWorker:
             return True
         return (len(self.pending_tasks) + self.active_tasks + max(0, int(task_count)) - 1) < self.max_pending_tasks
 
-    def _get_admission_state(self) -> Dict[str, float | int | bool]:
+    def _get_admission_state(self) -> dict[str, float | int | bool]:
         if self.admission_controller is None:
             return {"blocked": False}
         try:
@@ -194,7 +199,7 @@ class PrepareTextCpuWorker:
     async def _enqueue_task_async(self, task: TextCpuTask) -> None:
         await self._enqueue_tasks_async([task])
 
-    def submit(self, text: str, language: str, text_split_method: str = "cut1") -> Tuple[Any, Dict[str, float]]:
+    def submit(self, text: str, language: str, text_split_method: str = "cut1") -> tuple[Any, dict[str, float]]:
         task = TextCpuTask(text=str(text), language=str(language), text_split_method=str(text_split_method))
         asyncio.run(self._enqueue_task_async(task))
         task.done_event.wait()
@@ -207,7 +212,7 @@ class PrepareTextCpuWorker:
         text: str,
         language: str,
         text_split_method: str = "cut1",
-    ) -> Tuple[Any, Dict[str, float]]:
+    ) -> tuple[Any, dict[str, float]]:
         loop = asyncio.get_running_loop()
         task = TextCpuTask(
             text=str(text),
@@ -219,11 +224,13 @@ class PrepareTextCpuWorker:
         await self._enqueue_task_async(task)
         return await task.done_future
 
-    async def submit_many_async(self, items: Sequence[Tuple[str, str] | Tuple[str, str, str]]) -> List[Tuple[Any, Dict[str, float]]]:
+    async def submit_many_async(
+        self, items: Sequence[tuple[str, str] | tuple[str, str, str]]
+    ) -> list[tuple[Any, dict[str, float]]]:
         if not items:
             return []
         loop = asyncio.get_running_loop()
-        normalized_items: List[Tuple[str, str, str]] = []
+        normalized_items: list[tuple[str, str, str]] = []
         for item in items:
             if len(item) == 2:
                 text, language = item
@@ -262,7 +269,7 @@ class PrepareTextCpuWorker:
         except RuntimeError:
             pass
 
-    def snapshot(self) -> Dict[str, int | float]:
+    def snapshot(self) -> dict[str, int | float]:
         with self.condition:
             return {
                 "worker_count": int(self.worker_count),
@@ -295,17 +302,16 @@ class PrepareTextCpuWorker:
                 "backpressure_blocked_total": int(self.backpressure_blocked_total),
             }
 
-    def _select_batch_policy_locked(self) -> Tuple[float, int, bool]:
+    def _select_batch_policy_locked(self) -> tuple[float, int, bool]:
         pending_depth = len(self.pending_tasks)
         use_high_pressure = (
-            self.high_pressure_pending_threshold > 0
-            and pending_depth >= self.high_pressure_pending_threshold
+            self.high_pressure_pending_threshold > 0 and pending_depth >= self.high_pressure_pending_threshold
         )
         if use_high_pressure:
             return self.high_pressure_batch_window_s, self.high_pressure_max_batch_items, True
         return self.batch_window_s, self.max_batch_items, False
 
-    def _collect_batch(self) -> Tuple[List[TextCpuTask], bool]:
+    def _collect_batch(self) -> tuple[list[TextCpuTask], bool]:
         with self.condition:
             while not self.pending_tasks:
                 self.condition.wait()
@@ -313,7 +319,7 @@ class PrepareTextCpuWorker:
             batch_window_s, max_batch_items, use_high_pressure = self._select_batch_policy_locked()
             first_task = self.pending_tasks.popleft()
             first_task.batch_popped_at = time.perf_counter()
-            batch: List[TextCpuTask] = [first_task]
+            batch: list[TextCpuTask] = [first_task]
             deadline = time.perf_counter() + batch_window_s
 
             while len(batch) < max_batch_items:
@@ -356,7 +362,7 @@ class PrepareTextCpuWorker:
             self.total_finished += len(batch)
             self.condition.notify_all()
 
-    def _run_batch(self, batch: List[TextCpuTask], use_high_pressure: bool) -> None:
+    def _run_batch(self, batch: list[TextCpuTask], use_high_pressure: bool) -> None:
         batch_collected_ts = time.perf_counter()
         batch_started = time.perf_counter()
         try:
@@ -373,9 +379,7 @@ class PrepareTextCpuWorker:
                 except TypeError:
                     results = [self.process_fn(task.text, task.language) for task in batch]  # type: ignore[misc]
             if len(results) != len(batch):
-                raise RuntimeError(
-                    f"text cpu batch 结果数量不匹配: expected={len(batch)} actual={len(results)}"
-                )
+                raise RuntimeError(f"text cpu batch 结果数量不匹配: expected={len(batch)} actual={len(results)}")
             batch_finished = time.perf_counter()
             batch_run_ms = max(0.0, (batch_finished - batch_started) * 1000.0)
             for task, result in zip(batch, results):

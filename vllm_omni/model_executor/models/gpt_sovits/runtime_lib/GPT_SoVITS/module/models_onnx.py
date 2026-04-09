@@ -1,23 +1,20 @@
 import math
-from typing import Optional
+
 import torch
-from torch import nn
-from torch.nn import functional as F
-
-from module import commons
-from module import modules
-from module import attentions_onnx as attentions
-
 from f5_tts.model import DiT
-
-from torch.nn import Conv1d, ConvTranspose1d, Conv2d
-from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
-from module.commons import init_weights, get_padding
-from module.quantize import ResidualVectorQuantizer
 
 # from text import symbols
 from text import symbols as symbols_v1
 from text import symbols2 as symbols_v2
+from torch import nn
+from torch.nn import Conv1d, Conv2d, ConvTranspose1d
+from torch.nn import functional as F
+from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
+
+from module import attentions_onnx as attentions
+from module import commons, modules
+from module.commons import get_padding, init_weights
+from module.quantize import ResidualVectorQuantizer
 
 
 class StochasticDurationPredictor(nn.Module):
@@ -302,7 +299,7 @@ class PosteriorEncoder(nn.Module):
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(self, x, x_lengths, g=None):
-        if g != None:
+        if g is not None:
             g = g.detach()
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
         x = self.pre(x) * x_mask
@@ -331,7 +328,7 @@ class Encoder(nn.Module):
         self.proj = nn.Conv1d(hidden_channels, out_channels, 1)
 
     def forward(self, x, x_lengths, g=None):
-        if g != None:
+        if g is not None:
             g = g.detach()
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
         x = self.pre(x) * x_mask
@@ -393,7 +390,7 @@ class Generator(torch.nn.Module):
         gin_channels=0,
         is_bias=False,
     ):
-        super(Generator, self).__init__()
+        super().__init__()
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
         self.conv_pre = Conv1d(initial_channel, upsample_initial_channel, 7, 1, padding=3)
@@ -425,7 +422,7 @@ class Generator(torch.nn.Module):
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
 
-    def forward(self, x, g: Optional[torch.Tensor] = None):
+    def forward(self, x, g: torch.Tensor | None = None):
         x = self.conv_pre(x)
         if g is not None:
             x = x + self.cond(g)
@@ -456,10 +453,10 @@ class Generator(torch.nn.Module):
 
 class DiscriminatorP(torch.nn.Module):
     def __init__(self, period, kernel_size=5, stride=3, use_spectral_norm=False):
-        super(DiscriminatorP, self).__init__()
+        super().__init__()
         self.period = period
         self.use_spectral_norm = use_spectral_norm
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+        norm_f = weight_norm if not use_spectral_norm else spectral_norm
         self.convs = nn.ModuleList(
             [
                 norm_f(
@@ -535,8 +532,8 @@ class DiscriminatorP(torch.nn.Module):
 
 class DiscriminatorS(torch.nn.Module):
     def __init__(self, use_spectral_norm=False):
-        super(DiscriminatorS, self).__init__()
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+        super().__init__()
+        norm_f = weight_norm if not use_spectral_norm else spectral_norm
         self.convs = nn.ModuleList(
             [
                 norm_f(Conv1d(1, 16, 15, 1, padding=7)),
@@ -565,7 +562,7 @@ class DiscriminatorS(torch.nn.Module):
 
 class MultiPeriodDiscriminator(torch.nn.Module):
     def __init__(self, use_spectral_norm=False):
-        super(MultiPeriodDiscriminator, self).__init__()
+        super().__init__()
         periods = [2, 3, 5, 7, 11]
 
         discs = [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
@@ -649,7 +646,7 @@ class ReferenceEncoder(nn.Module):
 
 class Quantizer_module(torch.nn.Module):
     def __init__(self, n_e, e_dim):
-        super(Quantizer_module, self).__init__()
+        super().__init__()
         self.embedding = nn.Embedding(n_e, e_dim)
         self.embedding.weight.data.uniform_(-1.0 / n_e, 1.0 / n_e)
 
@@ -659,14 +656,14 @@ class Quantizer_module(torch.nn.Module):
             + torch.sum(self.embedding.weight**2, 1)
             - 2 * torch.matmul(x, self.embedding.weight.T)
         )
-        min_indicies = torch.argmin(d, 1)
-        z_q = self.embedding(min_indicies)
-        return z_q, min_indicies
+        min_indices = torch.argmin(d, 1)
+        z_q = self.embedding(min_indices)
+        return z_q, min_indices
 
 
 class Quantizer(torch.nn.Module):
     def __init__(self, embed_dim=512, n_code_groups=4, n_codes=160):
-        super(Quantizer, self).__init__()
+        super().__init__()
         assert embed_dim % n_code_groups == 0
         self.quantizer_modules = nn.ModuleList(
             [Quantizer_module(n_codes, embed_dim // n_code_groups) for _ in range(n_code_groups)]
@@ -680,17 +677,17 @@ class Quantizer(torch.nn.Module):
         xin = xin.transpose(1, 2)
         x = xin.reshape(-1, self.embed_dim)
         x = torch.split(x, self.embed_dim // self.n_code_groups, dim=-1)
-        min_indicies = []
+        min_indices = []
         z_q = []
         for _x, m in zip(x, self.quantizer_modules):
-            _z_q, _min_indicies = m(_x)
+            _z_q, _min_indices = m(_x)
             z_q.append(_z_q)
-            min_indicies.append(_min_indicies)  # B * T,
+            min_indices.append(_min_indices)  # B * T,
         z_q = torch.cat(z_q, -1).reshape(xin.shape)
         loss = 0.25 * torch.mean((z_q.detach() - xin) ** 2) + torch.mean((z_q - xin.detach()) ** 2)
         z_q = xin + (z_q - xin).detach()
         z_q = z_q.transpose(1, 2)
-        codes = torch.stack(min_indicies, -1).reshape(B, T, self.n_code_groups)
+        codes = torch.stack(min_indices, -1).reshape(B, T, self.n_code_groups)
         return z_q, loss, codes.transpose(1, 2)
 
     def embed(self, x):
@@ -1057,7 +1054,7 @@ class SynthesizerTrnV3(nn.Module):
             100,
             DiT(**dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=inter_channels2, conv_layers=4)),
         )  # text_dim is condition feature dim
-        if freeze_quantizer == True:
+        if freeze_quantizer:
             set_no_grad(self.ssl_proj)
             set_no_grad(self.quantizer)
             set_no_grad(self.enc_p)
@@ -1077,7 +1074,7 @@ class SynthesizerTrnV3(nn.Module):
         x, m_p, logs_p, y_mask = self.enc_p(quantized, text, ge, speed)
         fea = self.bridge(x)
         fea = F.interpolate(fea, scale_factor=1.875, mode="nearest")  ##BCT
-        ####more wn paramter to learn mel
+        ####more wn parameter to learn mel
         fea, y_mask_ = self.wns1(fea, y_lengths1, ge)
         return fea
 

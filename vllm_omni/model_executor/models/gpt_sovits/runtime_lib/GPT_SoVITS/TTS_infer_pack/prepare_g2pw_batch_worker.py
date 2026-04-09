@@ -3,8 +3,9 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Sequence, Tuple
+from typing import Any
 
 
 def _segment_char_weight(segment: Any) -> int:
@@ -16,7 +17,7 @@ def _segment_char_weight(segment: Any) -> int:
 
 @dataclass
 class G2PWBatchTask:
-    segment_batches: List[List[Any]]
+    segment_batches: list[list[Any]]
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     created_at: float = field(default_factory=time.perf_counter)
     enqueued_at: float = 0.0
@@ -26,18 +27,18 @@ class G2PWBatchTask:
     done_event: threading.Event = field(default_factory=threading.Event)
     done_loop: asyncio.AbstractEventLoop | None = None
     done_future: asyncio.Future | None = None
-    result_batches: List[List[Any]] | None = None
-    batch_profiles: List[Dict[str, float]] | None = None
+    result_batches: list[list[Any]] | None = None
+    batch_profiles: list[dict[str, float]] | None = None
     started_at: float = 0.0
     finished_at: float = 0.0
     error: Exception | None = None
-    worker_profile: Dict[str, float] = field(default_factory=dict)
+    worker_profile: dict[str, float] = field(default_factory=dict)
 
 
 class PrepareG2PWBatchWorker:
     def __init__(
         self,
-        resolve_batch_fn: Callable[[List[List[Any]], List[Dict[str, float]] | None], List[List[Any]]],
+        resolve_batch_fn: Callable[[list[list[Any]], list[dict[str, float]] | None], list[list[Any]]],
         batch_window_ms: int = 2,
         max_batch_tasks: int = 64,
         max_batch_groups: int = 128,
@@ -64,9 +65,13 @@ class PrepareG2PWBatchWorker:
             if int(high_pressure_pending_threshold) > 0
             else max(self.max_batch_tasks * 2, 32),
         )
-        hp_window_ms = self.batch_window_ms if high_pressure_batch_window_ms is None else int(high_pressure_batch_window_ms)
+        hp_window_ms = (
+            self.batch_window_ms if high_pressure_batch_window_ms is None else int(high_pressure_batch_window_ms)
+        )
         hp_tasks = self.max_batch_tasks if high_pressure_max_batch_tasks is None else int(high_pressure_max_batch_tasks)
-        hp_groups = self.max_batch_groups if high_pressure_max_batch_groups is None else int(high_pressure_max_batch_groups)
+        hp_groups = (
+            self.max_batch_groups if high_pressure_max_batch_groups is None else int(high_pressure_max_batch_groups)
+        )
         hp_chars = self.max_batch_chars if high_pressure_max_batch_chars is None else int(high_pressure_max_batch_chars)
         self.high_pressure_batch_window_ms = max(0, hp_window_ms)
         self.high_pressure_batch_window_s = float(self.high_pressure_batch_window_ms) / 1000.0
@@ -75,7 +80,7 @@ class PrepareG2PWBatchWorker:
         self.high_pressure_max_batch_chars = max(self.max_batch_chars, hp_chars)
 
         self.condition = threading.Condition()
-        self.pending_tasks: Deque[G2PWBatchTask] = deque()
+        self.pending_tasks: deque[G2PWBatchTask] = deque()
         self.pending_peak = 0
         self.total_submitted = 0
         self.total_finished = 0
@@ -133,7 +138,7 @@ class PrepareG2PWBatchWorker:
     async def submit_async(
         self,
         segment_batches: Sequence[Sequence[Any]],
-    ) -> Tuple[List[List[Any]], List[Dict[str, float]], Dict[str, float], float, float, float]:
+    ) -> tuple[list[list[Any]], list[dict[str, float]], dict[str, float], float, float, float]:
         loop = asyncio.get_running_loop()
         task = G2PWBatchTask(
             segment_batches=[list(segment_batch) for segment_batch in segment_batches],
@@ -143,7 +148,7 @@ class PrepareG2PWBatchWorker:
         await self._enqueue_task_async(task)
         return await task.done_future
 
-    def snapshot(self) -> Dict[str, int | float]:
+    def snapshot(self) -> dict[str, int | float]:
         with self.condition:
             pending_groups = sum(self._estimate_task_groups(task) for task in self.pending_tasks)
             pending_chars = sum(self._estimate_task_chars(task) for task in self.pending_tasks)
@@ -177,7 +182,7 @@ class PrepareG2PWBatchWorker:
                 "admission_wait_peak_ms": float(self.admission_wait_peak_ms),
             }
 
-    def _select_batch_policy_locked(self) -> Tuple[float, int, int, int, bool, int]:
+    def _select_batch_policy_locked(self) -> tuple[float, int, int, int, bool, int]:
         pending_depth = len(self.pending_tasks)
         use_high_pressure = (
             self.high_pressure_pending_threshold > 0 and pending_depth >= self.high_pressure_pending_threshold
@@ -200,7 +205,7 @@ class PrepareG2PWBatchWorker:
             pending_depth,
         )
 
-    def _collect_batch(self) -> Tuple[List[G2PWBatchTask], Dict[str, float]]:
+    def _collect_batch(self) -> tuple[list[G2PWBatchTask], dict[str, float]]:
         with self.condition:
             while not self.pending_tasks:
                 self.condition.wait()
@@ -247,10 +252,12 @@ class PrepareG2PWBatchWorker:
                 "batch_chars": float(batch_chars),
                 "pending_depth_on_collect": float(pending_depth),
                 "high_pressure_mode": 1.0 if use_high_pressure else 0.0,
-                "batch_window_ms": float(self.high_pressure_batch_window_ms if use_high_pressure else self.batch_window_ms),
+                "batch_window_ms": float(
+                    self.high_pressure_batch_window_ms if use_high_pressure else self.batch_window_ms
+                ),
             }
 
-    def _finalize_batch(self, batch: List[G2PWBatchTask]) -> None:
+    def _finalize_batch(self, batch: list[G2PWBatchTask]) -> None:
         with self.condition:
             self.active_batch_size = 0
             self.active_batch_groups = 0
@@ -287,12 +294,12 @@ class PrepareG2PWBatchWorker:
         except RuntimeError:
             pass
 
-    def _run_batch(self, batch: List[G2PWBatchTask], batch_meta: Dict[str, float]) -> None:
+    def _run_batch(self, batch: list[G2PWBatchTask], batch_meta: dict[str, float]) -> None:
         batch_started = time.perf_counter()
         batch_collected_ts = float(batch_meta.get("collected_at_ts", batch_started))
-        flat_batches: List[List[Any]] = []
-        flat_profiles: List[Dict[str, float]] = []
-        task_slices: List[Tuple[int, int]] = []
+        flat_batches: list[list[Any]] = []
+        flat_profiles: list[dict[str, float]] = []
+        task_slices: list[tuple[int, int]] = []
         for task in batch:
             start = len(flat_batches)
             task.result_batches = None
@@ -346,7 +353,7 @@ class PrepareG2PWBatchWorker:
 class PrepareG2PWBatchWorkerPool:
     def __init__(
         self,
-        resolve_batch_fn: Callable[[List[List[Any]], List[Dict[str, float]] | None], List[List[Any]]],
+        resolve_batch_fn: Callable[[list[list[Any]], list[dict[str, float]] | None], list[list[Any]]],
         batch_window_ms: int = 2,
         max_batch_tasks: int = 64,
         max_batch_groups: int = 128,
@@ -394,7 +401,7 @@ class PrepareG2PWBatchWorkerPool:
     async def submit_async(
         self,
         segment_batches: Sequence[Sequence[Any]],
-    ) -> Tuple[List[List[Any]], List[Dict[str, float]], Dict[str, float], float, float, float]:
+    ) -> tuple[list[list[Any]], list[dict[str, float]], dict[str, float], float, float, float]:
         shard = self._pick_shard()
         resolved_batches, batch_profiles, worker_profile, submit_at, started_at, finished_at = await shard.submit_async(
             segment_batches
@@ -403,7 +410,7 @@ class PrepareG2PWBatchWorkerPool:
         merged_profile["g2pw_pool_workers"] = float(self.worker_count)
         return resolved_batches, batch_profiles, merged_profile, submit_at, started_at, finished_at
 
-    def snapshot(self) -> Dict[str, int | float | List[Dict[str, int | float]]]:
+    def snapshot(self) -> dict[str, int | float | list[dict[str, int | float]]]:
         shard_snapshots = [dict(shard.snapshot()) for shard in self.shards]
         return {
             "worker_count": int(self.worker_count),
@@ -416,8 +423,12 @@ class PrepareG2PWBatchWorkerPool:
             "total_finished": int(sum(int(snapshot.get("total_finished", 0)) for snapshot in shard_snapshots)),
             "total_batches": int(sum(int(snapshot.get("total_batches", 0)) for snapshot in shard_snapshots)),
             "active_batch_size": int(sum(int(snapshot.get("active_batch_size", 0)) for snapshot in shard_snapshots)),
-            "active_batch_peak": int(max((int(snapshot.get("active_batch_peak", 0)) for snapshot in shard_snapshots), default=0)),
-            "active_batch_groups": int(sum(int(snapshot.get("active_batch_groups", 0)) for snapshot in shard_snapshots)),
+            "active_batch_peak": int(
+                max((int(snapshot.get("active_batch_peak", 0)) for snapshot in shard_snapshots), default=0)
+            ),
+            "active_batch_groups": int(
+                sum(int(snapshot.get("active_batch_groups", 0)) for snapshot in shard_snapshots)
+            ),
             "active_batch_groups_peak": int(
                 max((int(snapshot.get("active_batch_groups_peak", 0)) for snapshot in shard_snapshots), default=0)
             ),

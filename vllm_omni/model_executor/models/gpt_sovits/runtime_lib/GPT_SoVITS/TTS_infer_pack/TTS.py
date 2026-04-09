@@ -1,6 +1,5 @@
-import gc
 import asyncio
-import concurrent.futures
+import gc
 import math
 import os
 import random
@@ -12,7 +11,6 @@ from copy import deepcopy
 now_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if now_dir not in sys.path:
     sys.path.insert(0, now_dir)
-from typing import List, Tuple, Union
 
 from runtime_preload import configure_model_runtime_environment, preload_text_runtime_deps
 
@@ -20,7 +18,6 @@ configure_model_runtime_environment()
 preload_text_runtime_deps()
 
 import ffmpeg
-import librosa
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -32,32 +29,37 @@ from BigVGAN.bigvgan import BigVGAN
 from feature_extractor.cnhubert import CNHubert
 from module import commons
 from module.mel_processing import mel_spectrogram_torch, spectrogram_torch
-from module.models import SynthesizerTrn, SynthesizerTrnV3, Generator
+from module.models import Generator, SynthesizerTrn, SynthesizerTrnV3
 from peft import LoraConfig, get_peft_model
 from process_ckpt import get_sovits_version_from_path_fast, load_sovits_new
-from transformers import AutoModelForMaskedLM, AutoTokenizer
-from tqdm import tqdm
-
+from sv import SV
 from tools.audio_sr import AP_BWE
 from tools.i18n.i18n import I18nAuto, scan_language_list
-from TTS_infer_pack.text_segmentation_method import splits
-from TTS_infer_pack.TextPreprocessor import TextPreprocessor, StageLimiter
+from tqdm import tqdm
+from transformers import AutoModelForMaskedLM, AutoTokenizer
+
 from TTS_infer_pack.prepare_bert_batch_worker import PrepareBertBatchWorker, PrepareBertBatchWorkerPool
+from TTS_infer_pack.prepare_g2pw_batch_worker import PrepareG2PWBatchWorker, PrepareG2PWBatchWorkerPool
 from TTS_infer_pack.prepare_ref_semantic_batch_worker import (
-    PrepareRefSemanticBatchWorker,
     PrepareRefSemanticBatchWorkerPool,
     prepare_prompt_semantic_wav16k,
 )
-from TTS_infer_pack.prepare_g2pw_batch_worker import PrepareG2PWBatchWorker, PrepareG2PWBatchWorkerPool
 from TTS_infer_pack.prepare_text_cpu_worker import PrepareTextCpuWorker
 from TTS_infer_pack.t2s_kv_cache_pool import attach_t2s_kv_cache_pool
-from sv import SV
+from TTS_infer_pack.text_segmentation_method import splits
+from TTS_infer_pack.TextPreprocessor import StageLimiter, TextPreprocessor
 
 resample_transform_dict = {}
 
 
 def _verbose_runtime_text() -> bool:
-    return os.environ.get("GPTSOVITS_VERBOSE_TEXT_PREPROCESS", "0").strip().lower() not in {"0", "false", "no", "off", ""}
+    return os.environ.get("GPTSOVITS_VERBOSE_TEXT_PREPROCESS", "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
 
 
 def _compile_vits_dec_enabled() -> bool:
@@ -76,7 +78,7 @@ def _compile_t2s_prealloc_enabled() -> bool:
 
 def resample(audio_tensor, sr0, sr1, device):
     global resample_transform_dict
-    key = "%s-%s-%s" % (sr0, sr1, str(device))
+    key = f"{sr0}-{sr1}-{str(device)}"
     if key not in resample_transform_dict:
         resample_transform_dict[key] = torchaudio.transforms.Resample(sr0, sr1).to(device)
     return resample_transform_dict[key](audio_tensor)
@@ -99,7 +101,8 @@ def denorm_spec(x):
     return (x + 1) / 2 * (spec_max - spec_min) + spec_min
 
 
-mel_fn = lambda x: mel_spectrogram_torch(
+def mel_fn(x):
+    return mel_spectrogram_torch(
     x,
     **{
         "n_fft": 1024,
@@ -113,7 +116,8 @@ mel_fn = lambda x: mel_spectrogram_torch(
     },
 )
 
-mel_fn_v4 = lambda x: mel_spectrogram_torch(
+def mel_fn_v4(x):
+    return mel_spectrogram_torch(
     x,
     **{
         "n_fft": 1280,
@@ -167,7 +171,7 @@ class DictToAttrRecursive(dict):
     def __setattr__(self, key, value):
         if isinstance(value, dict):
             value = DictToAttrRecursive(value)
-        super(DictToAttrRecursive, self).__setitem__(key, value)
+        super().__setitem__(key, value)
         super().__setattr__(key, value)
 
     def __delattr__(self, item):
@@ -351,12 +355,12 @@ class TTS_Config:
     v2_languages: list = ["auto", "auto_yue", "en", "zh", "ja", "yue", "ko", "all_zh", "all_ja", "all_yue", "all_ko"]
     languages: list = v2_languages
     mute_tokens: dict = {
-        "v1" : 486,
-        "v2" : 486,
+        "v1": 486,
+        "v2": 486,
         "v2Pro": 486,
         "v2ProPlus": 486,
-        "v3" : 486,
-        "v4" : 486,
+        "v3": 486,
+        "v4": 486,
     }
     mute_emb_sim_matrix: torch.Tensor = None
     # "all_zh",#全部按中文识别
@@ -371,7 +375,7 @@ class TTS_Config:
     # "auto",#多语种启动切分识别语种
     # "auto_yue",#多语种启动切分识别语种
 
-    def __init__(self, configs: Union[dict, str] = None):
+    def __init__(self, configs: dict | str = None):
         # 设置默认配置文件路径
         configs_base_path: str = "GPT_SoVITS/configs/"
         os.makedirs(configs_base_path, exist_ok=True)
@@ -401,7 +405,7 @@ class TTS_Config:
         requested_is_half = bool(self.configs.get("is_half", False))
         self.precision_name = _normalize_precision_name(self.configs.get("precision", None), is_half=requested_is_half)
         if str(self.device) == "cpu" and self.precision_name != "fp32":
-            print(f"Warning: Reduced precision is not supported on CPU, set precision to fp32.")
+            print("Warning: Reduced precision is not supported on CPU, set precision to fp32.")
             self.precision_name = "fp32"
         self.precision = _precision_name_to_dtype(self.precision_name)
         self.is_half = self.precision == torch.float16
@@ -455,7 +459,7 @@ class TTS_Config:
         else:
             print(i18n("路径不存在,使用默认配置"))
             self.save_configs(configs_path)
-        with open(configs_path, "r", encoding="utf-8") as f:
+        with open(configs_path, encoding="utf-8") as f:
             configs = yaml.load(f, Loader=yaml.FullLoader)
 
         return configs
@@ -534,14 +538,14 @@ class TTS:
         spec_slots = cls._resolve_ref_stage_slots("GPTSOVITS_PREPARE_REF_SPEC_SLOTS", 4)
         return StageLimiter(semantic_slots), StageLimiter(spec_slots), True
 
-    def __init__(self, configs: Union[dict, str, TTS_Config]):
+    def __init__(self, configs: dict | str | TTS_Config):
         if isinstance(configs, TTS_Config):
             self.configs = configs
         else:
             self.configs: TTS_Config = TTS_Config(configs)
 
         self.t2s_model: Text2SemanticLightningModule = None
-        self.vits_model: Union[SynthesizerTrn, SynthesizerTrnV3] = None
+        self.vits_model: SynthesizerTrn | SynthesizerTrnV3 = None
         self.bert_tokenizer: AutoTokenizer = None
         self.bert_model: AutoModelForMaskedLM = None
         self.cnhuhbert_model: CNHubert = None
@@ -581,10 +585,9 @@ class TTS:
         self.precision: torch.dtype = self.configs.precision
 
         self._init_models()
-        self.runtime_prepare_components_deferred = (
-            str(os.environ.get("GPTSOVITS_RUNTIME_SKIP_PREPARE_COMPONENTS", "0")).strip().lower()
-            in {"1", "true", "yes", "on"}
-        )
+        self.runtime_prepare_components_deferred = str(
+            os.environ.get("GPTSOVITS_RUNTIME_SKIP_PREPARE_COMPONENTS", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         if not self.runtime_prepare_components_deferred:
             self.refresh_runtime_components()
 
@@ -775,9 +778,7 @@ class TTS:
 
             pipeline_prewarmed = False
             if hasattr(chinese2, "prewarm_g2pw_pipeline"):
-                pipeline_prewarmed = bool(
-                    chinese2.prewarm_g2pw_pipeline(sentences=warm_texts, rounds=warm_rounds)
-                )
+                pipeline_prewarmed = bool(chinese2.prewarm_g2pw_pipeline(sentences=warm_texts, rounds=warm_rounds))
             if not pipeline_prewarmed:
                 g2pw_instance = getattr(chinese2, "g2pw", None)
                 if g2pw_instance is not None and hasattr(g2pw_instance, "prewarm"):
@@ -821,8 +822,8 @@ class TTS:
             traceback.print_exc()
 
     @staticmethod
-    def _parse_ref_prewarm_csv_ints(raw: str | None) -> List[int]:
-        values: List[int] = []
+    def _parse_ref_prewarm_csv_ints(raw: str | None) -> list[int]:
+        values: list[int] = []
         for item in str(raw or "").split(","):
             item = item.strip()
             if not item:
@@ -831,7 +832,7 @@ class TTS:
         return values
 
     @staticmethod
-    def _select_evenly_spaced_indices(total: int, count: int) -> List[int]:
+    def _select_evenly_spaced_indices(total: int, count: int) -> list[int]:
         if total <= 0 or count <= 0:
             return []
         if count >= total:
@@ -839,25 +840,24 @@ class TTS:
         if count == 1:
             return [total - 1]
         indices = {
-            min(total - 1, max(0, int(round(position * (total - 1) / float(count - 1)))))
-            for position in range(count)
+            min(total - 1, max(0, int(round(position * (total - 1) / float(count - 1))))) for position in range(count)
         }
         return sorted(indices)
 
-    def _build_prepare_ref_prewarm_plans(self, worker) -> List[dict]:
+    def _build_prepare_ref_prewarm_plans(self, worker) -> list[dict]:
         shards = list(getattr(worker, "shards", []) or [])
         if not shards:
             return []
         shard0 = shards[0]
         zero_wav_samples = int(getattr(shard0, "zero_wav_samples", int(self.configs.sampling_rate * 0.3)))
         min_valid_samples = int(max(48000, 48000 + zero_wav_samples))
-        prewarm_mode = (
-            str(os.environ.get("GPTSOVITS_PREPARE_REF_PREWARM_MODE", "runtime")).strip().lower() or "runtime"
-        )
+        prewarm_mode = str(os.environ.get("GPTSOVITS_PREPARE_REF_PREWARM_MODE", "runtime")).strip().lower() or "runtime"
         bucket_upper_bounds = [int(bound) for bound in getattr(shard0, "bucket_upper_bounds", []) or []]
         if not bucket_upper_bounds:
             bucket_upper_bounds = [min_valid_samples]
-        explicit_lengths = self._parse_ref_prewarm_csv_ints(os.environ.get("GPTSOVITS_PREPARE_REF_PREWARM_TARGET_SAMPLES"))
+        explicit_lengths = self._parse_ref_prewarm_csv_ints(
+            os.environ.get("GPTSOVITS_PREPARE_REF_PREWARM_TARGET_SAMPLES")
+        )
         if prewarm_mode in {"single", "basic"} and not explicit_lengths:
             target_lengths = [min_valid_samples]
         elif explicit_lengths:
@@ -865,14 +865,18 @@ class TTS:
         else:
             per_item_hot_ceiling = max(
                 min_valid_samples,
-                int(math.ceil(float(getattr(shard0, "max_batch_samples", min_valid_samples)) / float(max(1, getattr(shard0, "max_batch_items", 1))))),
+                int(
+                    math.ceil(
+                        float(getattr(shard0, "max_batch_samples", min_valid_samples))
+                        / float(max(1, getattr(shard0, "max_batch_items", 1)))
+                    )
+                ),
             )
             ratio_values = os.environ.get("GPTSOVITS_PREPARE_REF_PREWARM_TARGET_RATIOS", "0.0,0.625,1.01")
-            snap_to_bucket = (
-                str(os.environ.get("GPTSOVITS_PREPARE_REF_PREWARM_SNAP_TO_BUCKETS", "1")).strip().lower()
-                not in {"0", "false", "no", "off"}
-            )
-            desired_targets: List[int] = []
+            snap_to_bucket = str(
+                os.environ.get("GPTSOVITS_PREPARE_REF_PREWARM_SNAP_TO_BUCKETS", "1")
+            ).strip().lower() not in {"0", "false", "no", "off"}
+            desired_targets: list[int] = []
             for ratio_raw in str(ratio_values).split(","):
                 ratio_raw = ratio_raw.strip()
                 if not ratio_raw:
@@ -888,16 +892,15 @@ class TTS:
                 candidate_lengths = sorted({max(min_valid_samples, bound) for bound in bucket_upper_bounds})
                 target_lengths = []
                 for desired_target in desired_targets:
-                    snapped = next((value for value in candidate_lengths if value >= desired_target), candidate_lengths[-1])
+                    snapped = next(
+                        (value for value in candidate_lengths if value >= desired_target), candidate_lengths[-1]
+                    )
                     target_lengths.append(int(snapped))
                 target_lengths = sorted(set(target_lengths))
             else:
                 max_valid_samples = int(getattr(shard0, "max_batch_samples", 160000))
                 target_lengths = sorted(
-                    {
-                        max(min_valid_samples, min(max_valid_samples, int(value)))
-                        for value in desired_targets
-                    }
+                    {max(min_valid_samples, min(max_valid_samples, int(value))) for value in desired_targets}
                 )
         default_batch_sizes = [1]
         max_batch_items = max(1, int(getattr(shard0, "max_batch_items", 1)))
@@ -905,7 +908,9 @@ class TTS:
             default_batch_sizes.append(max(2, min(max_batch_items, int(math.ceil(float(max_batch_items) * 0.625)))))
         if prewarm_mode not in {"single", "basic"} and max_batch_items > 1:
             default_batch_sizes.append(max_batch_items)
-        explicit_batch_sizes = self._parse_ref_prewarm_csv_ints(os.environ.get("GPTSOVITS_PREPARE_REF_PREWARM_BATCH_SIZES"))
+        explicit_batch_sizes = self._parse_ref_prewarm_csv_ints(
+            os.environ.get("GPTSOVITS_PREPARE_REF_PREWARM_BATCH_SIZES")
+        )
         target_batch_sizes = sorted(
             {
                 max(1, min(max_batch_items, value))
@@ -914,7 +919,7 @@ class TTS:
         )
         raw_sr = 16000
         raw_audio = torch.zeros((1, 48000), dtype=torch.float32)
-        plans: List[dict] = []
+        plans: list[dict] = []
         for target_samples in target_lengths:
             wav16k = torch.zeros(int(target_samples), dtype=torch.float32).contiguous()
             for batch_size in target_batch_sizes:
@@ -996,7 +1001,9 @@ class TTS:
                 ),
             },
             "text_preprocessor": (
-                None if self.text_preprocessor is None or not hasattr(self.text_preprocessor, "snapshot") else self.text_preprocessor.snapshot()
+                None
+                if self.text_preprocessor is None or not hasattr(self.text_preprocessor, "snapshot")
+                else self.text_preprocessor.snapshot()
             ),
             "g2pw": g2pw_runtime,
             "g2pw_batch": (
@@ -1082,7 +1089,9 @@ class TTS:
             "off",
             "",
         }
-        skip_dynamic_graphs = os.environ.get("GPTSOVITS_COMPILE_VITS_DEC_SKIP_DYNAMIC_CUDAGRAPH", "0").strip().lower() not in {
+        skip_dynamic_graphs = os.environ.get(
+            "GPTSOVITS_COMPILE_VITS_DEC_SKIP_DYNAMIC_CUDAGRAPH", "0"
+        ).strip().lower() not in {
             "0",
             "false",
             "no",
@@ -1131,14 +1140,18 @@ class TTS:
             "off",
             "",
         }
-        capture_scalar_outputs = os.environ.get("GPTSOVITS_COMPILE_T2S_PREALLOC_CAPTURE_SCALAR_OUTPUTS", "1").strip().lower() not in {
+        capture_scalar_outputs = os.environ.get(
+            "GPTSOVITS_COMPILE_T2S_PREALLOC_CAPTURE_SCALAR_OUTPUTS", "1"
+        ).strip().lower() not in {
             "0",
             "false",
             "no",
             "off",
             "",
         }
-        skip_dynamic_graphs = os.environ.get("GPTSOVITS_COMPILE_T2S_PREALLOC_SKIP_DYNAMIC_CUDAGRAPH", "0").strip().lower() not in {
+        skip_dynamic_graphs = os.environ.get(
+            "GPTSOVITS_COMPILE_T2S_PREALLOC_SKIP_DYNAMIC_CUDAGRAPH", "0"
+        ).strip().lower() not in {
             "0",
             "false",
             "no",
@@ -1183,8 +1196,8 @@ class TTS:
             self.init_sv_model()
         path_sovits = self.configs.default_configs[model_version]["vits_weights_path"]
 
-        if if_lora_v3 == True and os.path.exists(path_sovits) == False:
-            info = path_sovits + i18n("SoVITS %s 底模缺失，无法加载相应 LoRA 权重" % model_version)
+        if if_lora_v3 and not os.path.exists(path_sovits):
+            info = path_sovits + i18n(f"SoVITS {model_version} 底模缺失，无法加载相应 LoRA 权重")
             raise FileExistsError(info)
 
         # dict_s2 = torch.load(weights_path, map_location=self.configs.device,weights_only=False)
@@ -1244,7 +1257,7 @@ class TTS:
 
         self.is_v2pro = model_version in {"v2Pro", "v2ProPlus"}
 
-        if if_lora_v3 == False:
+        if not if_lora_v3:
             print(
                 f"Loading VITS weights from {weights_path}. {vits_model.load_state_dict(dict_s2['weight'], strict=False)}"
             )
@@ -1268,7 +1281,11 @@ class TTS:
 
         # In inference, decoder weight_norm adds per-forward reparameterization overhead
         # on the hottest synth path and can be removed without changing outputs.
-        if not self.configs.use_vocoder and hasattr(vits_model, "dec") and hasattr(vits_model.dec, "remove_weight_norm"):
+        if (
+            not self.configs.use_vocoder
+            and hasattr(vits_model, "dec")
+            and hasattr(vits_model.dec, "remove_weight_norm")
+        ):
             vits_model.dec.remove_weight_norm()
 
         vits_model = vits_model.eval()
@@ -1276,8 +1293,6 @@ class TTS:
         self._maybe_compile_vits_decoder()
 
         self.configs.save_configs()
-
-
 
     def init_t2s_weights(self, weights_path: str):
         print(f"Loading Text2Semantic weights from {weights_path}")
@@ -1308,7 +1323,7 @@ class TTS:
                 self.empty_cache()
 
             self.vocoder = BigVGAN.from_pretrained(
-                "%s/GPT_SoVITS/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x" % (now_dir,),
+                f"{now_dir}/GPT_SoVITS/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x",
                 use_cuda_kernel=False,
             )  # if True, RuntimeError: Ninja is required to load C++ extensions
             # remove weight norm in the model and set to eval mode
@@ -1341,7 +1356,7 @@ class TTS:
             )
             self.vocoder.remove_weight_norm()
             state_dict_g = torch.load(
-                "%s/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth" % (now_dir,),
+                f"{now_dir}/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth",
                 map_location="cpu",
                 weights_only=False,
             )
@@ -1451,7 +1466,7 @@ class TTS:
     def set_ref_audio(self, ref_audio_path: str):
         """
         To set the reference audio for the TTS model,
-            including the prompt_semantic and refer_spepc.
+            including the prompt_semantic and refer_spec.
         Args:
             ref_audio_path: str, the path of the reference audio.
         """
@@ -1521,11 +1536,15 @@ class TTS:
                 zero_wav_samples=int(self.configs.sampling_rate * 0.3),
             )
             cpu_prepare_ms = (time.perf_counter() - cpu_prepare_start) * 1000.0
-        return wav16k, cpu_prepare_ms, {
-            "wait_ms": float(limiter_stats.get("wait_ms", 0.0)),
-            "slots": float(limiter_stats.get("slots", 0.0)),
-            "peak_inflight": float(limiter_stats.get("peak_inflight", 0.0)),
-        }
+        return (
+            wav16k,
+            cpu_prepare_ms,
+            {
+                "wait_ms": float(limiter_stats.get("wait_ms", 0.0)),
+                "slots": float(limiter_stats.get("slots", 0.0)),
+                "peak_inflight": float(limiter_stats.get("peak_inflight", 0.0)),
+            },
+        )
 
     @torch.inference_mode()
     def _extract_prompt_semantic_profile_from_raw(self, raw_audio: torch.Tensor, raw_sr: int):
@@ -1547,18 +1566,18 @@ class TTS:
         return spec, audio, raw_audio, raw_sr
 
     def _prepare_ref_prompt_wav16k_for_worker(self, raw_audio: torch.Tensor, raw_sr: int):
-        if (
-            self.prepare_ref_semantic_batch_worker is None
-            or str(os.environ.get("GPTSOVITS_PREPARE_REF_SUBMIT_PREPARED_WAV16K", "1")).strip().lower()
-            in {"0", "false", "no", "off"}
-        ):
+        if self.prepare_ref_semantic_batch_worker is None or str(
+            os.environ.get("GPTSOVITS_PREPARE_REF_SUBMIT_PREPARED_WAV16K", "1")
+        ).strip().lower() in {"0", "false", "no", "off"}:
             return None, {
                 "prompt_semantic_cpu_prepare_wait_ms": 0.0,
                 "prompt_semantic_cpu_prepare_slots": 0.0,
                 "prompt_semantic_cpu_prepare_inflight_peak": 0.0,
                 "prompt_semantic_cpu_prepare_ms": 0.0,
             }
-        wav16k, cpu_prepare_ms, cpu_prepare_limiter_stats = self._prepare_prompt_semantic_wav16k_profile(raw_audio, raw_sr)
+        wav16k, cpu_prepare_ms, cpu_prepare_limiter_stats = self._prepare_prompt_semantic_wav16k_profile(
+            raw_audio, raw_sr
+        )
         return wav16k, {
             "prompt_semantic_cpu_prepare_wait_ms": float(cpu_prepare_limiter_stats.get("wait_ms", 0.0)),
             "prompt_semantic_cpu_prepare_slots": float(cpu_prepare_limiter_stats.get("slots", 0.0)),
@@ -1607,7 +1626,7 @@ class TTS:
         profile["ref_spec_spectrogram_ms"] = (time.perf_counter() - spec_start) * 1000.0
         if self._runtime_compute_dtype() != torch.float32:
             spec = spec.to(dtype=self._runtime_compute_dtype())
-        if self.is_v2pro == True:
+        if self.is_v2pro:
             post_resample_start = time.perf_counter()
             audio = resample(audio, self.configs.sampling_rate, 16000, self.configs.device)
             profile["ref_spec_post_resample_ms"] = (time.perf_counter() - post_resample_start) * 1000.0
@@ -1632,15 +1651,17 @@ class TTS:
             )
             with self.prepare_ref_semantic_stage_limiter.enter() as prompt_semantic_limiter_stats:
                 prompt_semantic_start = time.perf_counter()
-                prompt_semantic, prompt_semantic_runtime_profile = self._extract_prompt_semantic_profile_from_prepared_wav16k(
-                    wav16k
+                prompt_semantic, prompt_semantic_runtime_profile = (
+                    self._extract_prompt_semantic_profile_from_prepared_wav16k(wav16k)
                 )
                 prompt_semantic_ms = (time.perf_counter() - prompt_semantic_start) * 1000.0
             with self.prepare_ref_spec_stage_limiter.enter() as ref_spec_limiter_stats:
                 ref_spec_start = time.perf_counter()
                 refer_spec = self._extract_ref_spec_from_raw(raw_audio, raw_sr)[:2]
                 ref_spec_ms = (time.perf_counter() - ref_spec_start) * 1000.0
-            audio_stage_wait_ms = float(prompt_semantic_limiter_stats["wait_ms"]) + float(ref_spec_limiter_stats["wait_ms"])
+            audio_stage_wait_ms = float(prompt_semantic_limiter_stats["wait_ms"]) + float(
+                ref_spec_limiter_stats["wait_ms"]
+            )
             audio_stage_slots = max(
                 float(prompt_semantic_limiter_stats["slots"]),
                 float(ref_spec_limiter_stats["slots"]),
@@ -1729,12 +1750,8 @@ class TTS:
                     "prompt_semantic_extract_latent_ms": float(
                         prompt_semantic_profile.get("prompt_semantic_extract_latent_ms", 0.0)
                     ),
-                    "prompt_semantic_forward_ms": float(
-                        prompt_semantic_profile.get("prompt_semantic_forward_ms", 0.0)
-                    ),
-                    "prompt_semantic_scatter_ms": float(
-                        prompt_semantic_profile.get("prompt_semantic_scatter_ms", 0.0)
-                    ),
+                    "prompt_semantic_forward_ms": float(prompt_semantic_profile.get("prompt_semantic_forward_ms", 0.0)),
+                    "prompt_semantic_scatter_ms": float(prompt_semantic_profile.get("prompt_semantic_scatter_ms", 0.0)),
                     "prompt_semantic_stage_slots": float(
                         prompt_semantic_profile.get("prompt_semantic_stage_slots", 0.0)
                     ),
@@ -1771,7 +1788,9 @@ class TTS:
         if self.prepare_ref_semantic_batch_worker is not None:
             wav16k, local_cpu_prepare_profile = self._prepare_ref_prompt_wav16k_for_worker(raw_audio, raw_sr)
             prompt_submit_at = time.perf_counter()
-            prompt_semantic, worker_profile = self.prepare_ref_semantic_batch_worker.submit(raw_audio, raw_sr, wav16k=wav16k)
+            prompt_semantic, worker_profile = self.prepare_ref_semantic_batch_worker.submit(
+                raw_audio, raw_sr, wav16k=wav16k
+            )
             prompt_semantic_profile.update(worker_profile)
             prompt_semantic_profile["prompt_semantic_cpu_prepare_wait_ms"] = float(
                 prompt_semantic_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0)
@@ -1887,7 +1906,9 @@ class TTS:
         raw_audio, raw_sr = await asyncio.to_thread(self._load_ref_audio_raw, ref_audio_path)
         load_ms = (time.perf_counter() - load_start) * 1000.0
         load_done_at = time.perf_counter()
-        wav16k_prepare_task = asyncio.create_task(asyncio.to_thread(self._prepare_ref_prompt_wav16k_for_worker, raw_audio, raw_sr))
+        wav16k_prepare_task = asyncio.create_task(
+            asyncio.to_thread(self._prepare_ref_prompt_wav16k_for_worker, raw_audio, raw_sr)
+        )
 
         async def _submit_prompt_semantic():
             wav16k, local_cpu_prepare_profile = await wav16k_prepare_task
@@ -1935,7 +1956,10 @@ class TTS:
             }
 
         ref_spec_task = asyncio.create_task(asyncio.to_thread(_build_ref_spec_profile))
-        (prompt_semantic, prompt_semantic_profile, prompt_submit_at), (refer_spec, ref_spec_profile) = await asyncio.gather(
+        (
+            (prompt_semantic, prompt_semantic_profile, prompt_submit_at),
+            (refer_spec, ref_spec_profile),
+        ) = await asyncio.gather(
             prompt_semantic_task,
             ref_spec_task,
         )
@@ -1969,9 +1993,7 @@ class TTS:
                 "prompt_semantic_ms": float(prompt_semantic_ms),
                 "prompt_semantic_wait_ms": float(prompt_semantic_profile.get("prompt_semantic_wait_ms", 0.0)),
                 "prompt_semantic_submit_offset_ms": float(max(0.0, (prompt_submit_at - load_start) * 1000.0)),
-                "prompt_semantic_submit_after_load_ms": float(
-                    max(0.0, (prompt_submit_at - load_done_at) * 1000.0)
-                ),
+                "prompt_semantic_submit_after_load_ms": float(max(0.0, (prompt_submit_at - load_done_at) * 1000.0)),
                 "prompt_semantic_worker_queue_wait_ms": float(
                     prompt_semantic_profile.get("prompt_semantic_worker_queue_wait_ms", 0.0)
                 ),
@@ -1984,7 +2006,9 @@ class TTS:
                 "prompt_semantic_batch_dispatch_delay_ms": float(
                     prompt_semantic_profile.get("prompt_semantic_batch_dispatch_delay_ms", 0.0)
                 ),
-                "prompt_semantic_cpu_prepare_ms": float(prompt_semantic_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)),
+                "prompt_semantic_cpu_prepare_ms": float(
+                    prompt_semantic_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
+                ),
                 "prompt_semantic_forward_ms": float(prompt_semantic_profile.get("prompt_semantic_forward_ms", 0.0)),
                 "prompt_semantic_scatter_ms": float(prompt_semantic_profile.get("prompt_semantic_scatter_ms", 0.0)),
                 "prompt_semantic_stage_slots": float(prompt_semantic_profile.get("prompt_semantic_stage_slots", 0.0)),
@@ -1992,12 +2016,16 @@ class TTS:
                     prompt_semantic_profile.get("prompt_semantic_stage_inflight_peak", 0.0)
                 ),
                 "prompt_semantic_batch_size": float(prompt_semantic_profile.get("prompt_semantic_batch_size", 1.0)),
-                "prompt_semantic_batch_samples": float(prompt_semantic_profile.get("prompt_semantic_batch_samples", 0.0)),
+                "prompt_semantic_batch_samples": float(
+                    prompt_semantic_profile.get("prompt_semantic_batch_samples", 0.0)
+                ),
                 "prompt_semantic_pool_workers": float(prompt_semantic_profile.get("prompt_semantic_pool_workers", 0.0)),
                 "prompt_semantic_shard_index": float(prompt_semantic_profile.get("prompt_semantic_shard_index", 0.0)),
                 "ref_spec_wait_ms": float(ref_spec_profile.get("ref_spec_wait_ms", 0.0)),
                 "ref_spec_ms": float(ref_spec_profile.get("ref_spec_ms", 0.0)),
-                "bundle_total_ms": float(load_ms + audio_stage_wait_ms + prompt_semantic_ms + ref_spec_profile.get("ref_spec_ms", 0.0)),
+                "bundle_total_ms": float(
+                    load_ms + audio_stage_wait_ms + prompt_semantic_ms + ref_spec_profile.get("ref_spec_ms", 0.0)
+                ),
             },
         }
 
@@ -2058,7 +2086,7 @@ class TTS:
         prompt_semantic = self.extract_prompt_semantic(ref_wav_path)
         self.prompt_cache["prompt_semantic"] = prompt_semantic
 
-    def batch_sequences(self, sequences: List[torch.Tensor], axis: int = 0, pad_value: int = 0, max_length: int = None):
+    def batch_sequences(self, sequences: list[torch.Tensor], axis: int = 0, pad_value: int = 0, max_length: int = None):
         seq = sequences[0]
         ndim = seq.dim()
         if axis < 0:
@@ -2277,7 +2305,7 @@ class TTS:
         fragment_interval = inputs.get("fragment_interval", 0.3)
         seed = inputs.get("seed", -1)
         seed = -1 if seed in ["", None] else seed
-        actual_seed = set_seed(seed)
+        set_seed(seed)
         parallel_infer = inputs.get("parallel_infer", True)
         repetition_penalty = inputs.get("repetition_penalty", 1.35)
         sample_steps = inputs.get("sample_steps", 32)
@@ -2286,7 +2314,7 @@ class TTS:
         overlap_length = inputs.get("overlap_length", 2)
         min_chunk_length = inputs.get("min_chunk_length", 16)
         fixed_length_chunk = inputs.get("fixed_length_chunk", False)
-        chunk_split_thershold = 0.0 # 该值代表语义token与mute token的余弦相似度阈值，若大于该阈值，则视为可切分点。
+        chunk_split_threshold = 0.0  # 该值代表语义token与mute token的余弦相似度阈值，若大于该阈值，则视为可切分点。
 
         if parallel_infer and not streaming_mode:
             print(i18n("并行推理模式已开启"))
@@ -2318,7 +2346,6 @@ class TTS:
         if (return_fragment or streaming_mode) and split_bucket:
             print(i18n("分段返回模式/流式推理模式不支持分桶处理，已自动关闭分桶处理"))
             split_bucket = False
-
 
         if split_bucket and speed_factor == 1.0 and not (self.configs.use_vocoder and parallel_infer):
             print(i18n("分桶处理模式已开启"))
@@ -2398,7 +2425,7 @@ class TTS:
         if not (return_fragment or streaming_mode):
             data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
             if len(data) == 0:
-                yield 16000, np.zeros(int(16000), dtype=np.int16)
+                yield 16000, np.zeros(16000, dtype=np.int16)
                 return
 
             batch_index_list: list = None
@@ -2467,9 +2494,9 @@ class TTS:
                     if item is None:
                         continue
 
-                batch_phones: List[torch.LongTensor] = item["phones"]
+                batch_phones: list[torch.LongTensor] = item["phones"]
                 # batch_phones:torch.LongTensor = item["phones"]
-                batch_phones_len: torch.LongTensor = item["phones_len"]
+                item["phones_len"]
                 all_phoneme_ids: torch.LongTensor = item["all_phones"]
                 all_phoneme_lens: torch.LongTensor = item["all_phones_len"]
                 all_bert_features: torch.LongTensor = item["all_bert_features"]
@@ -2485,7 +2512,7 @@ class TTS:
                     )
 
                 refer_audio_spec = []
-                
+
                 sv_emb = [] if self.is_v2pro else None
                 for spec, audio_tensor in self.prompt_cache["refer_spec"]:
                     spec = spec.to(dtype=self.precision, device=self.configs.device)
@@ -2534,7 +2561,6 @@ class TTS:
                                 f"fastpath_hit={t2s_stats.get('fastpath_hit')}"
                             )
 
-
                     batch_audio_fragment = []
 
                     # ## vits并行推理 method 1
@@ -2567,8 +2593,8 @@ class TTS:
                             _batch_phones = torch.cat(batch_phones).unsqueeze(0).to(self.configs.device)
 
                             _batch_audio_fragment = self.vits_model.decode(
-                                    all_pred_semantic, _batch_phones, refer_audio_spec, speed=speed_factor, sv_emb=sv_emb
-                                ).detach()[0, 0, :]
+                                all_pred_semantic, _batch_phones, refer_audio_spec, speed=speed_factor, sv_emb=sv_emb
+                            ).detach()[0, 0, :]
 
                             audio_frag_end_idx.insert(0, 0)
                             batch_audio_fragment = [
@@ -2583,14 +2609,18 @@ class TTS:
                                     pred_semantic_list[i][-idx:].unsqueeze(0).unsqueeze(0)
                                 )  # .unsqueeze(0)#mq要多unsqueeze一次
                                 audio_fragment = self.vits_model.decode(
-                                        _pred_semantic, phones, refer_audio_spec, speed=speed_factor, sv_emb=sv_emb
-                                    ).detach()[0, 0, :]
+                                    _pred_semantic, phones, refer_audio_spec, speed=speed_factor, sv_emb=sv_emb
+                                ).detach()[0, 0, :]
                                 batch_audio_fragment.append(audio_fragment)  ###试试重建不带上prompt部分
                     else:
                         if parallel_infer:
                             print(f"{i18n('并行合成中')}...")
                             audio_fragments = self.using_vocoder_synthesis_batched_infer(
-                                idx_list, pred_semantic_list, batch_phones, speed=speed_factor, sample_steps=sample_steps
+                                idx_list,
+                                pred_semantic_list,
+                                batch_phones,
+                                speed=speed_factor,
+                                sample_steps=sample_steps,
                             )
                             batch_audio_fragment.extend(audio_fragments)
                         else:
@@ -2609,7 +2639,7 @@ class TTS:
                     #     item.to(dtype=self.precision, device=self.configs.device)
                     #     for item in self.prompt_cache["refer_spec"]
                     # ]
-                    semantic_token_generator =self.t2s_model.model.infer_panel(
+                    semantic_token_generator = self.t2s_model.model.infer_panel(
                         all_phoneme_ids[0].unsqueeze(0),
                         all_phoneme_lens,
                         prompt,
@@ -2623,7 +2653,7 @@ class TTS:
                         streaming_mode=True,
                         chunk_length=min_chunk_length,
                         mute_emb_sim_matrix=self.configs.mute_emb_sim_matrix if not fixed_length_chunk else None,
-                        chunk_split_thershold=chunk_split_thershold,
+                        chunk_split_threshold=chunk_split_threshold,
                     )
                     t4 = time.perf_counter()
                     t_34 += t4 - t3
@@ -2634,30 +2664,34 @@ class TTS:
                         # if speed_factor == 1.0:
                         #     upsample_rate = math.prod(self.vits_model.upsample_rates)*(2 if self.vits_model.semantic_frame_rate == "25hz" else 1)
                         # else:
-                        upsample_rate = math.prod(self.vits_model.upsample_rates)*((2 if self.vits_model.semantic_frame_rate == "25hz" else 1)/speed_factor)
+                        upsample_rate = math.prod(self.vits_model.upsample_rates) * (
+                            (2 if self.vits_model.semantic_frame_rate == "25hz" else 1) / speed_factor
+                        )
                     else:
                         # if speed_factor == 1.0:
                         #     upsample_rate = self.vocoder_configs["upsample_rate"]*(3.875 if self.configs.version == "v3" else 4)
                         # else:
-                        upsample_rate = self.vocoder_configs["upsample_rate"]*((3.875 if self.configs.version == "v3" else 4)/speed_factor)
+                        upsample_rate = self.vocoder_configs["upsample_rate"] * (
+                            (3.875 if self.configs.version == "v3" else 4) / speed_factor
+                        )
 
                     last_audio_chunk = None
                     # last_tokens = None
                     last_latent = None
                     previous_tokens = []
                     overlap_len = overlap_length
-                    overlap_size = math.ceil(overlap_length*upsample_rate)
+                    overlap_size = math.ceil(overlap_length * upsample_rate)
                     for semantic_tokens, is_final in semantic_token_generator:
                         if semantic_tokens is None and last_audio_chunk is not None:
                             yield self.audio_postprocess(
-                                    [[last_audio_chunk[-overlap_size:]]],
-                                    output_sr,
-                                    None,
-                                    speed_factor,
-                                    False,
-                                    0.0,
-                                    super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
-                                )
+                                [[last_audio_chunk[-overlap_size:]]],
+                                output_sr,
+                                None,
+                                speed_factor,
+                                False,
+                                0.0,
+                                super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
+                            )
                             break
 
                         _semantic_tokens = semantic_tokens
@@ -2668,10 +2702,9 @@ class TTS:
                         _semantic_tokens = torch.cat(previous_tokens, dim=-1)
 
                         if not is_first_chunk and semantic_tokens.shape[-1] < 10:
-                            overlap_len = overlap_length+(10-semantic_tokens.shape[-1])
+                            overlap_len = overlap_length + (10 - semantic_tokens.shape[-1])
                         else:
                             overlap_len = overlap_length
-
 
                         if not self.configs.use_vocoder:
                             token_padding_length = 0
@@ -2682,58 +2715,64 @@ class TTS:
                             #     token_padding_length = 0
 
                             audio_chunk, latent, latent_mask = self.vits_model.decode_streaming(
-                                                    _semantic_tokens.unsqueeze(0), 
-                                                    phones, refer_audio_spec, 
-                                                    speed=speed_factor,
-                                                    sv_emb=sv_emb,
-                                                    result_length=semantic_tokens.shape[-1]+overlap_len if not is_first_chunk else None,
-                                                    overlap_frames=last_latent[:,:,-overlap_len*(2 if self.vits_model.semantic_frame_rate == "25hz" else 1):] \
-                                                    if last_latent is not None else None,
-                                                    padding_length=token_padding_length
-                                                )
-                            audio_chunk=audio_chunk.detach()[0, 0, :]
+                                _semantic_tokens.unsqueeze(0),
+                                phones,
+                                refer_audio_spec,
+                                speed=speed_factor,
+                                sv_emb=sv_emb,
+                                result_length=semantic_tokens.shape[-1] + overlap_len if not is_first_chunk else None,
+                                overlap_frames=last_latent[
+                                    :, :, -overlap_len * (2 if self.vits_model.semantic_frame_rate == "25hz" else 1) :
+                                ]
+                                if last_latent is not None
+                                else None,
+                                padding_length=token_padding_length,
+                            )
+                            audio_chunk = audio_chunk.detach()[0, 0, :]
                         else:
                             raise RuntimeError(i18n("SoVits V3/4模型不支持流式推理模式"))
-                        
-                        if overlap_len>overlap_length:
-                            audio_chunk=audio_chunk[-int((overlap_length+semantic_tokens.shape[-1])*upsample_rate):]
+
+                        if overlap_len > overlap_length:
+                            audio_chunk = audio_chunk[
+                                -int((overlap_length + semantic_tokens.shape[-1]) * upsample_rate) :
+                            ]
 
                         audio_chunk_ = audio_chunk
                         if is_first_chunk and not is_final:
                             is_first_chunk = False
                             audio_chunk_ = audio_chunk_[:-overlap_size]
-                        elif is_first_chunk and is_final: 
+                        elif is_first_chunk and is_final:
                             is_first_chunk = False
                         elif not is_first_chunk and not is_final:
                             audio_chunk_ = self.sola_algorithm([last_audio_chunk, audio_chunk_], overlap_size)
                             audio_chunk_ = (
-                                audio_chunk_[last_audio_chunk.shape[0]-overlap_size:-overlap_size] if not is_final \
-                                    else audio_chunk_[last_audio_chunk.shape[0]-overlap_size:]
-                                    )
+                                audio_chunk_[last_audio_chunk.shape[0] - overlap_size : -overlap_size]
+                                if not is_final
+                                else audio_chunk_[last_audio_chunk.shape[0] - overlap_size :]
+                            )
 
                         last_latent = latent
                         last_audio_chunk = audio_chunk
                         yield self.audio_postprocess(
-                                [[audio_chunk_]],
-                                output_sr,
-                                None,
-                                speed_factor,
-                                False,
-                                0.0,
-                                super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
-                            )
-                        
-                        if is_first_package: 
-                            print(f"first_package_delay: {time.perf_counter()-t0:.3f}")
+                            [[audio_chunk_]],
+                            output_sr,
+                            None,
+                            speed_factor,
+                            False,
+                            0.0,
+                            super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
+                        )
+
+                        if is_first_package:
+                            print(f"first_package_delay: {time.perf_counter() - t0:.3f}")
                             is_first_package = False
 
-
-                    yield output_sr, np.zeros(int(output_sr*fragment_interval), dtype=np.int16)
+                    yield output_sr, np.zeros(int(output_sr * fragment_interval), dtype=np.int16)
 
                 t5 = time.perf_counter()
                 t_45 += t5 - t4
                 if return_fragment:
-                    print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t4 - t3, t5 - t4))
+                    print(f"{t1 - t0:.3f}\t{t2 - t1:.3f}\t{t4 - t3:.3f}\t{t5 - t4:.3f}")
                     yield self.audio_postprocess(
                         [batch_audio_fragment],
                         output_sr,
@@ -2743,7 +2782,8 @@ class TTS:
                         fragment_interval,
                         super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
                     )
-                elif streaming_mode:...
+                elif streaming_mode:
+                    ...
                 else:
                     audio.append(batch_audio_fragment)
 
@@ -2752,7 +2792,7 @@ class TTS:
                     return
 
             if not (return_fragment or streaming_mode):
-                print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t_34, t_45))
+                print(f"{t1 - t0:.3f}\t{t2 - t1:.3f}\t{t_34:.3f}\t{t_45:.3f}")
                 if t2s_observe_batch_count > 0:
                     request_avg_decode_ms_per_token = (
                         (t_34 * 1000.0) / t2s_observe_generated_tokens if t2s_observe_generated_tokens > 0 else 0.0
@@ -2781,7 +2821,7 @@ class TTS:
         except Exception as e:
             traceback.print_exc()
             # 必须返回一个空音频, 否则会导致显存不释放。
-            yield 16000, np.zeros(int(16000), dtype=np.int16)
+            yield 16000, np.zeros(16000, dtype=np.int16)
             # 重置模型, 否则会导致显存释放不完全。
             del self.t2s_model
             del self.vits_model
@@ -2805,15 +2845,15 @@ class TTS:
 
     def audio_postprocess(
         self,
-        audio: List[torch.Tensor],
+        audio: list[torch.Tensor],
         sr: int,
         batch_index_list: list = None,
         speed_factor: float = 1.0,
         split_bucket: bool = True,
         fragment_interval: float = 0.3,
         super_sampling: bool = False,
-    ) -> Tuple[int, np.ndarray]:
-        if fragment_interval>0:
+    ) -> tuple[int, np.ndarray]:
+        if fragment_interval > 0:
             zero_wav = torch.zeros(
                 int(self.configs.sampling_rate * fragment_interval), dtype=self.precision, device=self.configs.device
             )
@@ -2823,7 +2863,9 @@ class TTS:
                 max_audio = torch.abs(audio_fragment).max()  # 简单防止16bit爆音
                 if max_audio > 1:
                     audio_fragment /= max_audio
-                audio_fragment: torch.Tensor = torch.cat([audio_fragment, zero_wav], dim=0) if fragment_interval>0 else audio_fragment
+                audio_fragment: torch.Tensor = (
+                    torch.cat([audio_fragment, zero_wav], dim=0) if fragment_interval > 0 else audio_fragment
+                )
                 audio[i][j] = audio_fragment
 
         if split_bucket:
@@ -2853,7 +2895,6 @@ class TTS:
         else:
             audio = np.asarray(audio)
         audio = (audio.reshape(-1) * 32768).astype(np.int16)
-
 
         # try:
         #     if speed_factor != 1.0:
@@ -3004,7 +3045,7 @@ class TTS:
         phones: torch.Tensor,
         prompt_semantic: torch.Tensor,
         prompt_phones: torch.Tensor,
-        refer_spec: tuple | List[tuple],
+        refer_spec: tuple | list[tuple],
         raw_audio: torch.Tensor,
         raw_sr: int,
         speed: float = 1.0,
@@ -3013,7 +3054,9 @@ class TTS:
         refer_specs = list(refer_spec) if isinstance(refer_spec, list) else [refer_spec]
         refer_audio_spec, audio_tensor = refer_specs[0]
         if not self.configs.use_vocoder:
-            refer_audio_spec_list = [item[0].to(dtype=self.precision, device=self.configs.device) for item in refer_specs]
+            refer_audio_spec_list = [
+                item[0].to(dtype=self.precision, device=self.configs.device) for item in refer_specs
+            ]
             sv_emb = None
             if self.is_v2pro:
                 sv_emb = []
@@ -3044,13 +3087,13 @@ class TTS:
     @torch.inference_mode()
     def synthesize_audio_requests_local_batched(
         self,
-        semantic_tokens_list: List[torch.Tensor],
-        phones_list: List[torch.Tensor],
-        refer_specs: List[tuple | List[tuple]],
-        speeds: List[float] | None = None,
-        sample_steps_list: List[int] | None = None,
+        semantic_tokens_list: list[torch.Tensor],
+        phones_list: list[torch.Tensor],
+        refer_specs: list[tuple | list[tuple]],
+        speeds: list[float] | None = None,
+        sample_steps_list: list[int] | None = None,
         shared_runtime_cache: dict | None = None,
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         batch_size = len(semantic_tokens_list)
         if batch_size == 0:
             return []
@@ -3144,9 +3187,9 @@ class TTS:
         phone_batch = torch.zeros((batch_size, max_phone_len), dtype=torch.long, device=device)
         semantic_lengths = []
         phone_lengths = []
-        refer_audio_specs: List[torch.Tensor] = []
+        refer_audio_specs: list[torch.Tensor] = []
         sv_emb_batch = None
-        sv_emb_list: List[torch.Tensor] = []
+        sv_emb_list: list[torch.Tensor] = []
 
         for batch_index, semantic_tokens in enumerate(semantic_tokens_list):
             semantic_len = int(semantic_tokens.shape[-1])
@@ -3222,7 +3265,7 @@ class TTS:
             shared_refer=shared_single_refer,
             precomputed_ge=precomputed_ge,
         )
-        audios: List[torch.Tensor] = []
+        audios: list[torch.Tensor] = []
         for batch_index in range(batch_size):
             audio_len = int(audio_lengths[batch_index].item())
             audios.append(audio_batch[batch_index, 0, :audio_len].detach())
@@ -3230,12 +3273,12 @@ class TTS:
 
     def using_vocoder_synthesis_batched_infer(
         self,
-        idx_list: List[int],
-        semantic_tokens_list: List[torch.Tensor],
-        batch_phones: List[torch.Tensor],
+        idx_list: list[int],
+        semantic_tokens_list: list[torch.Tensor],
+        batch_phones: list[torch.Tensor],
         speed: float = 1.0,
         sample_steps: int = 32,
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
         prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
         raw_entry = self.prompt_cache["refer_spec"][0]
@@ -3343,40 +3386,32 @@ class TTS:
 
         return audio_fragments
 
-    def sola_algorithm(
-        self,
-        audio_fragments: List[torch.Tensor],
-        overlap_len: int,
-        search_len:int= 320
-    ):
+    def sola_algorithm(self, audio_fragments: list[torch.Tensor], overlap_len: int, search_len: int = 320):
         # overlap_len-=search_len
 
         dtype = audio_fragments[0].dtype
-        
+
         for i in range(len(audio_fragments) - 1):
             f1 = audio_fragments[i].float()
             f2 = audio_fragments[i + 1].float()
             w1 = f1[-overlap_len:]
-            w2 = f2[:overlap_len+search_len]
+            w2 = f2[: overlap_len + search_len]
             # w2 = w2[-w2.shape[-1]//2:]
             # assert w1.shape == w2.shape
             corr_norm = F.conv1d(w2.view(1, 1, -1), w1.view(1, 1, -1)).view(-1)
 
-            corr_den = F.conv1d(w2.view(1, 1, -1)**2, torch.ones_like(w1).view(1, 1, -1)).view(-1)+ 1e-8
-            idx = (corr_norm/corr_den.sqrt()).argmax()
+            corr_den = F.conv1d(w2.view(1, 1, -1) ** 2, torch.ones_like(w1).view(1, 1, -1)).view(-1) + 1e-8
+            idx = (corr_norm / corr_den.sqrt()).argmax()
 
             print(f"seg_idx: {idx}")
 
             # idx = corr.argmax()
-            f1_ = f1[: -overlap_len]
+            f1_ = f1[:-overlap_len]
             audio_fragments[i] = f1_
 
             f2_ = f2[idx:]
             window = torch.hann_window((overlap_len) * 2, device=f1.device, dtype=f1.dtype)
-            f2_[: overlap_len] = (
-                window[: overlap_len] * f2_[: overlap_len]
-                + window[overlap_len :] * f1[-overlap_len :]
-            )
+            f2_[:overlap_len] = window[:overlap_len] * f2_[:overlap_len] + window[overlap_len:] * f1[-overlap_len:]
 
             # window = torch.sin(torch.arange((overlap_len - idx), device=f1.device) * np.pi / (overlap_len - idx))
             # f2_[: (overlap_len - idx)] = (

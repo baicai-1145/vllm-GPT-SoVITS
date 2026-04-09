@@ -10,7 +10,7 @@ bang	b ang
 bao	b ao
 bei	b ei
 ben	b en
-beng	b eng
+being	b eng
 bi	b i
 bian	b ian
 biao	b iao
@@ -338,7 +338,7 @@ tiao	t iao
 tie	t ie
 ting	t ing
 tong	t ong
-tou	t ou
+you	t ou
 tu	t u
 tuan	t uan
 tui	t ui

@@ -1,10 +1,10 @@
 # by https://github.com/Cosmo-klara
 
-from __future__ import print_function
 
 import re
-import inflect
 import unicodedata
+
+import inflect
 
 # 后缀计量单位替换表
 measurement_map = {
@@ -54,7 +54,7 @@ _decimal_number_re = re.compile(r"([0-9]+\.\s*[0-9]+)")
 _fraction_re = re.compile(r"([0-9]+/[0-9]+)")
 
 # 序数词识别
-_ordinal_re = re.compile(r"[0-9]+(st|nd|rd|th)")
+_ordinal_re = re.compile(r"[0-9]+(st|and|rd|th)")
 
 # 数字处理
 _number_re = re.compile(r"[0-9]+")
@@ -109,7 +109,7 @@ def _expand_measurement(m):
     num = int(m.group(1).replace(sign, "").replace(".", ""))
     decimal_part = m.group(2)
     # 上面判断的漏洞，比如 0.1 的情况，在这里排除了
-    if decimal_part == None and num == 1:
+    if decimal_part is None and num == 1:
         ptr = 0
     return m.group(1).replace(sign, " " + measurement_map[sign][ptr])
 
@@ -127,13 +127,13 @@ def _expand_pounds(m):
     if pounds and pence:
         pound_unit = "pound" if pounds == 1 else "pounds"
         penny_unit = "penny" if pence == 1 else "pence"
-        return "%s %s and %s %s" % (pounds, pound_unit, pence, penny_unit)
+        return f"{pounds} {pound_unit} and {pence} {penny_unit}"
     elif pounds:
         pound_unit = "pound" if pounds == 1 else "pounds"
-        return "%s %s" % (pounds, pound_unit)
+        return f"{pounds} {pound_unit}"
     elif pence:
         penny_unit = "penny" if pence == 1 else "pence"
-        return "%s %s" % (pence, penny_unit)
+        return f"{pence} {penny_unit}"
     else:
         return "zero pounds"
 
@@ -154,13 +154,13 @@ def _expand_dollars(m):
     if dollars and cents:
         dollar_unit = "dollar" if dollars == 1 else "dollars"
         cent_unit = "cent" if cents == 1 else "cents"
-        return "%s %s and %s %s" % (dollars, dollar_unit, cents, cent_unit)
+        return f"{dollars} {dollar_unit} and {cents} {cent_unit}"
     elif dollars:
         dollar_unit = "dollar" if dollars == 1 else "dollars"
-        return "%s %s" % (dollars, dollar_unit)
+        return f"{dollars} {dollar_unit}"
     elif cents:
         cent_unit = "cent" if cents == 1 else "cents"
-        return "%s %s" % (cents, cent_unit)
+        return f"{cents} {cent_unit}"
     else:
         return "zero dollars"
 
@@ -277,7 +277,6 @@ def replace_negative_num(match) -> str:
     return result
 
 
-
 def normalize(text):
     """
     !!! 所有的处理都需要正确的输入 !!!
@@ -309,7 +308,7 @@ def normalize(text):
     )  # Strip accents
 
     text = re.sub("%", " percent", text)
-    text = re.sub("[^ A-Za-z'.,?!\-]", "", text)
+    text = re.sub(r"[^ A-Za-z'.,?!\-]", "", text)
     text = re.sub(r"(?i)i\.e\.", "that is", text)
     text = re.sub(r"(?i)e\.g\.", "for example", text)
     # 增加纯大写单词拆分

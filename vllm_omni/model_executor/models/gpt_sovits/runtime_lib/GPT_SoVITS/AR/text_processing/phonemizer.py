@@ -2,13 +2,11 @@
 # reference: https://github.com/lifeiteng/vall-e
 import itertools
 import re
-from typing import Dict
-from typing import List
 
 import regex
 from gruut import sentences
-from gruut.const import Sentence
-from gruut.const import Word
+from gruut.const import Sentence, Word
+
 from AR.text_processing.symbols import SYMBOL_TO_ID
 
 
@@ -17,7 +15,7 @@ class GruutPhonemizer:
         self._phonemizer = sentences
         self.lang = language
         self.symbol_to_id = SYMBOL_TO_ID
-        self._special_cases_dict: Dict[str] = {
+        self._special_cases_dict: dict[str] = {
             r"\.\.\.": "... ",
             ";": "; ",
             ":": ": ",
@@ -51,8 +49,8 @@ class GruutPhonemizer:
 
     def phonemize(self, text: str, espeak: bool = False) -> str:
         text_to_phonemize: str = self._normalize_punctuation(text)
-        sents: List[Sentence] = [sent for sent in self._phonemizer(text_to_phonemize, lang="en-us", espeak=espeak)]
-        words: List[str] = [self._convert_punctuation(word) for word in itertools.chain(*sents)]
+        sents: list[Sentence] = [sent for sent in self._phonemizer(text_to_phonemize, lang="en-us", espeak=espeak)]
+        words: list[str] = [self._convert_punctuation(word) for word in itertools.chain(*sents)]
         return " ".join(words)
 
     def transform(self, phonemes):

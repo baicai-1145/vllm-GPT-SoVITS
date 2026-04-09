@@ -6,15 +6,16 @@
 
 import math
 import os
+import pathlib
 import random
+
+import librosa
+import numpy as np
 import torch
 import torch.utils.data
-import numpy as np
-import librosa
 from librosa.filters import mel as librosa_mel_fn
-import pathlib
 from tqdm import tqdm
-from typing import List, Tuple, Optional
+
 from .env import AttrDict
 
 MAX_WAV_VALUE = 32767.0  # NOTE: 32768.0 -1 to prevent int16 overflow (results in popping sound in corner cases)
@@ -144,20 +145,20 @@ def get_dataset_filelist(a):
     validation_files = []
     list_unseen_validation_files = []
 
-    with open(a.input_training_file, "r", encoding="utf-8") as fi:
+    with open(a.input_training_file, encoding="utf-8") as fi:
         training_files = [
             os.path.join(a.input_wavs_dir, x.split("|")[0] + ".wav") for x in fi.read().split("\n") if len(x) > 0
         ]
         print(f"first training file: {training_files[0]}")
 
-    with open(a.input_validation_file, "r", encoding="utf-8") as fi:
+    with open(a.input_validation_file, encoding="utf-8") as fi:
         validation_files = [
             os.path.join(a.input_wavs_dir, x.split("|")[0] + ".wav") for x in fi.read().split("\n") if len(x) > 0
         ]
         print(f"first validation file: {validation_files[0]}")
 
     for i in range(len(a.list_input_unseen_validation_file)):
-        with open(a.list_input_unseen_validation_file[i], "r", encoding="utf-8") as fi:
+        with open(a.list_input_unseen_validation_file[i], encoding="utf-8") as fi:
             unseen_validation_files = [
                 os.path.join(a.list_input_unseen_wavs_dir[i], x.split("|")[0] + ".wav")
                 for x in fi.read().split("\n")
@@ -172,7 +173,7 @@ def get_dataset_filelist(a):
 class MelDataset(torch.utils.data.Dataset):
     def __init__(
         self,
-        training_files: List[str],
+        training_files: list[str],
         hparams: AttrDict,
         segment_size: int,
         n_fft: int,
@@ -181,11 +182,11 @@ class MelDataset(torch.utils.data.Dataset):
         win_size: int,
         sampling_rate: int,
         fmin: int,
-        fmax: Optional[int],
+        fmax: int | None,
         split: bool = True,
         shuffle: bool = True,
         device: str = None,
-        fmax_loss: Optional[int] = None,
+        fmax_loss: int | None = None,
         fine_tuning: bool = False,
         base_mels_path: str = None,
         is_seen: bool = True,
@@ -219,7 +220,7 @@ class MelDataset(torch.utils.data.Dataset):
         for i in tqdm(range(len(self.audio_files))):
             assert os.path.exists(self.audio_files[i]), f"{self.audio_files[i]} not found"
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, str, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, str, torch.Tensor]:
         try:
             filename = self.audio_files[index]
 
@@ -300,7 +301,7 @@ class MelDataset(torch.utils.data.Dataset):
                 # For fine-tuning, assert that the waveform is in the defined sampling_rate
                 # Fine-tuning won't support on-the-fly resampling to be fool-proof (the dataset should have been prepared properly)
                 assert source_sampling_rate == self.sampling_rate, (
-                    f"For fine_tuning, waveform must be in the spcified sampling rate {self.sampling_rate}, got {source_sampling_rate}"
+                    f"For fine_tuning, waveform must be in the specified sampling rate {self.sampling_rate}, got {source_sampling_rate}"
                 )
 
                 # Cast ndarray to torch tensor

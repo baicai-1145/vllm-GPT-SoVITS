@@ -6,7 +6,7 @@ import os
 import time
 import warnings
 import zipfile
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import numpy as np
 import onnxruntime
@@ -15,7 +15,7 @@ from opencc import OpenCC
 from pypinyin import Style, pinyin
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 
-from ..zh_normalization.char_convert import tranditional_to_simplified
+from ..zh_normalization.char_convert import transitional_to_simplified
 from .dataset import get_char_phoneme_labels, get_phoneme_labels, prepare_onnx_input
 from .utils import load_config
 
@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore")
 model_version = "1.1"
 
 
-def predict(session, onnx_input: Dict[str, Any], labels: List[str]) -> Tuple[List[str], List[float]]:
+def predict(session, onnx_input: dict[str, Any], labels: list[str]) -> tuple[list[str], list[float]]:
     all_preds = []
     all_confidences = []
     probs = session.run(
@@ -54,13 +54,13 @@ def predict(session, onnx_input: Dict[str, Any], labels: List[str]) -> Tuple[Lis
     return all_preds, all_confidences
 
 
-def _load_json_from_candidates(filename: str, candidate_dirs: List[str]) -> Dict[str, Any]:
+def _load_json_from_candidates(filename: str, candidate_dirs: list[str]) -> dict[str, Any]:
     for candidate_dir in candidate_dirs:
         if not candidate_dir:
             continue
         json_path = os.path.join(candidate_dir, filename)
         if os.path.exists(json_path):
-            with open(json_path, "r", encoding="utf-8") as fr:
+            with open(json_path, encoding="utf-8") as fr:
                 return json.load(fr)
     raise FileNotFoundError(f"Cannot locate {filename} in candidate dirs: {candidate_dirs}")
 
@@ -119,13 +119,13 @@ class _G2PWBaseOnnxConverter:
         model_dir: str = "G2PWModel/",
         style: str = "bopomofo",
         model_source: str = None,
-        enable_non_tradional_chinese: bool = False,
+        enable_non_traditional_chinese: bool = False,
     ):
         self.model_dir = download_and_decompress(model_dir)
         self.config = load_config(config_path=os.path.join(self.model_dir, "config.py"), use_default=True)
 
         self.model_source = _resolve_tokenizer_source(model_source if model_source else self.config.model_source)
-        self.enable_opencc = enable_non_tradional_chinese
+        self.enable_opencc = enable_non_traditional_chinese
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_source, local_files_only=True)
 
         polyphonic_chars_path = os.path.join(self.model_dir, "POLYPHONIC_CHARS.txt")
@@ -226,11 +226,11 @@ class _G2PWBaseOnnxConverter:
         print(f'Warning: "{bopomofo}" cannot convert to pinyin')
         return None
 
-    def __call__(self, sentences: List[str]) -> List[List[str]]:
+    def __call__(self, sentences: list[str]) -> list[list[str]]:
         results, _profile = self.predict_sentences_with_profile(sentences)
         return results
 
-    def predict_sentences_with_profile(self, sentences: List[str]) -> Tuple[List[List[str]], Dict[str, float]]:
+    def predict_sentences_with_profile(self, sentences: list[str]) -> tuple[list[list[str]], dict[str, float]]:
         if isinstance(sentences, str):
             sentences = [sentences]
 
@@ -262,7 +262,7 @@ class _G2PWBaseOnnxConverter:
         if not model_input:
             return partial_results, {}
 
-        predict_profile: Dict[str, float] = {}
+        predict_profile: dict[str, float] = {}
         if self.enable_sentence_dedup:
             preds, _confidences, predict_profile = self._predict_with_sentence_dedup_profiled(
                 model_input=model_input,
@@ -285,15 +285,13 @@ class _G2PWBaseOnnxConverter:
 
         return results, predict_profile
 
-    def _prepare_data(
-        self, sentences: List[str]
-    ) -> Tuple[List[str], List[int], List[int], List[int], List[List[str]]]:
+    def _prepare_data(self, sentences: list[str]) -> tuple[list[str], list[int], list[int], list[int], list[list[str]]]:
         texts, model_query_ids, result_query_ids, sent_ids, partial_results = [], [], [], [], []
         for sent_id, sent in enumerate(sentences):
-            sent_s = tranditional_to_simplified(sent)
+            sent_s = transitional_to_simplified(sent)
             pypinyin_result = pinyin(sent_s, neutral_tone_with_five=True, style=Style.TONE3)
             partial_result = [None] * len(sent)
-            polyphonic_indices: List[int] = []
+            polyphonic_indices: list[int] = []
             for i, char in enumerate(sent):
                 if char in self.polyphonic_chars_new:
                     polyphonic_indices.append(i)
@@ -323,24 +321,24 @@ class _G2PWBaseOnnxConverter:
             partial_results.append(partial_result)
         return texts, model_query_ids, result_query_ids, sent_ids, partial_results
 
-    def _predict(self, model_input: Dict[str, Any]) -> Tuple[List[str], List[float]]:
+    def _predict(self, model_input: dict[str, Any]) -> tuple[list[str], list[float]]:
         raise NotImplementedError
 
     def _predict_with_sentence_dedup(
-        self, model_input: Dict[str, Any], texts: List[str]
-    ) -> Tuple[List[str], List[float]]:
+        self, model_input: dict[str, Any], texts: list[str]
+    ) -> tuple[list[str], list[float]]:
         if len(texts) <= 1:
             return self._predict(model_input=model_input)
 
-        grouped_indices: Dict[str, List[int]] = {}
+        grouped_indices: dict[str, list[int]] = {}
         for idx, text in enumerate(texts):
             grouped_indices.setdefault(text, []).append(idx)
 
         if all(len(indices) == 1 for indices in grouped_indices.values()):
             return self._predict(model_input=model_input)
 
-        preds: List[str] = [""] * len(texts)
-        confidences: List[float] = [0.0] * len(texts)
+        preds: list[str] = [""] * len(texts)
+        confidences: list[float] = [0.0] * len(texts)
         for indices in grouped_indices.values():
             group_input = {name: value[indices] for name, value in model_input.items()}
             if len(indices) > 1:
@@ -356,9 +354,9 @@ class _G2PWBaseOnnxConverter:
 
     def _predict_with_sentence_dedup_profiled(
         self,
-        model_input: Dict[str, Any],
-        texts: List[str],
-    ) -> Tuple[List[str], List[float], Dict[str, float]]:
+        model_input: dict[str, Any],
+        texts: list[str],
+    ) -> tuple[list[str], list[float], dict[str, float]]:
         if len(texts) <= 1:
             if hasattr(self, "_predict_with_profile"):
                 return self._predict_with_profile(model_input=model_input)
@@ -366,7 +364,7 @@ class _G2PWBaseOnnxConverter:
             preds, confidences = self._predict(model_input=model_input)
             return preds, confidences, {"g2pw_predict_ms": float((time.perf_counter() - predict_started) * 1000.0)}
 
-        grouped_indices: Dict[str, List[int]] = {}
+        grouped_indices: dict[str, list[int]] = {}
         for idx, text in enumerate(texts):
             grouped_indices.setdefault(text, []).append(idx)
 
@@ -377,9 +375,9 @@ class _G2PWBaseOnnxConverter:
             preds, confidences = self._predict(model_input=model_input)
             return preds, confidences, {"g2pw_predict_ms": float((time.perf_counter() - predict_started) * 1000.0)}
 
-        preds: List[str] = [""] * len(texts)
-        confidences: List[float] = [0.0] * len(texts)
-        merged_profile: Dict[str, float] = {}
+        preds: list[str] = [""] * len(texts)
+        confidences: list[float] = [0.0] * len(texts)
+        merged_profile: dict[str, float] = {}
         for indices in grouped_indices.values():
             group_input = {name: value[indices] for name, value in model_input.items()}
             if len(indices) > 1:
@@ -407,13 +405,13 @@ class G2PWOnnxConverter(_G2PWBaseOnnxConverter):
         model_dir: str = "G2PWModel/",
         style: str = "bopomofo",
         model_source: str = None,
-        enable_non_tradional_chinese: bool = False,
+        enable_non_traditional_chinese: bool = False,
     ):
         super().__init__(
             model_dir=model_dir,
             style=style,
             model_source=model_source,
-            enable_non_tradional_chinese=enable_non_tradional_chinese,
+            enable_non_traditional_chinese=enable_non_traditional_chinese,
         )
 
         sess_options = onnxruntime.SessionOptions()
@@ -439,5 +437,5 @@ class G2PWOnnxConverter(_G2PWBaseOnnxConverter):
                 providers=["CPUExecutionProvider"],
             )
 
-    def _predict(self, model_input: Dict[str, Any]) -> Tuple[List[str], List[float]]:
+    def _predict(self, model_input: dict[str, Any]) -> tuple[list[str], list[float]]:
         return predict(session=self.session_g2pw, onnx_input=model_input, labels=self.labels)

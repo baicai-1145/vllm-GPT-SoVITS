@@ -3,8 +3,8 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Sequence, Tuple
 
 import torch
 
@@ -14,7 +14,7 @@ from TTS_infer_pack.prepare_gpu_timeline import sync_timeline_cuda, trace_gpu_ba
 @dataclass
 class BertFeatureTask:
     norm_text: str
-    word2ph: List[int]
+    word2ph: list[int]
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     created_at: float = field(default_factory=time.perf_counter)
     enqueued_at: float = 0.0
@@ -26,7 +26,7 @@ class BertFeatureTask:
     done_future: asyncio.Future | None = None
     result_feature: torch.Tensor | None = None
     error: Exception | None = None
-    profile: Dict[str, float] = field(default_factory=dict)
+    profile: dict[str, float] = field(default_factory=dict)
 
 
 class PrepareBertBatchWorker:
@@ -64,9 +64,13 @@ class PrepareBertBatchWorker:
             if int(high_pressure_pending_threshold) > 0
             else max(self.max_batch_items * 2, 32),
         )
-        hp_window_ms = self.batch_window_ms if high_pressure_batch_window_ms is None else int(high_pressure_batch_window_ms)
+        hp_window_ms = (
+            self.batch_window_ms if high_pressure_batch_window_ms is None else int(high_pressure_batch_window_ms)
+        )
         hp_items = self.max_batch_items if high_pressure_max_batch_items is None else int(high_pressure_max_batch_items)
-        hp_tokens = self.max_batch_tokens if high_pressure_max_batch_tokens is None else int(high_pressure_max_batch_tokens)
+        hp_tokens = (
+            self.max_batch_tokens if high_pressure_max_batch_tokens is None else int(high_pressure_max_batch_tokens)
+        )
         self.high_pressure_batch_window_ms = max(0, hp_window_ms)
         self.high_pressure_batch_window_s = float(self.high_pressure_batch_window_ms) / 1000.0
         self.high_pressure_max_batch_items = max(self.max_batch_items, hp_items)
@@ -74,7 +78,7 @@ class PrepareBertBatchWorker:
         self.shard_index = int(shard_index)
 
         self.condition = threading.Condition()
-        self.pending_tasks: Deque[BertFeatureTask] = deque()
+        self.pending_tasks: deque[BertFeatureTask] = deque()
         self.pending_peak = 0
         self.total_submitted = 0
         self.total_finished = 0
@@ -165,7 +169,7 @@ class PrepareBertBatchWorker:
                     return
             await asyncio.sleep(self.admission_poll_s)
 
-    def submit(self, norm_text: str, word2ph: List[int]) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def submit(self, norm_text: str, word2ph: list[int]) -> tuple[torch.Tensor, dict[str, float]]:
         task = BertFeatureTask(norm_text=str(norm_text), word2ph=list(word2ph))
         self._enqueue_task(task)
         task.done_event.wait()
@@ -174,7 +178,7 @@ class PrepareBertBatchWorker:
         assert task.result_feature is not None
         return task.result_feature, dict(task.profile)
 
-    async def submit_async(self, norm_text: str, word2ph: List[int]) -> Tuple[torch.Tensor, Dict[str, float]]:
+    async def submit_async(self, norm_text: str, word2ph: list[int]) -> tuple[torch.Tensor, dict[str, float]]:
         loop = asyncio.get_running_loop()
         task = BertFeatureTask(
             norm_text=str(norm_text),
@@ -203,8 +207,8 @@ class PrepareBertBatchWorker:
 
     async def submit_many_async(
         self,
-        items: Sequence[Tuple[str, List[int]]],
-    ) -> List[Tuple[torch.Tensor, Dict[str, float]]]:
+        items: Sequence[tuple[str, list[int]]],
+    ) -> list[tuple[torch.Tensor, dict[str, float]]]:
         if not items:
             return []
         loop = asyncio.get_running_loop()
@@ -220,7 +224,7 @@ class PrepareBertBatchWorker:
         await self._enqueue_tasks_async(tasks)
         return list(await asyncio.gather(*[task.done_future for task in tasks]))
 
-    def snapshot(self) -> Dict[str, int]:
+    def snapshot(self) -> dict[str, int]:
         with self.condition:
             return {
                 "shard_index": self.shard_index,
@@ -251,11 +255,10 @@ class PrepareBertBatchWorker:
                 "admission_wait_peak_ms": self.admission_wait_peak_ms,
             }
 
-    def _select_batch_policy_locked(self) -> Tuple[float, int, int, bool, int]:
+    def _select_batch_policy_locked(self) -> tuple[float, int, int, bool, int]:
         pending_depth = len(self.pending_tasks)
         use_high_pressure = (
-            self.high_pressure_pending_threshold > 0
-            and pending_depth >= self.high_pressure_pending_threshold
+            self.high_pressure_pending_threshold > 0 and pending_depth >= self.high_pressure_pending_threshold
         )
         if use_high_pressure:
             return (
@@ -273,7 +276,7 @@ class PrepareBertBatchWorker:
             pending_depth,
         )
 
-    def _collect_batch(self) -> Tuple[List[BertFeatureTask], Dict[str, float]]:
+    def _collect_batch(self) -> tuple[list[BertFeatureTask], dict[str, float]]:
         with self.condition:
             while not self.pending_tasks:
                 self.condition.wait()
@@ -284,7 +287,7 @@ class PrepareBertBatchWorker:
             )
             first_task = self.pending_tasks.popleft()
             first_task.batch_popped_at = time.perf_counter()
-            batch: List[BertFeatureTask] = [first_task]
+            batch: list[BertFeatureTask] = [first_task]
             batch_tokens = self._estimate_task_tokens(batch[0])
             deadline = time.perf_counter() + batch_window_s
 
@@ -319,10 +322,12 @@ class PrepareBertBatchWorker:
                 "batch_tokens": float(batch_tokens),
                 "pending_depth_on_collect": float(pending_depth_on_collect),
                 "high_pressure_mode": 1.0 if use_high_pressure else 0.0,
-                "batch_window_ms": float(self.high_pressure_batch_window_ms if use_high_pressure else self.batch_window_ms),
+                "batch_window_ms": float(
+                    self.high_pressure_batch_window_ms if use_high_pressure else self.batch_window_ms
+                ),
             }
 
-    def _finalize_batch(self, batch: List[BertFeatureTask]) -> None:
+    def _finalize_batch(self, batch: list[BertFeatureTask]) -> None:
         with self.condition:
             self.active_batch_size = 0
             self.active_batch_tokens = 0
@@ -330,13 +335,12 @@ class PrepareBertBatchWorker:
             self.total_finished += len(batch)
             self.condition.notify_all()
 
-    def _run_batch(self, batch: List[BertFeatureTask], batch_meta: Dict[str, float]) -> None:
+    def _run_batch(self, batch: list[BertFeatureTask], batch_meta: dict[str, float]) -> None:
         batch_started = time.perf_counter()
         texts = [task.norm_text for task in batch]
         batch_tokens = int(batch_meta["batch_tokens"])
         batch_collected_ts = float(batch_meta.get("collected_at_ts", batch_started))
         tokenize_start = time.perf_counter()
-        tokenize_start_ts = tokenize_start
         inputs_cpu = self.tokenizer(texts, return_tensors="pt", padding=True)
         tokenize_end_ts = time.perf_counter()
         tokenize_ms = (tokenize_end_ts - tokenize_start) * 1000.0
@@ -560,13 +564,13 @@ class PrepareBertBatchWorkerPool:
                 ),
             )
 
-    def submit(self, norm_text: str, word2ph: List[int]) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def submit(self, norm_text: str, word2ph: list[int]) -> tuple[torch.Tensor, dict[str, float]]:
         shard = self._pick_shard()
         result, profile = shard.submit(norm_text, word2ph)
         profile["bert_pool_workers"] = float(self.worker_count)
         return result, profile
 
-    async def submit_async(self, norm_text: str, word2ph: List[int]) -> Tuple[torch.Tensor, Dict[str, float]]:
+    async def submit_async(self, norm_text: str, word2ph: list[int]) -> tuple[torch.Tensor, dict[str, float]]:
         shard = self._pick_shard()
         result, profile = await shard.submit_async(norm_text, word2ph)
         profile["bert_pool_workers"] = float(self.worker_count)
@@ -574,8 +578,8 @@ class PrepareBertBatchWorkerPool:
 
     async def submit_many_async(
         self,
-        items: Sequence[Tuple[str, List[int]]],
-    ) -> List[Tuple[torch.Tensor, Dict[str, float]]]:
+        items: Sequence[tuple[str, list[int]]],
+    ) -> list[tuple[torch.Tensor, dict[str, float]]]:
         if not items:
             return []
         if self.worker_count == 1:
@@ -584,7 +588,7 @@ class PrepareBertBatchWorkerPool:
                 profile["bert_pool_workers"] = float(self.worker_count)
             return results
 
-        shard_items: list[list[tuple[int, str, List[int]]]] = [[] for _ in range(self.worker_count)]
+        shard_items: list[list[tuple[int, str, list[int]]]] = [[] for _ in range(self.worker_count)]
         shard_token_loads: list[int] = [0] * self.worker_count
         for item_index, (norm_text, word2ph) in enumerate(items):
             with self.lock:
@@ -601,26 +605,24 @@ class PrepareBertBatchWorkerPool:
             shard_token_loads[shard_index] += max(1, len(str(norm_text)) + 2)
 
         shard_tasks = []
-        shard_metas: list[list[tuple[int, str, List[int]]]] = []
+        shard_metas: list[list[tuple[int, str, list[int]]]] = []
         for shard_index, batch in enumerate(shard_items):
             if not batch:
                 continue
             shard_metas.append(batch)
             shard_tasks.append(
-                self.shards[shard_index].submit_many_async(
-                    [(norm_text, word2ph) for _, norm_text, word2ph in batch]
-                )
+                self.shards[shard_index].submit_many_async([(norm_text, word2ph) for _, norm_text, word2ph in batch])
             )
 
         gathered = await asyncio.gather(*shard_tasks)
-        ordered_results: list[Tuple[torch.Tensor, Dict[str, float]] | None] = [None] * len(items)
+        ordered_results: list[tuple[torch.Tensor, dict[str, float]] | None] = [None] * len(items)
         for batch_meta, batch_results in zip(shard_metas, gathered):
             for (item_index, _norm_text, _word2ph), (result, profile) in zip(batch_meta, batch_results):
                 profile["bert_pool_workers"] = float(self.worker_count)
                 ordered_results[item_index] = (result, profile)
         return [item for item in ordered_results if item is not None]
 
-    def snapshot(self) -> Dict[str, int | List[Dict[str, int]]]:
+    def snapshot(self) -> dict[str, int | list[dict[str, int]]]:
         shard_snapshots = [dict(shard.snapshot()) for shard in self.shards]
         return {
             "worker_count": int(self.worker_count),
@@ -636,7 +638,9 @@ class PrepareBertBatchWorkerPool:
             "active_batch_peak": int(
                 max((int(snapshot.get("active_batch_peak", 0)) for snapshot in shard_snapshots), default=0)
             ),
-            "active_batch_tokens": int(sum(int(snapshot.get("active_batch_tokens", 0)) for snapshot in shard_snapshots)),
+            "active_batch_tokens": int(
+                sum(int(snapshot.get("active_batch_tokens", 0)) for snapshot in shard_snapshots)
+            ),
             "active_batch_tokens_peak": int(
                 max((int(snapshot.get("active_batch_tokens_peak", 0)) for snapshot in shard_snapshots), default=0)
             ),

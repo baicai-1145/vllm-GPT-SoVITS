@@ -2,22 +2,22 @@ import math
 
 import numpy as np
 import torch
+import torch.distributions as D
 from torch import nn
-from torch.nn import functional as F
-
 from torch.nn import Conv1d
-from torch.nn.utils import weight_norm, remove_weight_norm
+from torch.nn import functional as F
+from torch.nn.utils import remove_weight_norm, weight_norm
 
 from module import commons
-from module.commons import init_weights, get_padding
+from module.commons import get_padding, init_weights
 from module.transforms import piecewise_rational_quadratic_transform
-import torch.distributions as D
-
 
 LRELU_SLOPE = 0.1
 
 
-def _conv2d_spec_from_conv1d(conv: nn.Conv1d, *, dtype: torch.dtype | None = None) -> dict[str, torch.Tensor | tuple[int, int]]:
+def _conv2d_spec_from_conv1d(
+    conv: nn.Conv1d, *, dtype: torch.dtype | None = None
+) -> dict[str, torch.Tensor | tuple[int, int]]:
     target_dtype = dtype or conv.weight.dtype
     weight = conv.weight.detach().to(device=conv.weight.device, dtype=target_dtype)
     bias = None
@@ -154,7 +154,7 @@ class WN(torch.nn.Module):
         gin_channels=0,
         p_dropout=0,
     ):
-        super(WN, self).__init__()
+        super().__init__()
         assert kernel_size % 2 == 1
         self.hidden_channels = hidden_channels
         self.kernel_size = (kernel_size,)
@@ -232,7 +232,7 @@ class WN(torch.nn.Module):
 
 class ResBlock1(torch.nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
-        super(ResBlock1, self).__init__()
+        super().__init__()
         self.convs1 = nn.ModuleList(
             [
                 weight_norm(
@@ -336,11 +336,15 @@ class ResBlock1(torch.nn.Module):
             xt = F.leaky_relu(x, LRELU_SLOPE)
             if mask is not None:
                 xt = xt * mask
-            xt = F.conv2d(xt, c1["weight"], c1["bias"], stride=c1["stride"], padding=c1["padding"], dilation=c1["dilation"])
+            xt = F.conv2d(
+                xt, c1["weight"], c1["bias"], stride=c1["stride"], padding=c1["padding"], dilation=c1["dilation"]
+            )
             xt = F.leaky_relu(xt, LRELU_SLOPE)
             if mask is not None:
                 xt = xt * mask
-            xt = F.conv2d(xt, c2["weight"], c2["bias"], stride=c2["stride"], padding=c2["padding"], dilation=c2["dilation"])
+            xt = F.conv2d(
+                xt, c2["weight"], c2["bias"], stride=c2["stride"], padding=c2["padding"], dilation=c2["dilation"]
+            )
             x = xt + x
         if mask is not None:
             x = x * mask
@@ -371,7 +375,7 @@ class ResBlock1(torch.nn.Module):
 
 class ResBlock2(torch.nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3)):
-        super(ResBlock2, self).__init__()
+        super().__init__()
         self.convs = nn.ModuleList(
             [
                 weight_norm(
@@ -616,7 +620,7 @@ class LinearNorm(nn.Module):
         bias=True,
         spectral_norm=False,
     ):
-        super(LinearNorm, self).__init__()
+        super().__init__()
         self.fc = nn.Linear(in_channels, out_channels, bias)
 
         if spectral_norm:
@@ -629,7 +633,7 @@ class LinearNorm(nn.Module):
 
 class Mish(nn.Module):
     def __init__(self):
-        super(Mish, self).__init__()
+        super().__init__()
 
     def forward(self, x):
         return x * torch.tanh(F.softplus(x))
@@ -642,7 +646,7 @@ class Conv1dGLU(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, dropout):
-        super(Conv1dGLU, self).__init__()
+        super().__init__()
         self.out_channels = out_channels
         self.conv1 = ConvNorm(in_channels, 2 * out_channels, kernel_size=kernel_size)
         self.dropout = nn.Dropout(dropout)
@@ -668,7 +672,7 @@ class ConvNorm(nn.Module):
         bias=True,
         spectral_norm=False,
     ):
-        super(ConvNorm, self).__init__()
+        super().__init__()
 
         if padding is None:
             assert kernel_size % 2 == 1
@@ -780,7 +784,7 @@ class MelStyleEncoder(nn.Module):
         style_head=2,
         dropout=0.1,
     ):
-        super(MelStyleEncoder, self).__init__()
+        super().__init__()
         self.in_dim = n_mel_channels
         self.hidden_dim = style_hidden
         self.out_dim = style_vector_dim

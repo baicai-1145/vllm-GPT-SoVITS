@@ -3,13 +3,15 @@ import re
 import threading
 
 import cn2an
-from pypinyin import lazy_pinyin, Style
+from pypinyin import Style, lazy_pinyin
 
 from text.symbols import punctuation
 from text.tone_sandhi import ToneSandhi
-from text.zh_normalization.text_normlization import TextNormalizer
+from text.zh_normalization.text_normalization import TextNormalizer
 
-normalizer = lambda x: cn2an.transform(x, "an2cn")
+
+def normalizer(x):
+    return cn2an.transform(x, "an2cn")
 
 current_file_path = os.path.dirname(__file__)
 pinyin_to_symbol_map = {
@@ -17,12 +19,12 @@ pinyin_to_symbol_map = {
     for line in open(os.path.join(current_file_path, "opencpop-strict.txt")).readlines()
 }
 
-import jieba_fast
 import logging
+
+import jieba_fast
 
 jieba_fast.setLogLevel(logging.CRITICAL)
 import jieba_fast.posseg as psg
-
 
 rep_map = {
     "：": ",",
@@ -80,7 +82,7 @@ def replace_consecutive_punctuation(text):
 
 
 def g2p(text):
-    pattern = r"(?<=[{0}])\s*".format("".join(punctuation))
+    pattern = r"(?<=[{}])\s*".format("".join(punctuation))
     sentences = [i for i in re.split(pattern, text) if i.strip() != ""]
     phones, word2ph = _g2p(sentences)
     return phones, word2ph
@@ -101,7 +103,6 @@ def _g2p(segments):
     phones_list = []
     word2ph = []
     for seg in segments:
-        pinyins = []
         # Replace all English words in the sentence
         seg = re.sub("[a-zA-Z]+", "", seg)
         seg_cut = psg.lcut(seg)
@@ -183,7 +184,7 @@ def text_normalize(text):
 
 
 if __name__ == "__main__":
-    text = "啊——但是《原神》是由,米哈\游自主，研发的一款全.新开放世界.冒险游戏"
+    text = r"啊——但是《原神》是由,米哈\游自主，研发的一款全.新开放世界.冒险游戏"
     text = "呣呣呣～就是…大人的鼹鼠党吧？"
     text = "你好"
     text = text_normalize(text)

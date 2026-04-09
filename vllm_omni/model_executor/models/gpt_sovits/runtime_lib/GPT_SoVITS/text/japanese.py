@@ -1,7 +1,7 @@
 # modified from https://github.com/CjangCjengh/vits/blob/main/text/japanese.py
-import re
-import os
 import hashlib
+import os
+import re
 from functools import lru_cache
 
 try:
@@ -62,7 +62,7 @@ try:
     if os.path.exists(USERDIC_CSV_PATH):
         if (
             not os.path.exists(USERDIC_BIN_PATH)
-            or get_hash(USERDIC_CSV_PATH) != open(USERDIC_HASH_PATH, "r", encoding="utf-8").read()
+            or get_hash(USERDIC_CSV_PATH) != open(USERDIC_HASH_PATH, encoding="utf-8").read()
         ):
             pyopenjtalk.mecab_dict_index(USERDIC_CSV_PATH, USERDIC_BIN_PATH)
             with open(USERDIC_HASH_PATH, "w", encoding="utf-8") as f:
@@ -91,13 +91,13 @@ _japanese_marks = re.compile(
 )
 
 # List of (symbol, Japanese) pairs for marks:
-_symbols_to_japanese = [(re.compile("%s" % x[0]), x[1]) for x in [("％", "パーセント")]]
+_symbols_to_japanese = [(re.compile(f"{x[0]}"), x[1]) for x in [("％", "パーセント")]]
 _TRAILING_PASSTHROUGH_CHARS = frozenset(" \n：；，。！？·、,.!?")
 
 
 # List of (consonant, sokuon) pairs:
 _real_sokuon = [
-    (re.compile("%s" % x[0]), x[1])
+    (re.compile(f"{x[0]}"), x[1])
     for x in [
         (r"Q([↑↓]*[kg])", r"k#\1"),
         (r"Q([↑↓]*[tdjʧ])", r"t#\1"),
@@ -108,7 +108,7 @@ _real_sokuon = [
 
 # List of (consonant, hatsuon) pairs:
 _real_hatsuon = [
-    (re.compile("%s" % x[0]), x[1])
+    (re.compile(f"{x[0]}"), x[1])
     for x in [
         (r"N([↑↓]*[pbm])", r"m\1"),
         (r"N([↑↓]*[ʧʥj])", r"n^\1"),
@@ -180,9 +180,11 @@ def preprocess_jap_batch(texts, with_prosody=False):
     post_marks = post_replace_ph
     use_prosody = bool(with_prosody)
     if use_prosody:
-        phonemize_sentence = lambda sentence: pyopenjtalk_g2p_prosody(sentence)[1:-1]
+        def phonemize_sentence(sentence):
+            return pyopenjtalk_g2p_prosody(sentence)[1:-1]
     else:
-        phonemize_sentence = lambda sentence: pyopenjtalk.g2p(sentence).split(" ")
+        def phonemize_sentence(sentence):
+            return pyopenjtalk.g2p(sentence).split(" ")
 
     rows = []
     pending_sentence_refs = []

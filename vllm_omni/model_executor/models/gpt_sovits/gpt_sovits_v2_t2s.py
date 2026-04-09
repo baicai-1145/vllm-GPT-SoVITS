@@ -22,6 +22,7 @@ class GPTSoVITSV2T2S(nn.Module):
 
     input_modalities = "audio"
     _SESSION_KEY = "gpt_sovits_ar_session"
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         del prefix
@@ -208,7 +209,9 @@ class GPTSoVITSV2T2S(nn.Module):
             raw_sr.append(torch.tensor(int(payload.raw_sr), dtype=torch.int32))
 
             if session is None and not info.get("skip_synthesis"):
-                logger.warning("GPT-SoVITS v2 AR request %s has no active session", self._request_id_from_info(info, index))
+                logger.warning(
+                    "GPT-SoVITS v2 AR request %s has no active session", self._request_id_from_info(info, index)
+                )
 
         self._pending_logits = torch.cat(logits_rows, dim=0) if logits_rows else self._skip_logits(self._device)
         num_tokens = int(input_ids.numel()) if input_ids is not None and input_ids.numel() > 0 else max(1, num_reqs)

@@ -5,13 +5,11 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Tuple
 
 import torch
 import torchaudio
 
 from TTS_infer_pack.prepare_gpu_timeline import sync_timeline_cuda, trace_gpu_batch
-
 
 REF_AUDIO_MIN_SAMPLES_16K = 48000
 REF_AUDIO_MAX_SAMPLES_16K = 160000
@@ -33,8 +31,8 @@ DEFAULT_REF_BATCH_BUCKETS = (
     169600,
 )
 _RESAMPLE_CACHE_LOCK = threading.Lock()
-_RESAMPLE_CACHE: Dict[Tuple[int, int, str], torchaudio.transforms.Resample] = {}
-_RESAMPLE_STREAM_CACHE: Dict[str, torch.cuda.Stream] = {}
+_RESAMPLE_CACHE: dict[tuple[int, int, str], torchaudio.transforms.Resample] = {}
+_RESAMPLE_STREAM_CACHE: dict[str, torch.cuda.Stream] = {}
 
 
 def _get_resampler(orig_sr: int, target_sr: int, device: str) -> torchaudio.transforms.Resample:
@@ -98,16 +96,19 @@ def conv1d_output_lengths(input_lengths: torch.Tensor, conv1d: torch.nn.Conv1d |
     stride = int(conv1d.stride[0])
     padding = int(conv1d.padding[0])
     dilation = int(conv1d.dilation[0])
-    output_lengths = torch.div(
-        input_lengths + 2 * padding - dilation * (kernel_size - 1) - 1,
-        stride,
-        rounding_mode="floor",
-    ) + 1
+    output_lengths = (
+        torch.div(
+            input_lengths + 2 * padding - dilation * (kernel_size - 1) - 1,
+            stride,
+            rounding_mode="floor",
+        )
+        + 1
+    )
     return torch.clamp(output_lengths, min=0).to(dtype=torch.long)
 
 
-def parse_ref_batch_buckets(raw: str | None) -> List[int]:
-    values: List[int] = []
+def parse_ref_batch_buckets(raw: str | None) -> list[int]:
+    values: list[int] = []
     for item in str(raw or "").split(","):
         item = item.strip()
         if not item:
@@ -144,7 +145,7 @@ class RefSemanticTask:
     done_future: asyncio.Future | None = None
     result_prompt_semantic: torch.Tensor | None = None
     error: Exception | None = None
-    profile: Dict[str, float] = field(default_factory=dict)
+    profile: dict[str, float] = field(default_factory=dict)
 
 
 class PrepareRefSemanticBatchWorker:
@@ -186,17 +187,12 @@ class PrepareRefSemanticBatchWorker:
         self.shard_index = int(shard_index)
         model_config = getattr(getattr(self.ssl_model, "model", None), "config", None)
         feat_extract_norm = str(getattr(model_config, "feat_extract_norm", "") or "").strip().lower()
-        self.skip_attention_mask = (
-            str(
-                os.environ.get(
-                    "GPTSOVITS_PREPARE_REF_SSL_SKIP_ATTENTION_MASK",
-                    "1" if feat_extract_norm == "group" else "0",
-                )
+        self.skip_attention_mask = str(
+            os.environ.get(
+                "GPTSOVITS_PREPARE_REF_SSL_SKIP_ATTENTION_MASK",
+                "1" if feat_extract_norm == "group" else "0",
             )
-            .strip()
-            .lower()
-            not in {"0", "false", "no", "off"}
-        )
+        ).strip().lower() not in {"0", "false", "no", "off"}
         self.use_pinned_h2d = (
             str(os.environ.get("GPTSOVITS_PREPARE_REF_PINNED_H2D", "1")).strip().lower()
             not in {"0", "false", "no", "off"}
@@ -211,13 +207,12 @@ class PrepareRefSemanticBatchWorker:
             os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_MAX_PAD_RATIO"),
             0.20,
         )
-        self.pad_to_bucket_upper_bound = (
-            str(os.environ.get("GPTSOVITS_PREPARE_REF_PAD_TO_BUCKET_UPPER_BOUND", "0")).strip().lower()
-            not in {"0", "false", "no", "off"}
-        )
+        self.pad_to_bucket_upper_bound = str(
+            os.environ.get("GPTSOVITS_PREPARE_REF_PAD_TO_BUCKET_UPPER_BOUND", "0")
+        ).strip().lower() not in {"0", "false", "no", "off"}
 
         self.condition = threading.Condition()
-        self.pending_tasks_by_bucket: Dict[int, Deque[RefSemanticTask]] = {
+        self.pending_tasks_by_bucket: dict[int, deque[RefSemanticTask]] = {
             bucket_index: deque() for bucket_index in range(len(self.bucket_upper_bounds))
         }
         self.pending_peak = 0
@@ -241,8 +236,7 @@ class PrepareRefSemanticBatchWorker:
 
     def _pending_iter_locked(self):
         for queue in self.pending_tasks_by_bucket.values():
-            for task in queue:
-                yield task
+            yield from queue
 
     def _bucket_index_for_samples(self, sample_count: int) -> int:
         target = max(REF_AUDIO_MIN_SAMPLES_16K, int(sample_count))
@@ -286,7 +280,7 @@ class PrepareRefSemanticBatchWorker:
                 selected_created_at = created_at
         return selected_bucket
 
-    def _candidate_bucket_indices(self, anchor_bucket_index: int) -> List[int]:
+    def _candidate_bucket_indices(self, anchor_bucket_index: int) -> list[int]:
         start = max(0, int(anchor_bucket_index) - self.bucket_merge_distance)
         end = min(len(self.bucket_upper_bounds) - 1, int(anchor_bucket_index) + self.bucket_merge_distance)
         return list(range(start, end + 1))
@@ -308,14 +302,17 @@ class PrepareRefSemanticBatchWorker:
             pending_samples = int(sum(self._estimate_task_samples(task) for task in self._pending_iter_locked()))
             return int(pending_samples + self.active_batch_samples)
 
-    def routing_snapshot_for_bucket(self, bucket_index: int) -> Dict[str, int]:
+    def routing_snapshot_for_bucket(self, bucket_index: int) -> dict[str, int]:
         with self.condition:
             candidate_bucket_indices = self._candidate_bucket_indices(bucket_index)
             pending_count = self._pending_count_locked()
             pending_samples = int(sum(self._estimate_task_samples(task) for task in self._pending_iter_locked()))
             return {
                 "mergeable_pending": int(
-                    sum(len(self.pending_tasks_by_bucket[candidate_index]) for candidate_index in candidate_bucket_indices)
+                    sum(
+                        len(self.pending_tasks_by_bucket[candidate_index])
+                        for candidate_index in candidate_bucket_indices
+                    )
                 ),
                 "exact_pending": int(len(self.pending_tasks_by_bucket.get(bucket_index, ()))),
                 "pending": int(pending_count),
@@ -350,7 +347,7 @@ class PrepareRefSemanticBatchWorker:
         raw_sr: int,
         *,
         wav16k: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         task = RefSemanticTask(raw_audio=raw_audio, raw_sr=int(raw_sr), wav16k=wav16k)
         with self.condition:
             bucket_index = self._bucket_index_for_task(task)
@@ -373,11 +370,10 @@ class PrepareRefSemanticBatchWorker:
         *,
         wav16k: torch.Tensor | None = None,
         batch_size: int = 1,
-    ) -> List[Dict[str, float]]:
+    ) -> list[dict[str, float]]:
         warm_batch_size = max(1, int(batch_size))
         tasks = [
-            RefSemanticTask(raw_audio=raw_audio, raw_sr=int(raw_sr), wav16k=wav16k)
-            for _ in range(warm_batch_size)
+            RefSemanticTask(raw_audio=raw_audio, raw_sr=int(raw_sr), wav16k=wav16k) for _ in range(warm_batch_size)
         ]
         with self.condition:
             for task in tasks:
@@ -388,7 +384,7 @@ class PrepareRefSemanticBatchWorker:
             if pending_count > self.pending_peak:
                 self.pending_peak = pending_count
             self.condition.notify_all()
-        profiles: List[Dict[str, float]] = []
+        profiles: list[dict[str, float]] = []
         for task in tasks:
             task.done_event.wait()
             if task.error is not None:
@@ -402,7 +398,7 @@ class PrepareRefSemanticBatchWorker:
         raw_sr: int,
         *,
         wav16k: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         loop = asyncio.get_running_loop()
         task = RefSemanticTask(
             raw_audio=raw_audio,
@@ -440,7 +436,7 @@ class PrepareRefSemanticBatchWorker:
         except RuntimeError:
             pass
 
-    def snapshot(self) -> Dict[str, int]:
+    def snapshot(self) -> dict[str, int]:
         with self.condition:
             pending_count = self._pending_count_locked()
             pending_samples = int(sum(self._estimate_task_samples(task) for task in self._pending_iter_locked()))
@@ -470,7 +466,7 @@ class PrepareRefSemanticBatchWorker:
                 },
             }
 
-    def _collect_batch(self) -> tuple[List[RefSemanticTask], float]:
+    def _collect_batch(self) -> tuple[list[RefSemanticTask], float]:
         with self.condition:
             while self._pending_count_locked() <= 0:
                 self.condition.wait()
@@ -481,7 +477,7 @@ class PrepareRefSemanticBatchWorker:
             selected_queue = self.pending_tasks_by_bucket[selected_bucket_index]
             first_task = selected_queue.popleft()
             first_task.batch_popped_at = time.perf_counter()
-            batch: List[RefSemanticTask] = [first_task]
+            batch: list[RefSemanticTask] = [first_task]
             batch_samples = self._estimate_task_samples(batch[0])
             batch_max_task_samples = batch_samples
             deadline = time.perf_counter() + self.batch_window_s
@@ -490,7 +486,10 @@ class PrepareRefSemanticBatchWorker:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     break
-                if not any(self.pending_tasks_by_bucket[bucket_index] for bucket_index in self._candidate_bucket_indices(selected_bucket_index)):
+                if not any(
+                    self.pending_tasks_by_bucket[bucket_index]
+                    for bucket_index in self._candidate_bucket_indices(selected_bucket_index)
+                ):
                     self.condition.wait(timeout=remaining)
                     continue
 
@@ -545,7 +544,7 @@ class PrepareRefSemanticBatchWorker:
                 self.active_batch_samples_peak = self.active_batch_samples
             return batch, time.perf_counter()
 
-    def _finalize_batch(self, batch: List[RefSemanticTask]) -> None:
+    def _finalize_batch(self, batch: list[RefSemanticTask]) -> None:
         with self.condition:
             self.active_batch_size = 0
             self.active_batch_anchor_bucket_index = -1
@@ -561,9 +560,13 @@ class PrepareRefSemanticBatchWorker:
         raw_lengths = attention_mask.to(dtype=torch.long).sum(dim=1)
         if hasattr(model, "_get_feat_extract_output_lengths"):
             return model._get_feat_extract_output_lengths(raw_lengths).to(dtype=torch.long)
-        return torch.full((attention_mask.shape[0],), int(hidden_length), dtype=torch.long, device=attention_mask.device)
+        return torch.full(
+            (attention_mask.shape[0],), int(hidden_length), dtype=torch.long, device=attention_mask.device
+        )
 
-    def _get_hidden_lengths_from_raw_lengths(self, raw_lengths: torch.Tensor, hidden_length: int, device) -> torch.Tensor:
+    def _get_hidden_lengths_from_raw_lengths(
+        self, raw_lengths: torch.Tensor, hidden_length: int, device
+    ) -> torch.Tensor:
         model = self.ssl_model.model
         raw_lengths = raw_lengths.to(device=device, dtype=torch.long)
         if hasattr(model, "_get_feat_extract_output_lengths"):
@@ -571,7 +574,7 @@ class PrepareRefSemanticBatchWorker:
         return torch.full((raw_lengths.shape[0],), int(hidden_length), dtype=torch.long, device=device)
 
     @torch.inference_mode()
-    def _run_batch(self, batch: List[RefSemanticTask], batch_collected_at: float) -> None:
+    def _run_batch(self, batch: list[RefSemanticTask], batch_collected_at: float) -> None:
         batch_started = time.perf_counter()
         prepared_start = time.perf_counter()
         prepared_wavs = [
@@ -587,10 +590,7 @@ class PrepareRefSemanticBatchWorker:
         max_wav_len = int(wav_lengths.max().item())
         pad_target_len = max_wav_len
         if self.pad_to_bucket_upper_bound:
-            bucket_target_len = max(
-                int(self.bucket_upper_bounds[self._bucket_index_for_task(task)])
-                for task in batch
-            )
+            bucket_target_len = max(int(self.bucket_upper_bounds[self._bucket_index_for_task(task)]) for task in batch)
             pad_target_len = max(pad_target_len, int(bucket_target_len))
         padded_batch_samples = int(len(batch) * pad_target_len)
         batch_pad_ratio = 0.0 if padded_batch_samples <= 0 else max(0.0, 1.0 - (batch_samples / padded_batch_samples))
@@ -714,9 +714,7 @@ class PrepareRefSemanticBatchWorker:
                 batch_collect_wait_ms = max(0.0, (float(batch_collected_at) - float(task.batch_popped_at)) * 1000.0)
                 stage_limiter_wait_ms = float(limiter_stats["wait_ms"])
                 task.profile = {
-                    "prompt_semantic_wait_ms": worker_queue_wait_ms
-                    + batch_collect_wait_ms
-                    + stage_limiter_wait_ms,
+                    "prompt_semantic_wait_ms": worker_queue_wait_ms + batch_collect_wait_ms + stage_limiter_wait_ms,
                     "prompt_semantic_shard_index": float(self.shard_index),
                     "prompt_semantic_worker_queue_wait_ms": worker_queue_wait_ms,
                     "prompt_semantic_batch_collect_wait_ms": batch_collect_wait_ms,
@@ -821,19 +819,17 @@ class PrepareRefSemanticBatchWorkerPool:
     ):
         self.worker_count = max(1, int(worker_count))
         self.lock = threading.Lock()
-        self.runtime_exact_prewarm_enabled = (
-            str(os.environ.get("GPTSOVITS_PREPARE_REF_RUNTIME_EXACT_PREWARM", "0")).strip().lower()
-            not in {"0", "false", "no", "off"}
-        )
+        self.runtime_exact_prewarm_enabled = str(
+            os.environ.get("GPTSOVITS_PREPARE_REF_RUNTIME_EXACT_PREWARM", "0")
+        ).strip().lower() not in {"0", "false", "no", "off"}
         self.runtime_exact_prewarm_lock = threading.Lock()
         self.runtime_exact_prewarm_max_unique = max(
             0,
             int(os.environ.get("GPTSOVITS_PREPARE_REF_RUNTIME_EXACT_PREWARM_MAX_UNIQUE", "4")),
         )
-        self.bucket_first_hit_serialization_enabled = (
-            str(os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_SERIALIZE_FIRST_HITS", "1")).strip().lower()
-            not in {"0", "false", "no", "off"}
-        )
+        self.bucket_first_hit_serialization_enabled = str(
+            os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_SERIALIZE_FIRST_HITS", "1")
+        ).strip().lower() not in {"0", "false", "no", "off"}
         self.bucket_first_hit_required_hits = max(
             0,
             int(os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_SERIALIZE_FIRST_HITS_REQUIRED", "1")),
@@ -852,11 +848,10 @@ class PrepareRefSemanticBatchWorkerPool:
                 continue
         self.bucket_first_hit_bucket_indices = bucket_first_hit_bucket_indices
         self.bucket_first_hit_lock = threading.Lock()
-        self.bucket_first_hit_states: Dict[int, Dict[str, int]] = {}
-        self.bucket_aware_sharding = (
-            str(os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_AWARE_SHARDING", "1")).strip().lower()
-            not in {"0", "false", "no", "off"}
-        )
+        self.bucket_first_hit_states: dict[int, dict[str, int]] = {}
+        self.bucket_aware_sharding = str(
+            os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_AWARE_SHARDING", "1")
+        ).strip().lower() not in {"0", "false", "no", "off"}
         self.bucket_aware_max_outstanding_gap = max(
             0,
             int(os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_AWARE_MAX_OUTSTANDING_GAP", "2")),
@@ -890,7 +885,7 @@ class PrepareRefSemanticBatchWorkerPool:
                 ",".join(str(value) for value in default_exact_prewarm_batch_sizes),
             )
         ).strip()
-        runtime_exact_prewarm_batch_sizes: List[int] = []
+        runtime_exact_prewarm_batch_sizes: list[int] = []
         for item in raw_batch_sizes.split(","):
             item = item.strip()
             if not item:
@@ -944,8 +939,8 @@ class PrepareRefSemanticBatchWorkerPool:
         raw_sr: int,
         *,
         wav16k: torch.Tensor | None = None,
-        batch_sizes: List[int] | None = None,
-    ) -> Dict[str, float]:
+        batch_sizes: list[int] | None = None,
+    ) -> dict[str, float]:
         profile = {
             "prompt_semantic_runtime_exact_prewarm_applied": 0.0,
             "prompt_semantic_runtime_exact_prewarm_ms": 0.0,
@@ -984,7 +979,7 @@ class PrepareRefSemanticBatchWorkerPool:
         raw_sr: int,
         *,
         wav16k: torch.Tensor | None = None,
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         profile = {
             "prompt_semantic_runtime_exact_prewarm_applied": 0.0,
             "prompt_semantic_runtime_exact_prewarm_ms": 0.0,
@@ -1023,7 +1018,7 @@ class PrepareRefSemanticBatchWorkerPool:
         raw_sr: int,
         *,
         wav16k: torch.Tensor | None = None,
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         return self._maybe_runtime_exact_prewarm(raw_audio, raw_sr, wav16k=wav16k)
 
     def _pick_shard(self, bucket_index: int | None = None) -> PrepareRefSemanticBatchWorker:
@@ -1074,7 +1069,7 @@ class PrepareRefSemanticBatchWorkerPool:
         )
         return int(preferred.shard_index)
 
-    def runtime_routing_snapshots_for_bucket(self, bucket_index: int | None) -> List[Dict[str, int]]:
+    def runtime_routing_snapshots_for_bucket(self, bucket_index: int | None) -> list[dict[str, int]]:
         if bucket_index is None:
             return [dict(shard.snapshot()) for shard in self.shards]
         return [
@@ -1151,11 +1146,11 @@ class PrepareRefSemanticBatchWorkerPool:
         raw_sr: int,
         *,
         wav16k: torch.Tensor | None = None,
-        runtime_exact_prewarm_profile: Dict[str, float] | None = None,
+        runtime_exact_prewarm_profile: dict[str, float] | None = None,
         bucket_index: int | None = None,
         preferred_shard_index: int | None = None,
         bucket_first_hit_serialized: bool | None = None,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         runtime_exact_prewarm_profile = dict(runtime_exact_prewarm_profile or {})
         if not runtime_exact_prewarm_profile:
             runtime_exact_prewarm_profile = self._maybe_runtime_exact_prewarm(raw_audio, raw_sr, wav16k=wav16k)
@@ -1164,7 +1159,9 @@ class PrepareRefSemanticBatchWorkerPool:
             if bucket_index is None
             else int(bucket_index)
         )
-        serialized_shard = None if bucket_first_hit_serialized is not None else self._pick_first_hit_serialized_shard(bucket_index)
+        serialized_shard = (
+            None if bucket_first_hit_serialized is not None else self._pick_first_hit_serialized_shard(bucket_index)
+        )
         shard = self._shard_by_index(preferred_shard_index) or serialized_shard or self._pick_shard(bucket_index)
         try:
             result, profile = shard.submit(raw_audio, raw_sr, wav16k=wav16k)
@@ -1175,17 +1172,21 @@ class PrepareRefSemanticBatchWorkerPool:
         profile["prompt_semantic_pool_workers"] = float(self.worker_count)
         profile["prompt_semantic_pool_bucket_index"] = float(bucket_index)
         profile["prompt_semantic_bucket_first_hit_serialized"] = float(
-            1.0 if (bucket_first_hit_serialized if bucket_first_hit_serialized is not None else serialized_shard is not None) else 0.0
+            1.0
+            if (
+                bucket_first_hit_serialized if bucket_first_hit_serialized is not None else serialized_shard is not None
+            )
+            else 0.0
         )
         return result, profile
 
     def prewarm(
         self,
-        plans: List[Dict[str, torch.Tensor | int | float]],
+        plans: list[dict[str, torch.Tensor | int | float]],
         rounds: int = 1,
-    ) -> List[Dict[str, float]]:
+    ) -> list[dict[str, float]]:
         warm_rounds = max(1, int(rounds))
-        profiles: List[Dict[str, float]] = []
+        profiles: list[dict[str, float]] = []
         for warm_round in range(warm_rounds):
             for shard in self.shards:
                 for plan_index, plan in enumerate(plans):
@@ -1214,11 +1215,11 @@ class PrepareRefSemanticBatchWorkerPool:
         raw_sr: int,
         *,
         wav16k: torch.Tensor | None = None,
-        runtime_exact_prewarm_profile: Dict[str, float] | None = None,
+        runtime_exact_prewarm_profile: dict[str, float] | None = None,
         bucket_index: int | None = None,
         preferred_shard_index: int | None = None,
         bucket_first_hit_serialized: bool | None = None,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         runtime_exact_prewarm_profile = dict(runtime_exact_prewarm_profile or {})
         if not runtime_exact_prewarm_profile:
             runtime_exact_prewarm_profile = self._maybe_runtime_exact_prewarm(raw_audio, raw_sr, wav16k=wav16k)
@@ -1227,7 +1228,9 @@ class PrepareRefSemanticBatchWorkerPool:
             if bucket_index is None
             else int(bucket_index)
         )
-        serialized_shard = None if bucket_first_hit_serialized is not None else self._pick_first_hit_serialized_shard(bucket_index)
+        serialized_shard = (
+            None if bucket_first_hit_serialized is not None else self._pick_first_hit_serialized_shard(bucket_index)
+        )
         shard = self._shard_by_index(preferred_shard_index) or serialized_shard or self._pick_shard(bucket_index)
         try:
             result, profile = await shard.submit_async(raw_audio, raw_sr, wav16k=wav16k)
@@ -1238,11 +1241,15 @@ class PrepareRefSemanticBatchWorkerPool:
         profile["prompt_semantic_pool_workers"] = float(self.worker_count)
         profile["prompt_semantic_pool_bucket_index"] = float(bucket_index)
         profile["prompt_semantic_bucket_first_hit_serialized"] = float(
-            1.0 if (bucket_first_hit_serialized if bucket_first_hit_serialized is not None else serialized_shard is not None) else 0.0
+            1.0
+            if (
+                bucket_first_hit_serialized if bucket_first_hit_serialized is not None else serialized_shard is not None
+            )
+            else 0.0
         )
         return result, profile
 
-    def snapshot(self) -> Dict[str, int | List[Dict[str, int]]]:
+    def snapshot(self) -> dict[str, int | list[dict[str, int]]]:
         shard_snapshots = [dict(shard.snapshot()) for shard in self.shards]
         return {
             "worker_count": int(self.worker_count),
@@ -1264,7 +1271,9 @@ class PrepareRefSemanticBatchWorkerPool:
             "pending": int(sum(int(snapshot.get("pending", 0)) for snapshot in shard_snapshots)),
             "pending_peak": int(max((int(snapshot.get("pending_peak", 0)) for snapshot in shard_snapshots), default=0)),
             "outstanding": int(sum(int(snapshot.get("outstanding", 0)) for snapshot in shard_snapshots)),
-            "outstanding_samples": int(sum(int(snapshot.get("outstanding_samples", 0)) for snapshot in shard_snapshots)),
+            "outstanding_samples": int(
+                sum(int(snapshot.get("outstanding_samples", 0)) for snapshot in shard_snapshots)
+            ),
             "total_submitted": int(sum(int(snapshot.get("total_submitted", 0)) for snapshot in shard_snapshots)),
             "total_finished": int(sum(int(snapshot.get("total_finished", 0)) for snapshot in shard_snapshots)),
             "total_batches": int(sum(int(snapshot.get("total_batches", 0)) for snapshot in shard_snapshots)),
@@ -1272,7 +1281,9 @@ class PrepareRefSemanticBatchWorkerPool:
             "active_batch_peak": int(
                 max((int(snapshot.get("active_batch_peak", 0)) for snapshot in shard_snapshots), default=0)
             ),
-            "active_batch_samples": int(sum(int(snapshot.get("active_batch_samples", 0)) for snapshot in shard_snapshots)),
+            "active_batch_samples": int(
+                sum(int(snapshot.get("active_batch_samples", 0)) for snapshot in shard_snapshots)
+            ),
             "active_batch_samples_peak": int(
                 max((int(snapshot.get("active_batch_samples_peak", 0)) for snapshot in shard_snapshots), default=0)
             ),

@@ -4,8 +4,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict
-
+from typing import Any
 
 _TRACE_PATH = os.environ.get("GPTSOVITS_PREPARE_GPU_TIMELINE_PATH", "").strip()
 _TRACE_MAX_EVENTS = max(0, int(os.environ.get("GPTSOVITS_PREPARE_GPU_TIMELINE_MAX_EVENTS", "0") or 0))
@@ -75,7 +74,7 @@ def trace_gpu_batch(kind: str, **payload: Any) -> None:
         trace_file = _ensure_trace_file()
         if trace_file is None:
             return
-        event: Dict[str, Any] = {
+        event: dict[str, Any] = {
             "kind": str(kind),
             "pid": int(os.getpid()),
             "thread": threading.current_thread().name,

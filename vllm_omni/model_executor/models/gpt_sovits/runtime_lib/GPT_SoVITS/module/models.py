@@ -4,30 +4,26 @@ warnings.filterwarnings("ignore")
 import contextlib
 import math
 import os
+import random
 import threading
 import time
-from typing import List
 
 import torch
-from torch import nn
-from torch.nn import functional as F
-
-from module import commons
-from module import modules
-from module import attentions
 from f5_tts.model import DiT
-from torch.nn import Conv1d, ConvTranspose1d, Conv2d
-from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
-from module.commons import init_weights, get_padding
-from module.mrte_model import MRTE
-from module.quantize import ResidualVectorQuantizer
 
 # from text import symbols
 from text import symbols as symbols_v1
 from text import symbols2 as symbols_v2
+from torch import nn
 from torch.cuda.amp import autocast
-import contextlib
-import random
+from torch.nn import Conv1d, Conv2d, ConvTranspose1d
+from torch.nn import functional as F
+from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
+
+from module import attentions, commons, modules
+from module.commons import get_padding, init_weights
+from module.mrte_model import MRTE
+from module.quantize import ResidualVectorQuantizer
 
 
 def _sync_profile_device(device):
@@ -118,11 +114,7 @@ def _vits_decoder_channels_last_resblock_enabled() -> bool:
 
 @contextlib.contextmanager
 def _vits_decoder_tf32_context(x: torch.Tensor):
-    if (
-        not _vits_decoder_tf32_enabled()
-        or x.device.type != "cuda"
-        or x.dtype != torch.float32
-    ):
+    if not _vits_decoder_tf32_enabled() or x.device.type != "cuda" or x.dtype != torch.float32:
         yield
         return
     prev_matmul = torch.backends.cuda.matmul.allow_tf32
@@ -264,6 +256,7 @@ class DurationPredictor(nn.Module):
 
 WINDOW = {}
 
+
 class TextEncoder(nn.Module):
     def __init__(
         self,
@@ -322,7 +315,19 @@ class TextEncoder(nn.Module):
 
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-    def forward(self, y, y_lengths, text, text_lengths, ge, speed=1, test=None, result_length:int=None, overlap_frames:torch.Tensor=None, padding_length:int=None):
+    def forward(
+        self,
+        y,
+        y_lengths,
+        text,
+        text_lengths,
+        ge,
+        speed=1,
+        test=None,
+        result_length: int = None,
+        overlap_frames: torch.Tensor = None,
+        padding_length: int = None,
+    ):
         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
 
         y = self.ssl_proj(y * y_mask) * y_mask
@@ -336,10 +341,9 @@ class TextEncoder(nn.Module):
         text = self.encoder_text(text * text_mask, text_mask)
         y = self.mrte(y, y_mask, text, text_mask, ge)
 
-        if padding_length is not None and padding_length!=0:
+        if padding_length is not None and padding_length != 0:
             y = y[:, :, :-padding_length]
             y_mask = y_mask[:, :, :-padding_length]
-
 
         y = self.encoder2(y * y_mask, y_mask)
 
@@ -352,20 +356,19 @@ class TextEncoder(nn.Module):
             window = WINDOW.get(overlap_len, None)
             if window is None:
                 # WINDOW[overlap_len] = torch.hann_window(overlap_len*2, device=y.device, dtype=y.dtype)
-                WINDOW[overlap_len] = torch.sin(torch.arange(overlap_len*2, device=y.device) * torch.pi / (overlap_len*2))
+                WINDOW[overlap_len] = torch.sin(
+                    torch.arange(overlap_len * 2, device=y.device) * torch.pi / (overlap_len * 2)
+                )
                 window = WINDOW[overlap_len]
 
-
             window = window.to(y.device)
-            y[:,:,:overlap_len] = (
-                window[:overlap_len].view(1, 1, -1) * y[:,:,:overlap_len]
+            y[:, :, :overlap_len] = (
+                window[:overlap_len].view(1, 1, -1) * y[:, :, :overlap_len]
                 + window[overlap_len:].view(1, 1, -1) * overlap_frames
             )
-            
+
         y_ = y
         y_mask_ = y_mask
-
-
 
         if speed != 1:
             y = F.interpolate(y, size=int(y.shape[-1] / speed) + 1, mode="linear")
@@ -470,7 +473,7 @@ class PosteriorEncoder(nn.Module):
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(self, x, x_lengths, g=None):
-        if g != None:
+        if g is not None:
             g = g.detach()
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
         x = self.pre(x) * x_mask
@@ -499,7 +502,7 @@ class Encoder(nn.Module):
         self.proj = nn.Conv1d(hidden_channels, out_channels, 1)
 
     def forward(self, x, x_lengths, g=None):
-        if g != None:
+        if g is not None:
             g = g.detach()
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
         x = self.pre(x) * x_mask
@@ -561,7 +564,7 @@ class Generator(torch.nn.Module):
         gin_channels=0,
         is_bias=False,
     ):
-        super(Generator, self).__init__()
+        super().__init__()
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
         self.conv_pre = Conv1d(initial_channel, upsample_initial_channel, 7, 1, padding=3)
@@ -841,10 +844,10 @@ class Generator(torch.nn.Module):
 
 class DiscriminatorP(torch.nn.Module):
     def __init__(self, period, kernel_size=5, stride=3, use_spectral_norm=False):
-        super(DiscriminatorP, self).__init__()
+        super().__init__()
         self.period = period
         self.use_spectral_norm = use_spectral_norm
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+        norm_f = weight_norm if not use_spectral_norm else spectral_norm
         self.convs = nn.ModuleList(
             [
                 norm_f(
@@ -920,8 +923,8 @@ class DiscriminatorP(torch.nn.Module):
 
 class DiscriminatorS(torch.nn.Module):
     def __init__(self, use_spectral_norm=False):
-        super(DiscriminatorS, self).__init__()
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+        super().__init__()
+        norm_f = weight_norm if not use_spectral_norm else spectral_norm
         self.convs = nn.ModuleList(
             [
                 norm_f(Conv1d(1, 16, 15, 1, padding=7)),
@@ -953,7 +956,7 @@ v2pro_set = {"v2Pro", "v2ProPlus"}
 
 class MultiPeriodDiscriminator(torch.nn.Module):
     def __init__(self, use_spectral_norm=False, version=None):
-        super(MultiPeriodDiscriminator, self).__init__()
+        super().__init__()
         if version in v2pro_set:
             periods = [2, 3, 5, 7, 11, 17, 23]
         else:
@@ -1040,7 +1043,7 @@ class ReferenceEncoder(nn.Module):
 
 class Quantizer_module(torch.nn.Module):
     def __init__(self, n_e, e_dim):
-        super(Quantizer_module, self).__init__()
+        super().__init__()
         self.embedding = nn.Embedding(n_e, e_dim)
         self.embedding.weight.data.uniform_(-1.0 / n_e, 1.0 / n_e)
 
@@ -1050,14 +1053,14 @@ class Quantizer_module(torch.nn.Module):
             + torch.sum(self.embedding.weight**2, 1)
             - 2 * torch.matmul(x, self.embedding.weight.T)
         )
-        min_indicies = torch.argmin(d, 1)
-        z_q = self.embedding(min_indicies)
-        return z_q, min_indicies
+        min_indices = torch.argmin(d, 1)
+        z_q = self.embedding(min_indices)
+        return z_q, min_indices
 
 
 class Quantizer(torch.nn.Module):
     def __init__(self, embed_dim=512, n_code_groups=4, n_codes=160):
-        super(Quantizer, self).__init__()
+        super().__init__()
         assert embed_dim % n_code_groups == 0
         self.quantizer_modules = nn.ModuleList(
             [Quantizer_module(n_codes, embed_dim // n_code_groups) for _ in range(n_code_groups)]
@@ -1071,17 +1074,17 @@ class Quantizer(torch.nn.Module):
         xin = xin.transpose(1, 2)
         x = xin.reshape(-1, self.embed_dim)
         x = torch.split(x, self.embed_dim // self.n_code_groups, dim=-1)
-        min_indicies = []
+        min_indices = []
         z_q = []
         for _x, m in zip(x, self.quantizer_modules):
-            _z_q, _min_indicies = m(_x)
+            _z_q, _min_indices = m(_x)
             z_q.append(_z_q)
-            min_indicies.append(_min_indicies)  # B * T,
+            min_indices.append(_min_indices)  # B * T,
         z_q = torch.cat(z_q, -1).reshape(xin.shape)
         loss = 0.25 * torch.mean((z_q.detach() - xin) ** 2) + torch.mean((z_q - xin.detach()) ** 2)
         z_q = xin + (z_q - xin).detach()
         z_q = z_q.transpose(1, 2)
-        codes = torch.stack(min_indicies, -1).reshape(B, T, self.n_code_groups)
+        codes = torch.stack(min_indices, -1).reshape(B, T, self.n_code_groups)
         return z_q, loss, codes.transpose(1, 2)
 
     def embed(self, x):
@@ -1354,12 +1357,16 @@ class SynthesizerTrn(nn.Module):
                     "g": static_g,
                     "out": static_out,
                 }
-                runtime_stats["decoder_runtime_cudagraph_capture_ms"] = float((time.perf_counter() - started_at) * 1000.0)
+                runtime_stats["decoder_runtime_cudagraph_capture_ms"] = float(
+                    (time.perf_counter() - started_at) * 1000.0
+                )
                 runtime_stats["decoder_runtime_cudagraph_captures"] = 1
             except Exception as exc:
                 self._decoder_cuda_graph_failures.add(key)
                 self._decoder_cuda_graph_failure_reasons[key] = f"{type(exc).__name__}: {exc}"
-                runtime_stats["decoder_runtime_cudagraph_failure_reason"] = self._decoder_cuda_graph_failure_reasons[key]
+                runtime_stats["decoder_runtime_cudagraph_failure_reason"] = self._decoder_cuda_graph_failure_reasons[
+                    key
+                ]
 
     def _decode_audio_runtime(
         self,
@@ -1405,12 +1412,16 @@ class SynthesizerTrn(nn.Module):
         if cuda_graph_entry is not None:
             started_at = time.perf_counter()
             cuda_graph_entry["x"].copy_(x)
-            runtime_stats["decoder_runtime_cudagraph_input_copy_ms"] = float((time.perf_counter() - started_at) * 1000.0)
+            runtime_stats["decoder_runtime_cudagraph_input_copy_ms"] = float(
+                (time.perf_counter() - started_at) * 1000.0
+            )
             static_g = cuda_graph_entry["g"]
             if static_g is not None and g is not None:
                 started_at = time.perf_counter()
                 static_g.copy_(g)
-                runtime_stats["decoder_runtime_cudagraph_cond_copy_ms"] = float((time.perf_counter() - started_at) * 1000.0)
+                runtime_stats["decoder_runtime_cudagraph_cond_copy_ms"] = float(
+                    (time.perf_counter() - started_at) * 1000.0
+                )
             started_at = time.perf_counter()
             with _vits_decoder_tf32_context(x):
                 cuda_graph_entry["graph"].replay()
@@ -1431,7 +1442,9 @@ class SynthesizerTrn(nn.Module):
                 return cuda_graph_entry["out"]
             started_at = time.perf_counter()
             output = cuda_graph_entry["out"].clone()
-            runtime_stats["decoder_runtime_cudagraph_output_clone_ms"] = float((time.perf_counter() - started_at) * 1000.0)
+            runtime_stats["decoder_runtime_cudagraph_output_clone_ms"] = float(
+                (time.perf_counter() - started_at) * 1000.0
+            )
             self._set_last_decoder_runtime_stats(runtime_stats)
             return output
         if runtime_dec is not None and _vits_static_bucket_compile_enabled():
@@ -1528,7 +1541,9 @@ class SynthesizerTrn(nn.Module):
         if self.semantic_frame_rate == "25hz":
             quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
 
-        x, m_p, logs_p, y_mask, _, _ = self.enc_p(quantized, y_lengths, text, text_lengths, ge512 if self.is_v2pro else ge)
+        x, m_p, logs_p, y_mask, _, _ = self.enc_p(
+            quantized, y_lengths, text, text_lengths, ge512 if self.is_v2pro else ge
+        )
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=ge)
         z_p = self.flow(z, y_mask, g=ge)
 
@@ -1563,7 +1578,6 @@ class SynthesizerTrn(nn.Module):
 
         o = self._decode_audio_runtime((z * y_mask)[:, :, :], g=ge)
         return o, y_mask, (z, z_p, m_p, logs_p)
-
 
     @torch.no_grad()
     def decode(self, codes, text, refer, noise_scale=0.5, speed=1, sv_emb=None):
@@ -1619,7 +1633,7 @@ class SynthesizerTrn(nn.Module):
         code_lengths: torch.Tensor,
         text: torch.Tensor,
         text_lengths: torch.Tensor,
-        refer_list: List[torch.Tensor],
+        refer_list: list[torch.Tensor],
         noise_scale: float = 0.5,
         speed: float = 1,
         sv_emb: torch.Tensor | None = None,
@@ -1700,9 +1714,19 @@ class SynthesizerTrn(nn.Module):
         audio_lengths = y_mask.squeeze(1).sum(dim=1).to(dtype=torch.long) * int(upsample_factor)
         return audio, audio_lengths
 
-
     @torch.no_grad()
-    def decode_streaming(self, codes, text, refer, noise_scale=0.5, speed=1, sv_emb=None, result_length:int=None, overlap_frames:torch.Tensor=None, padding_length:int=None):
+    def decode_streaming(
+        self,
+        codes,
+        text,
+        refer,
+        noise_scale=0.5,
+        speed=1,
+        sv_emb=None,
+        result_length: int = None,
+        overlap_frames: torch.Tensor = None,
+        padding_length: int = None,
+    ):
         def get_ge(refer, sv_emb):
             ge = None
             if refer is not None:
@@ -1733,8 +1757,8 @@ class SynthesizerTrn(nn.Module):
         quantized = self.quantizer.decode(codes)
         if self.semantic_frame_rate == "25hz":
             quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
-            result_length = (2*result_length) if result_length is not None else None
-            padding_length = (2*padding_length) if padding_length is not None else None
+            result_length = (2 * result_length) if result_length is not None else None
+            padding_length = (2 * padding_length) if padding_length is not None else None
         x, m_p, logs_p, y_mask, y_, y_mask_ = self.enc_p(
             quantized,
             y_lengths,
@@ -1742,10 +1766,10 @@ class SynthesizerTrn(nn.Module):
             text_lengths,
             self.ge_to512(ge.transpose(2, 1)).transpose(2, 1) if self.is_v2pro else ge,
             speed,
-            result_length=result_length, 
-            overlap_frames=overlap_frames, 
-            padding_length=padding_length
-            )
+            result_length=result_length,
+            overlap_frames=overlap_frames,
+            padding_length=padding_length,
+        )
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
 
         z = self.flow(z_p, y_mask, g=ge, reverse=True)
@@ -1955,7 +1979,7 @@ class SynthesizerTrnV3(nn.Module):
             100,
             DiT(**dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=inter_channels2, conv_layers=4)),
         )  # text_dim is condition feature dim
-        if self.freeze_quantizer == True:
+        if self.freeze_quantizer:
             set_no_grad(self.ssl_proj)
             set_no_grad(self.quantizer)
             set_no_grad(self.enc_p)
@@ -1994,7 +2018,7 @@ class SynthesizerTrnV3(nn.Module):
     def decode_encp(self, codes, text, refer, ge=None, speed=1):
         # print(2333333,refer.shape)
         # ge=None
-        if ge == None:
+        if ge is None:
             refer_lengths = torch.LongTensor([refer.size(2)]).to(refer.device)
             refer_mask = torch.unsqueeze(commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
             ge = self.ref_enc(refer[:, :704] * refer_mask, refer_mask)
@@ -2012,7 +2036,7 @@ class SynthesizerTrnV3(nn.Module):
         x, m_p, logs_p, y_mask, _, _ = self.enc_p(quantized, y_lengths, text, text_lengths, ge, speed)
         fea = self.bridge(x)
         fea = F.interpolate(fea, scale_factor=(1.875 if self.version == "v3" else 2), mode="nearest")  ##BCT
-        ####more wn paramter to learn mel
+        ####more wn parameter to learn mel
         fea, y_mask_ = self.wns1(fea, y_lengths1, ge)
         return fea, ge
 
@@ -2158,7 +2182,7 @@ class SynthesizerTrnV3b(nn.Module):
     def decode_encp(self, codes, text, refer, ge=None):
         # print(2333333,refer.shape)
         # ge=None
-        if ge == None:
+        if ge is None:
             refer_lengths = torch.LongTensor([refer.size(2)]).to(refer.device)
             refer_mask = torch.unsqueeze(commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
             ge = self.ref_enc(refer[:, :704] * refer_mask, refer_mask)
@@ -2172,7 +2196,7 @@ class SynthesizerTrnV3b(nn.Module):
         x, m_p, logs_p, y_mask, y_, y_mask_ = self.enc_p(quantized, y_lengths, text, text_lengths, ge)
         fea = self.bridge(x)
         fea = F.interpolate(fea, scale_factor=1.875, mode="nearest")  ##BCT
-        ####more wn paramter to learn mel
+        ####more wn parameter to learn mel
         fea, y_mask_ = self.wns1(fea, y_lengths1, ge)
         return fea, ge
 

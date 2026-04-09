@@ -2,13 +2,16 @@
 
 import re
 import threading
+
 import cn2an
 import ToJyutping
 
 from text.symbols import punctuation
-from text.zh_normalization.text_normlization import TextNormalizer
+from text.zh_normalization.text_normalization import TextNormalizer
 
-normalizer = lambda x: cn2an.transform(x, "an2cn")
+
+def normalizer(x):
+    return cn2an.transform(x, "an2cn")
 
 INITIALS = [
     "aa",
@@ -168,11 +171,11 @@ def jyuping_to_initials_finals_tones(jyuping_syllables):
     phones = []
     for a, b in zip(initials_finals, tones):
         if b not in [-1, 0]:  ###防止粤语和普通话重合开头加Y，如果是标点，不加。
-            todo = "%s%s" % (a, b)
+            todo = f"{a}{b}"
         else:
             todo = a
         if todo not in punctuation_set:
-            todo = "Y%s" % todo
+            todo = f"Y{todo}"
         phones.append(todo)
 
     # return initials_finals, tones, word2ph
@@ -192,7 +195,7 @@ def get_jyutping(text):
                 if len(punct) > 0:
                     jyutping_array.append(punct)
         else:
-            # match multple jyutping eg: liu4 ge3, or single jyutping eg: liu4
+            # match multiple jyutping eg: liu4 ge3, or single jyutping eg: liu4
             if not re.search(r"^([a-z]+[1-6]+[ ]?)+$", syllable):
                 raise ValueError(f"Failed to convert {word} to jyutping: {syllable}")
             jyutping_array.append(syllable)

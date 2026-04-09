@@ -3,22 +3,20 @@ import re
 import sys
 import threading
 from collections import OrderedDict
-from typing import Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
+from text import chinese2, cleaned_text_to_sequence
+from text.cleaner import clean_text, clean_text_batch
 from text.LangSegmenter import LangSegmenter
 from text.split_fastpath_native import scan_selective_direct_runs as scan_selective_direct_runs_native
-from text import cleaned_text_to_sequence
-from text import chinese2
-from text.cleaner import clean_text, clean_text_batch
 
-
-PreparedTextSegmentPayload = Dict[str, object]
-PreparedTextSegmentBatchItem = Tuple[str, str, str, bool]
-_PayloadCacheKey = Tuple[str, str, str, bool, str]
-_SegmentJob = Tuple[int, str, str, str]
+PreparedTextSegmentPayload = dict[str, object]
+PreparedTextSegmentBatchItem = tuple[str, str, str, bool]
+_PayloadCacheKey = tuple[str, str, str, bool, str]
+_SegmentJob = tuple[int, str, str, str]
 _MULTISPACE_PATTERN = re.compile(r" {2,}")
 _AUTO_ZH_FASTPATH_ALLOWED_PATTERN = re.compile(r"^[\u4e00-\u9fff0-9\s、，。！？,.!?…：；\-—~～/·]+$")
 _AUTO_EN_FASTPATH_PATTERN = re.compile(
@@ -35,7 +33,9 @@ _YUE_FASTPATH_ALLOWED_PATTERN = re.compile(r"^[\u4e00-\u9fff0-9\s、，。！？
 _JA_FASTPATH_ALLOWED_PATTERN = re.compile(
     r"^[\u3005\u3040-\u30ff\u4e00-\u9fff\uff11-\uff19\uff21-\uff3a\uff41-\uff5a\uff66-\uff9d0-9\s、，。！？,.!?…：；\-—~～/·]+$"
 )
-_KO_FASTPATH_ALLOWED_PATTERN = re.compile(r"^[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af0-9\s、，。！？,.!?…：；\-—~～/·]+$")
+_KO_FASTPATH_ALLOWED_PATTERN = re.compile(
+    r"^[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af0-9\s、，。！？,.!?…：；\-—~～/·]+$"
+)
 _DIRECT_FASTPATH_LATIN_PATTERN = re.compile(r"[A-Za-z\uff21-\uff3a\uff41-\uff5a]")
 _WHITESPACE_TOKEN_PATTERN = re.compile(r"\S+\s*")
 _TOKEN_STRIP_PUNCT_PATTERN = re.compile(r"^[、，。！？,.!?…：；\-—~～/·]+|[、，。！？,.!?…：；\-—~～/·]+$")
@@ -44,7 +44,7 @@ _TRIVIAL_BRIDGE_PATTERN = re.compile(r"^[0-9\s、，。！？,.!?…：；\-—~
 _ASCII_TRIVIAL_BRIDGE_CHARS = frozenset(",.!?-/~")
 _UNICODE_TRIVIAL_BRIDGE_CHARS = frozenset("、，。！？…：；—～/·")
 _PAYLOAD_CACHE_LOCK = threading.Lock()
-_PAYLOAD_CACHE: "OrderedDict[_PayloadCacheKey, List[PreparedTextSegmentPayload]]" = OrderedDict()
+_PAYLOAD_CACHE: "OrderedDict[_PayloadCacheKey, list[PreparedTextSegmentPayload]]" = OrderedDict()
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -196,14 +196,14 @@ def _classify_whitespace_token(text: str, language: str) -> str | None:
     return None
 
 
-def _try_whitespace_mixed_fast_path(text: str, language: str) -> Tuple[List[str], List[str]] | None:
+def _try_whitespace_mixed_fast_path(text: str, language: str) -> tuple[list[str], list[str]] | None:
     if str(language) not in {"auto", "auto_yue"}:
         return None
     token_matches = list(_WHITESPACE_TOKEN_PATTERN.finditer(str(text)))
     if len(token_matches) <= 1:
         return None
-    textlist: List[str] = []
-    langlist: List[str] = []
+    textlist: list[str] = []
+    langlist: list[str] = []
     for match in token_matches:
         chunk = match.group(0)
         detected_lang = _classify_whitespace_token(chunk, language)
@@ -229,11 +229,7 @@ def _is_ascii_or_fullwidth_latin(ch: str) -> bool:
 
 def _is_korean_char(ch: str) -> bool:
     codepoint = ord(ch)
-    return (
-        0x1100 <= codepoint <= 0x11FF
-        or 0x3130 <= codepoint <= 0x318F
-        or 0xAC00 <= codepoint <= 0xD7AF
-    )
+    return 0x1100 <= codepoint <= 0x11FF or 0x3130 <= codepoint <= 0x318F or 0xAC00 <= codepoint <= 0xD7AF
 
 
 def _is_kana_char(ch: str) -> bool:
@@ -263,12 +259,15 @@ def _consume_direct_script_run(text: str, start: int, script: str) -> int:
     cursor = start
 
     if script == "en":
+
         def _is_core_char(value: str) -> bool:
             return _is_ascii_or_fullwidth_latin(value) or value.isdigit() or value in {"'", "_", "-"}
     elif script == "ko":
+
         def _is_core_char(value: str) -> bool:
             return _is_korean_char(value)
     else:
+
         def _is_core_char(value: str) -> bool:
             return _is_kana_char(value)
 
@@ -285,7 +284,7 @@ def _consume_direct_script_run(text: str, start: int, script: str) -> int:
     return cursor
 
 
-def _consume_cjk_block(text: str, start: int) -> Tuple[int, bool, bool]:
+def _consume_cjk_block(text: str, start: int) -> tuple[int, bool, bool]:
     text_length = len(text)
     cursor = start
     saw_kana = False
@@ -330,10 +329,10 @@ def _consume_misc_ambiguous_block(text: str, start: int) -> int:
 
 
 def _merge_direct_and_resolved_specs(
-    direct_specs: Sequence[Tuple[str, str] | None],
-    resolved_specs: Sequence[List[Tuple[str, str]]],
-) -> Tuple[List[str], List[str]]:
-    merged_specs: List[Tuple[str, str]] = []
+    direct_specs: Sequence[tuple[str, str] | None],
+    resolved_specs: Sequence[list[tuple[str, str]]],
+) -> tuple[list[str], list[str]]:
+    merged_specs: list[tuple[str, str]] = []
     resolved_index = 0
     for spec in direct_specs:
         if spec is None:
@@ -346,11 +345,11 @@ def _merge_direct_and_resolved_specs(
 
 def _resolve_selective_direct_native_rows(
     texts: Sequence[str],
-    native_rows: Sequence[Sequence[Tuple[str, int]]],
+    native_rows: Sequence[Sequence[tuple[str, int]]],
     language: str,
-) -> List[Tuple[List[str], List[str]]]:
-    per_text_specs: List[List[Tuple[str, str] | None]] = []
-    ambiguous_chunks: List[str] = []
+) -> list[tuple[list[str], list[str]]]:
+    per_text_specs: list[list[tuple[str, str] | None]] = []
+    ambiguous_chunks: list[str] = []
     lang_map = {
         _NATIVE_SPAN_EN: "en",
         _NATIVE_SPAN_KO: "ko",
@@ -358,7 +357,7 @@ def _resolve_selective_direct_native_rows(
     }
 
     for _text, row in zip(texts, native_rows):
-        specs: List[Tuple[str, str] | None] = []
+        specs: list[tuple[str, str] | None] = []
         for chunk, span_type in row:
             if int(span_type) == _NATIVE_SPAN_AMBIGUOUS:
                 chunk_text = str(chunk)
@@ -368,14 +367,14 @@ def _resolve_selective_direct_native_rows(
                 specs.append((str(chunk), lang_map[int(span_type)]))
         per_text_specs.append(specs)
 
-    resolved_specs: List[List[Tuple[str, str]]] = []
+    resolved_specs: list[list[tuple[str, str]]] = []
     if ambiguous_chunks:
         ambiguous_rows = LangSegmenter.getTextsBatch(ambiguous_chunks)
         for items in ambiguous_rows:
             textlist, langlist = _langsegmenter_items_to_segment_lists(items, language)
             resolved_specs.append(list(zip(textlist, langlist)))
 
-    results: List[Tuple[List[str], List[str]]] = []
+    results: list[tuple[list[str], list[str]]] = []
     resolved_offset = 0
     for specs in per_text_specs:
         ambiguous_count = sum(1 for spec in specs if spec is None)
@@ -388,14 +387,14 @@ def _resolve_selective_direct_native_rows(
 def _split_texts_by_language_batch_selective_direct_runs(
     texts: Sequence[str],
     language: str,
-) -> List[Tuple[List[str], List[str]]] | None:
+) -> list[tuple[list[str], list[str]]] | None:
     if str(language) not in {"auto", "auto_yue"}:
         return None
     native_rows = scan_selective_direct_runs_native(texts)
     if native_rows is not None:
         return _resolve_selective_direct_native_rows(texts, native_rows, language)
-    per_text_specs: List[List[Tuple[str, str] | None]] = []
-    ambiguous_chunks: List[str] = []
+    per_text_specs: list[list[tuple[str, str] | None]] = []
+    ambiguous_chunks: list[str] = []
     has_direct_run = False
     ascii_trivial_bridge_chars = _ASCII_TRIVIAL_BRIDGE_CHARS
     unicode_trivial_bridge_chars = _UNICODE_TRIVIAL_BRIDGE_CHARS
@@ -407,7 +406,7 @@ def _split_texts_by_language_batch_selective_direct_runs(
 
     for raw_text in texts:
         text = str(raw_text)
-        specs: List[Tuple[str, str] | None] = []
+        specs: list[tuple[str, str] | None] = []
         cursor = 0
         text_length = len(text)
         char_types = bytearray(text_length)
@@ -429,11 +428,7 @@ def _split_texts_by_language_batch_selective_direct_runs(
             ):
                 char_types[index] = en_type
                 continue
-            if (
-                0x1100 <= codepoint <= 0x11FF
-                or 0x3130 <= codepoint <= 0x318F
-                or 0xAC00 <= codepoint <= 0xD7AF
-            ):
+            if 0x1100 <= codepoint <= 0x11FF or 0x3130 <= codepoint <= 0x318F or 0xAC00 <= codepoint <= 0xD7AF:
                 char_types[index] = ko_type
                 continue
             if 0x3040 <= codepoint <= 0x30FF or 0xFF66 <= codepoint <= 0xFF9D:
@@ -444,7 +439,7 @@ def _split_texts_by_language_batch_selective_direct_runs(
 
         pending_bridge_start = -1
         while cursor < text_length:
-            current = text[cursor]
+            text[cursor]
             current_type = char_types[cursor]
             if current_type == bridge_type:
                 if pending_bridge_start < 0:
@@ -561,14 +556,14 @@ def _split_texts_by_language_batch_selective_direct_runs(
     if not has_direct_run:
         return None
 
-    resolved_specs: List[List[Tuple[str, str]]] = []
+    resolved_specs: list[list[tuple[str, str]]] = []
     if ambiguous_chunks:
         ambiguous_rows = LangSegmenter.getTextsBatch(ambiguous_chunks)
         for items in ambiguous_rows:
             textlist, langlist = _langsegmenter_items_to_segment_lists(items, language)
             resolved_specs.append(list(zip(textlist, langlist)))
 
-    results: List[Tuple[List[str], List[str]]] = []
+    results: list[tuple[list[str], list[str]]] = []
     resolved_offset = 0
     for specs in per_text_specs:
         ambiguous_count = sum(1 for spec in specs if spec is None)
@@ -579,10 +574,10 @@ def _split_texts_by_language_batch_selective_direct_runs(
 
 
 def _merge_segment_specs(
-    specs: Sequence[Tuple[str, str]],
-) -> Tuple[List[str], List[str]]:
-    textlist: List[str] = []
-    langlist: List[str] = []
+    specs: Sequence[tuple[str, str]],
+) -> tuple[list[str], list[str]]:
+    textlist: list[str] = []
+    langlist: list[str] = []
     for text, lang in specs:
         if not text:
             continue
@@ -595,11 +590,11 @@ def _merge_segment_specs(
 
 
 def _langsegmenter_items_to_segment_lists(
-    items: Sequence[Dict[str, str]],
+    items: Sequence[dict[str, str]],
     language: str,
-) -> Tuple[List[str], List[str]]:
-    textlist: List[str] = []
-    langlist: List[str] = []
+) -> tuple[list[str], list[str]]:
+    textlist: list[str] = []
+    langlist: list[str] = []
     normalized_language = str(language)
     pending_prefix = ""
     for item in items:
@@ -634,19 +629,19 @@ def _langsegmenter_items_to_segment_lists(
 def _split_texts_by_language_batch_auto_whitespace_mixed(
     texts: Sequence[str],
     language: str,
-) -> List[Tuple[List[str], List[str]]] | None:
+) -> list[tuple[list[str], list[str]]] | None:
     if str(language) not in {"auto", "auto_yue"}:
         return None
-    per_text_specs: List[List[Tuple[str, str] | None]] = []
-    ambiguous_chunks: List[str] = []
-    ambiguous_targets: List[Tuple[int, int]] = []
+    per_text_specs: list[list[tuple[str, str] | None]] = []
+    ambiguous_chunks: list[str] = []
+    ambiguous_targets: list[tuple[int, int]] = []
     has_any_direct_token = False
 
     for text in texts:
         token_matches = list(_WHITESPACE_TOKEN_PATTERN.finditer(str(text)))
         if len(token_matches) <= 1:
             return None
-        specs: List[Tuple[str, str] | None] = []
+        specs: list[tuple[str, str] | None] = []
         pending_ambiguous = ""
         direct_token_count = 0
         for match in token_matches:
@@ -679,9 +674,9 @@ def _split_texts_by_language_batch_auto_whitespace_mixed(
         textlist, langlist = _langsegmenter_items_to_segment_lists(items, language)
         per_text_specs[text_index][spec_index] = ("\0".join(textlist), "\0".join(langlist))
 
-    results: List[Tuple[List[str], List[str]]] = []
+    results: list[tuple[list[str], list[str]]] = []
     for specs in per_text_specs:
-        expanded_specs: List[Tuple[str, str]] = []
+        expanded_specs: list[tuple[str, str]] = []
         for spec in specs:
             assert spec is not None
             text_value, lang_value = spec
@@ -695,7 +690,7 @@ def _split_texts_by_language_batch_auto_whitespace_mixed(
     return results
 
 
-def _build_zh_fast_path_payload(norm_text: str) -> List[PreparedTextSegmentPayload]:
+def _build_zh_fast_path_payload(norm_text: str) -> list[PreparedTextSegmentPayload]:
     return [
         {
             "language": "zh",
@@ -711,7 +706,7 @@ def _build_direct_language_payload(
     text: str,
     language: str,
     version: str,
-) -> List[PreparedTextSegmentPayload]:
+) -> list[PreparedTextSegmentPayload]:
     phones, word2ph, norm_text = clean_text_segment(text, language, version)
     return [
         {
@@ -751,7 +746,7 @@ def _build_segment_payload(
     }
 
 
-def _clone_payloads(payloads: Sequence[PreparedTextSegmentPayload]) -> List[PreparedTextSegmentPayload]:
+def _clone_payloads(payloads: Sequence[PreparedTextSegmentPayload]) -> list[PreparedTextSegmentPayload]:
     return [
         {
             "language": str(payload["language"]),
@@ -764,7 +759,7 @@ def _clone_payloads(payloads: Sequence[PreparedTextSegmentPayload]) -> List[Prep
     ]
 
 
-def _cache_get_payloads(item: PreparedTextSegmentBatchItem) -> List[PreparedTextSegmentPayload] | None:
+def _cache_get_payloads(item: PreparedTextSegmentBatchItem) -> list[PreparedTextSegmentPayload] | None:
     if not _PAYLOAD_CACHE_ENABLED:
         return None
     cache_key = _payload_cache_key(*item)
@@ -793,8 +788,8 @@ def _cache_store_payloads(
 
 def _build_nonzh_segment_payloads_batch(
     jobs: Sequence[_SegmentJob],
-) -> Dict[int, PreparedTextSegmentPayload]:
-    payloads_by_index: Dict[int, PreparedTextSegmentPayload] = {}
+) -> dict[int, PreparedTextSegmentPayload]:
+    payloads_by_index: dict[int, PreparedTextSegmentPayload] = {}
     if not jobs:
         return payloads_by_index
     texts = [segment_text for _segment_index, segment_text, _segment_lang, _version in jobs]
@@ -814,8 +809,8 @@ def _build_nonzh_segment_payloads_batch(
 
 def _build_zh_segment_payloads_batch(
     jobs: Sequence[_SegmentJob],
-) -> Dict[int, PreparedTextSegmentPayload]:
-    payloads_by_index: Dict[int, PreparedTextSegmentPayload] = {}
+) -> dict[int, PreparedTextSegmentPayload]:
+    payloads_by_index: dict[int, PreparedTextSegmentPayload] = {}
     if not jobs:
         return payloads_by_index
     norm_texts = chinese2.text_normalize_batch([segment_text for _, segment_text, _, _ in jobs])
@@ -831,9 +826,9 @@ def _build_zh_segment_payloads_batch(
 
 
 def _build_segment_payloads_batch(
-    jobs_by_language: Dict[Tuple[str, str], List[_SegmentJob]],
-) -> Dict[int, PreparedTextSegmentPayload]:
-    payloads_by_index: Dict[int, PreparedTextSegmentPayload] = {}
+    jobs_by_language: dict[tuple[str, str], list[_SegmentJob]],
+) -> dict[int, PreparedTextSegmentPayload]:
+    payloads_by_index: dict[int, PreparedTextSegmentPayload] = {}
     for (normalized_language, _version), jobs in jobs_by_language.items():
         if normalized_language == "zh":
             payloads_by_index.update(_build_zh_segment_payloads_batch(jobs))
@@ -842,7 +837,7 @@ def _build_segment_payloads_batch(
     return payloads_by_index
 
 
-def split_text_by_language(text: str, language: str) -> Tuple[List[str], List[str]]:
+def split_text_by_language(text: str, language: str) -> tuple[list[str], list[str]]:
     if _use_auto_langsegment_compat(language):
         return _langsegmenter_items_to_segment_lists(LangSegmenter.getTexts(text), str(language))
     if _should_use_zh_fast_path(text, language):
@@ -860,8 +855,8 @@ def split_text_by_language(text: str, language: str) -> Tuple[List[str], List[st
     whitespace_fast_path = _try_whitespace_mixed_fast_path(text, language)
     if whitespace_fast_path is not None:
         return whitespace_fast_path
-    textlist: List[str] = []
-    langlist: List[str] = []
+    textlist: list[str] = []
+    langlist: list[str] = []
     if language == "all_zh":
         for tmp in LangSegmenter.getTexts(text, "zh"):
             langlist.append(tmp["lang"])
@@ -913,7 +908,7 @@ def split_text_by_language(text: str, language: str) -> Tuple[List[str], List[st
 def split_texts_by_language_batch(
     texts: Sequence[str],
     language: str,
-) -> List[Tuple[List[str], List[str]]]:
+) -> list[tuple[list[str], list[str]]]:
     normalized_language = str(language)
     if not texts:
         return []
@@ -929,8 +924,8 @@ def split_texts_by_language_batch(
         mixed_fast_path_results = _split_texts_by_language_batch_auto_whitespace_mixed(texts, normalized_language)
         if mixed_fast_path_results is not None:
             return mixed_fast_path_results
-        results: List[Tuple[List[str], List[str]] | None] = [None] * len(texts)
-        fallback_pairs: List[Tuple[int, str]] = []
+        results: list[tuple[list[str], list[str]] | None] = [None] * len(texts)
+        fallback_pairs: list[tuple[int, str]] = []
         for index, text in enumerate(texts):
             fast_path = _try_whitespace_mixed_fast_path(text, normalized_language)
             if fast_path is not None:
@@ -962,10 +957,10 @@ def split_texts_by_language_batch(
             for items in LangSegmenter.getTextsBatch(texts, "zh")
         ]
     if normalized_language == "all_yue":
-        results: List[Tuple[List[str], List[str]]] = []
+        results: list[tuple[list[str], list[str]]] = []
         for items in LangSegmenter.getTextsBatch(texts, "zh"):
-            textlist: List[str] = []
-            langlist: List[str] = []
+            textlist: list[str] = []
+            langlist: list[str] = []
             for item in items:
                 item_lang = "yue" if item["lang"] == "zh" else item["lang"]
                 textlist.append(item["text"])
@@ -987,7 +982,7 @@ def split_texts_by_language_batch(
     return [split_text_by_language(text, normalized_language) for text in texts]
 
 
-def clean_text_segment(text: str, language: str, version: str) -> Tuple[List[int], Optional[List[int]], str]:
+def clean_text_segment(text: str, language: str, version: str) -> tuple[list[int], list[int] | None, str]:
     normalized_language = language.replace("all_", "")
     phones, word2ph, norm_text = clean_text(text, normalized_language, version)
     phones = cleaned_text_to_sequence(phones, version)
@@ -999,7 +994,7 @@ def _preprocess_text_segments_payload_impl(
     language: str,
     version: str,
     final: bool = False,
-) -> List[PreparedTextSegmentPayload]:
+) -> list[PreparedTextSegmentPayload]:
     text = _normalize_spaces(text)
     if _should_use_zh_fast_path(text, language):
         norm_text = chinese2.text_normalize(text)
@@ -1026,7 +1021,7 @@ def _preprocess_text_segments_payload_impl(
             return _preprocess_text_segments_payload_impl("." + text, language, version, final=True)
         return payloads
     textlist, langlist = split_text_by_language(text, language)
-    payloads: List[PreparedTextSegmentPayload] = []
+    payloads: list[PreparedTextSegmentPayload] = []
     total_phones_len = 0
     for segment_text, segment_lang in zip(textlist, langlist):
         normalized_language = segment_lang.replace("all_", "")
@@ -1062,7 +1057,7 @@ def preprocess_text_segments_payload(
     language: str,
     version: str,
     final: bool = False,
-) -> List[PreparedTextSegmentPayload]:
+) -> list[PreparedTextSegmentPayload]:
     item = (_normalize_spaces(str(text)), str(language), str(version), bool(final))
     cached = _cache_get_payloads(item)
     if cached is not None:
@@ -1074,16 +1069,16 @@ def preprocess_text_segments_payload(
 
 def preprocess_text_segments_payload_batch(
     items: Sequence[PreparedTextSegmentBatchItem],
-) -> List[List[PreparedTextSegmentPayload]]:
+) -> list[list[PreparedTextSegmentPayload]]:
     normalized_items = [
         (_normalize_spaces(str(text)), str(language), str(version), bool(final))
         for text, language, version, final in items
     ]
-    results: List[List[PreparedTextSegmentPayload] | None] = [None] * len(normalized_items)
-    duplicate_indices_by_root: Dict[int, List[int]] = {}
-    unique_items: List[PreparedTextSegmentBatchItem] = []
-    unique_result_indices: List[int] = []
-    first_index_by_item: Dict[PreparedTextSegmentBatchItem, int] = {}
+    results: list[list[PreparedTextSegmentPayload] | None] = [None] * len(normalized_items)
+    duplicate_indices_by_root: dict[int, list[int]] = {}
+    unique_items: list[PreparedTextSegmentBatchItem] = []
+    unique_result_indices: list[int] = []
+    first_index_by_item: dict[PreparedTextSegmentBatchItem, int] = {}
 
     for index, item in enumerate(normalized_items):
         cached = _cache_get_payloads(item)
@@ -1099,16 +1094,16 @@ def preprocess_text_segments_payload_batch(
         unique_result_indices.append(index)
 
     normalized_items = unique_items
-    item_segment_indices: List[List[int]] = [[] for _ in normalized_items]
-    jobs_by_language: Dict[Tuple[str, str], List[_SegmentJob]] = {}
-    retry_items: List[PreparedTextSegmentBatchItem] = []
-    retry_result_indices: List[int] = []
+    item_segment_indices: list[list[int]] = [[] for _ in normalized_items]
+    jobs_by_language: dict[tuple[str, str], list[_SegmentJob]] = {}
+    retry_items: list[PreparedTextSegmentBatchItem] = []
+    retry_result_indices: list[int] = []
     next_segment_index = 0
-    segment_specs_by_unique: List[List[Tuple[str, str]] | None] = [None] * len(normalized_items)
-    split_batches_by_language: Dict[str, List[Tuple[int, str]]] = {}
+    segment_specs_by_unique: list[list[tuple[str, str]] | None] = [None] * len(normalized_items)
+    split_batches_by_language: dict[str, list[tuple[int, str]]] = {}
 
     for unique_index, (text, language, version, final) in enumerate(normalized_items):
-        segment_specs: List[Tuple[str, str]] = []
+        segment_specs: list[tuple[str, str]] = []
         if _should_use_zh_fast_path(text, language):
             segment_specs = [(text, "zh")]
         else:

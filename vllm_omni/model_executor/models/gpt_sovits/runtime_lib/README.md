@@ -30,6 +30,19 @@ Linked instead of copied:
 - `third_party/g2pw-cu`
 - `third_party/split-lang`
 
+These local development links must not be committed to Git. Recreate them on a
+developer machine with:
+
+```bash
+bash tools/dev/setup_gptsovits_runtime_links.sh
+```
+
+They are local external dependencies for development convenience, not Git
+submodules of this repository.
+
+Override the source GPT-SoVITS checkout with `GPT_SOVITS_LINK_SOURCE_ROOT=/abs/path`
+when it is not located at `/root/GPT-SoVITS`.
+
 Removed from the native runtime copy:
 
 - WebUI / API entry scripts

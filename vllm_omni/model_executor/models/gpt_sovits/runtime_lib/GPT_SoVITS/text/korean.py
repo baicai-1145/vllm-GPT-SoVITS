@@ -1,14 +1,14 @@
 # reference: https://github.com/ORI-Muchim/MB-iSTFT-VITS-Korean/blob/main/text/korean.py
 
-import re
-from functools import lru_cache
-from jamo import h2j, j2hcj
-import ko_pron
-from g2pk2 import G2p
-import g2pk2.g2pk2 as g2pk2_module
-
 import importlib
 import os
+import re
+from functools import lru_cache
+
+import g2pk2.g2pk2 as g2pk2_module
+import ko_pron
+from g2pk2 import G2p
+from jamo import h2j, j2hcj
 
 # 防止win下无法读取模型
 if os.name == "nt":
@@ -24,6 +24,7 @@ if os.name == "nt":
                 installpath = spam_spec.submodule_search_locations[0]
                 if not (re.match(r"^[A-Za-z0-9_/\\:.\-]*$", installpath)):
                     import sys
+
                     from eunjeon import Mecab as _Mecab
 
                     class Mecab(_Mecab):
@@ -97,7 +98,7 @@ _LINK_G2PK2_FUNCS = (
 
 def _load_compiled_idiom_rules(path: str) -> list[tuple[re.Pattern[str], str]]:
     rules: list[tuple[re.Pattern[str], str]] = []
-    with open(path, "r", encoding="utf8") as idiom_file:
+    with open(path, encoding="utf8") as idiom_file:
         for raw_line in idiom_file:
             line = raw_line.split("#")[0].strip()
             if _IDIOM_RULE_SEPARATOR not in line:
@@ -161,6 +162,7 @@ class OptimizedG2p(G2p):
             inp = g2pk2_module.compose(inp)
         return inp
 
+
 # This is a list of Korean classifiers preceded by pure Korean numerals.
 _korean_classifiers = (
     "군데 권 개 그루 닢 대 두 마리 모 모금 뭇 발 발짝 방 번 벌 보루 살 수 술 시 쌈 움큼 정 짝 채 척 첩 축 켤레 톨 통"
@@ -168,7 +170,7 @@ _korean_classifiers = (
 
 # List of (hangul, hangul divided) pairs:
 _hangul_divided = [
-    (re.compile("%s" % x[0]), x[1])
+    (re.compile(f"{x[0]}"), x[1])
     for x in [
         # ('ㄳ', 'ㄱㅅ'),   # g2pk2, A Syllable-ending Rule
         # ('ㄵ', 'ㄴㅈ'),
@@ -199,7 +201,7 @@ _hangul_divided = [
 
 # List of (Latin alphabet, hangul) pairs:
 _latin_to_hangul = [
-    (re.compile("%s" % x[0], re.IGNORECASE), x[1])
+    (re.compile(f"{x[0]}", re.IGNORECASE), x[1])
     for x in [
         ("a", "에이"),
         ("b", "비"),
@@ -252,7 +254,7 @@ _hangul_divided_map = {
 
 # List of (ipa, lazy ipa) pairs:
 _ipa_to_lazy_ipa = [
-    (re.compile("%s" % x[0], re.IGNORECASE), x[1])
+    (re.compile(f"{x[0]}", re.IGNORECASE), x[1])
     for x in [
         ("t͡ɕ", "ʧ"),
         ("d͡ʑ", "ʥ"),
@@ -458,6 +460,7 @@ def g2p(text):
 @lru_cache(maxsize=8192)
 def _g2p_cached(text: str):
     return tuple(_finalize_g2p_row(str(text)))
+
 
 def _split_trailing_passthrough_suffix(text: str) -> tuple[str, str]:
     suffix_start = len(text)

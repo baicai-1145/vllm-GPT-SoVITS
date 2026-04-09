@@ -1,7 +1,7 @@
 import torch
+from packaging import version
 from torch.nn.parallel import DistributedDataParallel
 from torch.nn.parallel.distributed import _find_tensors
-from packaging import version
 
 
 # from https://github.com/Lightning-AI/lightning-bolts/blob/5d61197cd2f491f69e238137a5edabe80ae14ad9/pl_bolts/models/self_supervised/simclr/simclr_module.py#L20
@@ -50,6 +50,7 @@ class SyncFunction(torch.autograd.Function):
         idx_to = (torch.distributed.get_rank() + 1) * ctx.batch_size
         return grad_input[idx_from:idx_to]
 
+
 class DDP(DistributedDataParallel):
     """
     Override the forward call in lightning so it goes to training and validation step respectively
@@ -96,7 +97,7 @@ class DDP(DistributedDataParallel):
                 if work:
                     self.reducer._set_forward_pass_work_handle(work, self._divide_by_initial_world_size)
 
-                # Calling _rebuild_buckets before forward compuation,
+                # Calling _rebuild_buckets before forward computation,
                 # It may allocate new buckets before deallocating old buckets
                 # inside _rebuild_buckets. To save peak memory usage,
                 # call _rebuild_buckets before the peak memory usage increases
@@ -108,7 +109,7 @@ class DDP(DistributedDataParallel):
 
                 # sync params according to location (before/after forward) user
                 # specified as part of hook, if hook was specified.
-                buffer_hook_registered = hasattr(self, "buffer_hook")
+                hasattr(self, "buffer_hook")
                 if self._check_sync_bufs_pre_fwd():
                     self._sync_buffers()
 

@@ -5,12 +5,12 @@ import concurrent.futures
 import importlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
@@ -24,32 +24,30 @@ from vllm_omni.model_executor.models.gpt_sovits.runtime import (
     GPTSoVITSActiveBatch,
     GPTSoVITSARFinishedItem,
     GPTSoVITSARSession,
-    GPTSoVITSDecodePreparedRequest,
-    GPTSoVITSDecodePreparedRequestGroup,
     GPTSoVITSDecodedAudio,
     GPTSoVITSDecodedAudioGroup,
+    GPTSoVITSDecodePreparedRequest,
+    GPTSoVITSDecodePreparedRequestGroup,
     GPTSoVITSMultiSegmentRequestState,
     GPTSoVITSNativePreparedCpuStage,
     GPTSoVITSPrepareAudioPhaseData,
     GPTSoVITSPreparedAudioPhase,
     GPTSoVITSPreparedCpuStage,
-    GPTSoVITSPrepareProfiledResult,
-    GPTSoVITSReferSpec,
-    GPTSoVITSRefAudioBundle,
-    GPTSoVITSPrepareRefSpecResult,
-    GPTSoVITSPrepareRuntimeCoordinator,
-    GPTSoVITSRequestSpec,
-    GPTSoVITSResult,
-    GPTSoVITSPrepareTextPhaseData,
     GPTSoVITSPreparedRefAudioAsset,
     GPTSoVITSPreparedRefSpecPhase,
     GPTSoVITSPreparedTextPhase,
+    GPTSoVITSPrepareProfiledResult,
+    GPTSoVITSPrepareRefSpecResult,
+    GPTSoVITSPrepareRuntimeCoordinator,
+    GPTSoVITSPrepareTextPhaseData,
+    GPTSoVITSRefAudioBundle,
+    GPTSoVITSReferSpec,
+    GPTSoVITSRequestSpec,
+    GPTSoVITSResult,
+    GPTSoVITSRuntime,
     GPTSoVITSStageTransport,
     GPTSoVITST2SRequestState,
-    GPTSoVITSTextSegmentFeatures,
-    GPTSoVITSRuntime,
 )
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _GPT_SOVITS_PROJECT_ROOT = Path("/root/GPT-SoVITS")
@@ -57,9 +55,7 @@ _G2PW_CU_RUNTIME_LIB = _GPT_SOVITS_PROJECT_ROOT / "third_party" / "g2pw-cu" / "b
 _G2PW_CU_MANIFEST = _GPT_SOVITS_PROJECT_ROOT / "third_party" / "g2pw-cu" / "artifacts" / "model" / "manifest.txt"
 _G2PW_CU_WEIGHTS = _GPT_SOVITS_PROJECT_ROOT / "third_party" / "g2pw-cu" / "artifacts" / "model" / "weights.bin"
 _GPT_SOVITS_S1_V3 = _GPT_SOVITS_PROJECT_ROOT / "GPT_SoVITS" / "pretrained_models" / "s1v3.ckpt"
-_GPT_SOVITS_V2PROPLUS = (
-    _GPT_SOVITS_PROJECT_ROOT / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2ProPlus.pth"
-)
+_GPT_SOVITS_V2PROPLUS = _GPT_SOVITS_PROJECT_ROOT / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2ProPlus.pth"
 _G2PW_CU_RUNTIME_CONFIG = (
     _REPO_ROOT
     / "tests"
@@ -569,6 +565,7 @@ def test_install_runtime_prepare_components_rebinds_pipeline_refresh_method_to_r
 def test_scheduler_prepare_coordinator_prefers_runtime_native_factory_and_rebuilds_on_generation_change(tmp_path):
     _ensure_vendored_gpt_sovits_import_path()
     from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import RuntimePrepareCoordinatorAdapter
+
     from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.TTS_infer_pack.t2s_scheduler import (
         _get_scheduler_prepare_coordinator,
     )
@@ -874,8 +871,12 @@ def test_sample_active_batch_requests_uses_runtime_native_uniform_fast_path(tmp_
 
     active_batch = SimpleNamespace(
         states=[
-            SimpleNamespace(request_id="a", top_k=5, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1),
-            SimpleNamespace(request_id="b", top_k=5, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1),
+            SimpleNamespace(
+                request_id="a", top_k=5, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1
+            ),
+            SimpleNamespace(
+                request_id="b", top_k=5, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1
+            ),
         ],
         step_indices=torch.tensor([3, 3], dtype=torch.long),
         y_sequences=[
@@ -910,7 +911,9 @@ def test_sample_active_batch_requests_records_single_request_sampling_stats(tmp_
 
     active_batch = SimpleNamespace(
         states=[
-            SimpleNamespace(request_id="solo", top_k=5, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1),
+            SimpleNamespace(
+                request_id="solo", top_k=5, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1
+            ),
         ],
         step_indices=torch.tensor([3], dtype=torch.long),
         y_sequences=[torch.tensor([1, 2], dtype=torch.long)],
@@ -949,8 +952,12 @@ def test_sample_active_batch_requests_grouped_path_updates_histories(tmp_path):
 
     active_batch = SimpleNamespace(
         states=[
-            SimpleNamespace(request_id="a", top_k=5, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1),
-            SimpleNamespace(request_id="b", top_k=3, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1),
+            SimpleNamespace(
+                request_id="a", top_k=5, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1
+            ),
+            SimpleNamespace(
+                request_id="b", top_k=3, top_p=0.8, temperature=1.0, repetition_penalty=1.0, early_stop_num=-1
+            ),
         ],
         step_indices=torch.tensor([3, 3], dtype=torch.long),
         y_sequences=[
@@ -1125,14 +1132,15 @@ def test_decode_prepared_request_group_decodes_segments_in_chunks(tmp_path, monk
     monkeypatch.setenv("GPTSOVITS_SEGMENT_DECODE_MAX_BATCH", "2")
     runtime._pipeline = SimpleNamespace(configs=SimpleNamespace(use_vocoder=False, sampling_rate=32000))
     chunk_calls: list[list[str]] = []
-    runtime._build_non_vocoder_prompt_context = Mock(return_value={"ge": torch.ones((1, 1, 1)), "device": torch.device("cpu"), "vits_model": object()})  # type: ignore[method-assign]
+    runtime._build_non_vocoder_prompt_context = Mock(
+        return_value={"ge": torch.ones((1, 1, 1)), "device": torch.device("cpu"), "vits_model": object()}
+    )  # type: ignore[method-assign]
 
     def _fake_batched_decode(_pipeline, chunk, prompt_context=None, **_kwargs):
         assert prompt_context is not None
         chunk_calls.append([item.request_id for item in chunk])
         return [
-            GPTSoVITSDecodedAudio(item.request_id, f"audio-{item.request_id}", 32000, 1.0, 0.3, False)
-            for item in chunk
+            GPTSoVITSDecodedAudio(item.request_id, f"audio-{item.request_id}", 32000, 1.0, 0.3, False) for item in chunk
         ]
 
     runtime._decode_prepared_requests_batched_non_vocoder = Mock(side_effect=_fake_batched_decode)  # type: ignore[method-assign]
@@ -1188,14 +1196,15 @@ def test_decode_prepared_request_group_uses_length_aware_batches_and_restores_or
     monkeypatch.setenv("GPTSOVITS_SEGMENT_DECODE_MAX_PHONE_TOKENS", "0")
     runtime._pipeline = SimpleNamespace(configs=SimpleNamespace(use_vocoder=False, sampling_rate=32000))
     chunk_calls: list[list[str]] = []
-    runtime._build_non_vocoder_prompt_context = Mock(return_value={"ge": torch.ones((1, 1, 1)), "device": torch.device("cpu"), "vits_model": object()})  # type: ignore[method-assign]
+    runtime._build_non_vocoder_prompt_context = Mock(
+        return_value={"ge": torch.ones((1, 1, 1)), "device": torch.device("cpu"), "vits_model": object()}
+    )  # type: ignore[method-assign]
 
     def _fake_batched_decode(_pipeline, chunk, prompt_context=None, **_kwargs):
         assert prompt_context is not None
         chunk_calls.append([item.request_id for item in chunk])
         return [
-            GPTSoVITSDecodedAudio(item.request_id, f"audio-{item.request_id}", 32000, 1.0, 0.3, False)
-            for item in chunk
+            GPTSoVITSDecodedAudio(item.request_id, f"audio-{item.request_id}", 32000, 1.0, 0.3, False) for item in chunk
         ]
 
     runtime._decode_prepared_requests_batched_non_vocoder = Mock(side_effect=_fake_batched_decode)  # type: ignore[method-assign]
@@ -1296,7 +1305,9 @@ def test_decode_prepared_request_group_passes_bucket_padding_to_batched_non_voco
     monkeypatch.setenv("GPTSOVITS_SEGMENT_DECODE_PHONE_BUCKETS", "2,4")
     runtime._pipeline = SimpleNamespace(configs=SimpleNamespace(use_vocoder=False, sampling_rate=32000))
     bucket_calls: list[tuple[list[str], int | None, int | None]] = []
-    runtime._build_non_vocoder_prompt_context = Mock(return_value={"ge": torch.ones((1, 1, 1)), "device": torch.device("cpu"), "vits_model": object()})  # type: ignore[method-assign]
+    runtime._build_non_vocoder_prompt_context = Mock(
+        return_value={"ge": torch.ones((1, 1, 1)), "device": torch.device("cpu"), "vits_model": object()}
+    )  # type: ignore[method-assign]
 
     def _fake_batched_decode(_pipeline, chunk, prompt_context=None, **kwargs):
         assert prompt_context is not None
@@ -1308,8 +1319,7 @@ def test_decode_prepared_request_group_passes_bucket_padding_to_batched_non_voco
             )
         )
         return [
-            GPTSoVITSDecodedAudio(item.request_id, f"audio-{item.request_id}", 32000, 1.0, 0.3, False)
-            for item in chunk
+            GPTSoVITSDecodedAudio(item.request_id, f"audio-{item.request_id}", 32000, 1.0, 0.3, False) for item in chunk
         ]
 
     runtime._decode_prepared_requests_batched_non_vocoder = Mock(side_effect=_fake_batched_decode)  # type: ignore[method-assign]
@@ -1506,7 +1516,7 @@ def test_build_ref_prompt_semantic_from_raw_uses_runtime_native_wav16k_helper_fo
                     "prompt_semantic_scatter_ms": 6.0,
                 },
             )
-        )
+        ),
     )
     pipeline = SimpleNamespace(
         prepare_ref_semantic_batch_worker=worker,
@@ -1671,7 +1681,7 @@ def test_run_ref_prompt_semantic_stage_prepares_wav16k_before_worker_submit_with
                     "prompt_semantic_scatter_ms": 6.0,
                 },
             )
-        )
+        ),
     )
     pipeline = SimpleNamespace(
         prepare_ref_semantic_batch_worker=worker,
@@ -1797,11 +1807,13 @@ def test_run_ref_prompt_semantic_stage_batch_uses_worker_with_preloaded_assets(t
                     },
                 ),
             ]
-        )
+        ),
     )
     pipeline = SimpleNamespace(
         prepare_ref_semantic_batch_worker=worker,
-        prepare_ref_semantic_stage_limiter=SimpleNamespace(snapshot=Mock(return_value={"slots": 9.0, "peak_inflight": 10.0})),
+        prepare_ref_semantic_stage_limiter=SimpleNamespace(
+            snapshot=Mock(return_value={"slots": 9.0, "peak_inflight": 10.0})
+        ),
     )
     runtime._pipeline = pipeline
     runtime._prepare_coordinator = runtime._coerce_prepare_coordinator(
@@ -2150,9 +2162,30 @@ def test_decode_prepared_requests_batches_non_vocoder_groups(tmp_path):
 
     decoded = runtime.decode_prepared_requests(
         [
-            SimpleNamespace(request_id="a", semantic_tokens=torch.tensor([1]), speed_factor=1.0, fragment_interval=0.3, sample_steps=32, super_sampling=False),
-            SimpleNamespace(request_id="b", semantic_tokens=torch.tensor([2]), speed_factor=1.0, fragment_interval=0.3, sample_steps=32, super_sampling=False),
-            SimpleNamespace(request_id="c", semantic_tokens=torch.tensor([3]), speed_factor=1.5, fragment_interval=0.3, sample_steps=32, super_sampling=False),
+            SimpleNamespace(
+                request_id="a",
+                semantic_tokens=torch.tensor([1]),
+                speed_factor=1.0,
+                fragment_interval=0.3,
+                sample_steps=32,
+                super_sampling=False,
+            ),
+            SimpleNamespace(
+                request_id="b",
+                semantic_tokens=torch.tensor([2]),
+                speed_factor=1.0,
+                fragment_interval=0.3,
+                sample_steps=32,
+                super_sampling=False,
+            ),
+            SimpleNamespace(
+                request_id="c",
+                semantic_tokens=torch.tensor([3]),
+                speed_factor=1.5,
+                fragment_interval=0.3,
+                sample_steps=32,
+                super_sampling=False,
+            ),
         ]
     )
 
@@ -2172,7 +2205,9 @@ def test_decode_prepared_requests_batches_vocoder_groups_by_prompt_context(tmp_p
         side_effect=lambda prepared: GPTSoVITSReferSpec(prepared.refer_audio_spec, None)
     )
     runtime._build_vocoder_prompt_cache_key = Mock(  # type: ignore[method-assign]
-        side_effect=lambda prepared, refer_audio_spec: shared_prompt_key if prepared.request_id in {"a", "b"} else other_prompt_key
+        side_effect=lambda prepared, refer_audio_spec: (
+            shared_prompt_key if prepared.request_id in {"a", "b"} else other_prompt_key
+        )
     )
     runtime._decode_prepared_requests_grouped_vocoder = Mock(  # type: ignore[method-assign]
         return_value=[
@@ -2726,7 +2761,9 @@ def test_decode_prepared_request_fragment_clones_borrowed_decoder_output(tmp_pat
         "vits_model": vits_model,
         "ge": torch.ones((1, 2, 1), dtype=torch.float32),
     }
-    runtime._build_refer_spec_from_prepared = Mock(return_value=SimpleNamespace(spec_audio=torch.ones((1, 704, 4), dtype=torch.float32)))  # type: ignore[method-assign]
+    runtime._build_refer_spec_from_prepared = Mock(
+        return_value=SimpleNamespace(spec_audio=torch.ones((1, 704, 4), dtype=torch.float32))
+    )  # type: ignore[method-assign]
     runtime._run_vits_non_vocoder_decode = Mock(return_value=(audio_batch, y_mask))  # type: ignore[method-assign]
     runtime._measure_vits_audio_lengths = Mock(return_value=torch.tensor([3], dtype=torch.long))  # type: ignore[method-assign]
 
@@ -3427,8 +3464,12 @@ def test_native_prepare_coordinator_ref_audio_preload_uses_cache(tmp_path):
 
 def test_prepare_cpu_stage_async_uses_runtime_native_text_cpu_pair(tmp_path):
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
-    prompt_cpu_profiled = GPTSoVITSPrepareProfiledResult(result=["prompt"], submit_at=1.0, started_at=1.0, finished_at=2.0)
-    target_cpu_profiled = GPTSoVITSPrepareProfiledResult(result=["target"], submit_at=1.5, started_at=1.5, finished_at=2.5)
+    prompt_cpu_profiled = GPTSoVITSPrepareProfiledResult(
+        result=["prompt"], submit_at=1.0, started_at=1.0, finished_at=2.0
+    )
+    target_cpu_profiled = GPTSoVITSPrepareProfiledResult(
+        result=["target"], submit_at=1.5, started_at=1.5, finished_at=2.5
+    )
     coordinator = SimpleNamespace(
         _inflight_gate=SimpleNamespace(acquire=AsyncMock(return_value={"wait_ms": 0.5})),
         _mark_enter=Mock(return_value=(2, 4)),
@@ -3650,9 +3691,7 @@ def test_prepare_direct_shared_segments_async_uses_runtime_native_shared_prompt_
     )
     runtime._release_prepare_split_stage_slot = Mock()  # type: ignore[method-assign]
 
-    outputs = runtime._run_awaitable_sync(
-        runtime._prepare_direct_shared_segments_async(coordinator, [spec_a, spec_b])
-    )
+    outputs = runtime._run_awaitable_sync(runtime._prepare_direct_shared_segments_async(coordinator, [spec_a, spec_b]))
 
     runtime._normalize_prepare_sentence.assert_called_once_with("shared prompt", "zh")
     assert runtime._run_text_cpu_stage.await_count == 3
@@ -3886,7 +3925,9 @@ def test_prepare_gpu_audio_phase_batch_async_uses_runtime_native_ref_audio_batch
         ),
     ]
 
-    outputs = runtime._run_awaitable_sync(runtime._prepare_gpu_audio_phase_batch_async(coordinator, prepared_cpu_stages))
+    outputs = runtime._run_awaitable_sync(
+        runtime._prepare_gpu_audio_phase_batch_async(coordinator, prepared_cpu_stages)
+    )
 
     runtime._run_ref_prompt_semantic_stage_batch.assert_awaited_once_with(
         ANY,
@@ -3919,8 +3960,12 @@ def test_prepare_request_gpu_audio_phases_batch_merge_uses_runtime_native_batch_
 
     prepared_audio = runtime.prepare_request_gpu_audio_phases(
         [
-            GPTSoVITSPreparedCpuStage("req-a", SimpleNamespace(), 0.0, 0.0, "", "", 0.0, 0, 0, SimpleNamespace(), SimpleNamespace(), None),
-            GPTSoVITSPreparedCpuStage("req-b", SimpleNamespace(), 0.0, 0.0, "", "", 0.0, 0, 0, SimpleNamespace(), SimpleNamespace(), None),
+            GPTSoVITSPreparedCpuStage(
+                "req-a", SimpleNamespace(), 0.0, 0.0, "", "", 0.0, 0, 0, SimpleNamespace(), SimpleNamespace(), None
+            ),
+            GPTSoVITSPreparedCpuStage(
+                "req-b", SimpleNamespace(), 0.0, 0.0, "", "", 0.0, 0, 0, SimpleNamespace(), SimpleNamespace(), None
+            ),
         ]
     )
 
@@ -4052,8 +4097,12 @@ def test_prepare_request_spec_cpu_stages_batches_cpu_prepare_calls(tmp_path):
     runtime.preload_ref_audio_asset = Mock(side_effect=["future-a", "future-b"])  # type: ignore[method-assign]
     runtime._prepare_cpu_stage_async = AsyncMock(  # type: ignore[method-assign]
         side_effect=[
-            GPTSoVITSNativePreparedCpuStage(spec_a, 1.0, 2.0, "pa", "ta", 0.1, 1, 2, SimpleNamespace(), SimpleNamespace()),
-            GPTSoVITSNativePreparedCpuStage(spec_b, 1.5, 2.5, "pb", "tb", 0.2, 3, 4, SimpleNamespace(), SimpleNamespace()),
+            GPTSoVITSNativePreparedCpuStage(
+                spec_a, 1.0, 2.0, "pa", "ta", 0.1, 1, 2, SimpleNamespace(), SimpleNamespace()
+            ),
+            GPTSoVITSNativePreparedCpuStage(
+                spec_b, 1.5, 2.5, "pb", "tb", 0.2, 3, 4, SimpleNamespace(), SimpleNamespace()
+            ),
         ]
     )
 
@@ -4074,8 +4123,12 @@ def test_prepare_request_cpu_stages_builds_specs_and_delegates_to_spec_path(tmp_
     spec_a = SimpleNamespace(request_id="req-a")
     spec_b = SimpleNamespace(request_id="req-b")
     prepared_cpu_stages = [
-        GPTSoVITSPreparedCpuStage("req-a", spec_a, 0.0, 0.0, "pa", "ta", 0.0, 0, 0, SimpleNamespace(), SimpleNamespace(), "future-a"),
-        GPTSoVITSPreparedCpuStage("req-b", spec_b, 0.0, 0.0, "pb", "tb", 0.0, 0, 0, SimpleNamespace(), SimpleNamespace(), "future-b"),
+        GPTSoVITSPreparedCpuStage(
+            "req-a", spec_a, 0.0, 0.0, "pa", "ta", 0.0, 0, 0, SimpleNamespace(), SimpleNamespace(), "future-a"
+        ),
+        GPTSoVITSPreparedCpuStage(
+            "req-b", spec_b, 0.0, 0.0, "pb", "tb", 0.0, 0, 0, SimpleNamespace(), SimpleNamespace(), "future-b"
+        ),
     ]
     runtime._build_scheduler_request_spec = Mock(side_effect=[spec_a, spec_b])  # type: ignore[method-assign]
     runtime.prepare_request_spec_cpu_stages = Mock(return_value=prepared_cpu_stages)  # type: ignore[method-assign]
@@ -4152,8 +4205,14 @@ def test_run_text_cpu_stage_pair_uses_worker_batch_submission(tmp_path):
     worker = SimpleNamespace(
         submit_many_async=AsyncMock(
             return_value=[
-                (["prompt-seg"], {"text_cpu_admission_wait_ms": 1.0, "text_cpu_queue_wait_ms": 2.0, "text_cpu_run_ms": 3.0}),
-                (["target-seg"], {"text_cpu_admission_wait_ms": 4.0, "text_cpu_queue_wait_ms": 5.0, "text_cpu_run_ms": 6.0}),
+                (
+                    ["prompt-seg"],
+                    {"text_cpu_admission_wait_ms": 1.0, "text_cpu_queue_wait_ms": 2.0, "text_cpu_run_ms": 3.0},
+                ),
+                (
+                    ["target-seg"],
+                    {"text_cpu_admission_wait_ms": 4.0, "text_cpu_queue_wait_ms": 5.0, "text_cpu_run_ms": 6.0},
+                ),
             ]
         )
     )
@@ -4176,8 +4235,14 @@ def test_run_text_cpu_stage_pair_prefers_runtime_owned_worker_over_pipeline_attr
     worker = SimpleNamespace(
         submit_many_async=AsyncMock(
             return_value=[
-                (["prompt-seg"], {"text_cpu_admission_wait_ms": 1.0, "text_cpu_queue_wait_ms": 2.0, "text_cpu_run_ms": 3.0}),
-                (["target-seg"], {"text_cpu_admission_wait_ms": 4.0, "text_cpu_queue_wait_ms": 5.0, "text_cpu_run_ms": 6.0}),
+                (
+                    ["prompt-seg"],
+                    {"text_cpu_admission_wait_ms": 1.0, "text_cpu_queue_wait_ms": 2.0, "text_cpu_run_ms": 3.0},
+                ),
+                (
+                    ["target-seg"],
+                    {"text_cpu_admission_wait_ms": 4.0, "text_cpu_queue_wait_ms": 5.0, "text_cpu_run_ms": 6.0},
+                ),
             ]
         )
     )
@@ -4215,7 +4280,9 @@ def test_prepare_text_cpu_uses_runtime_native_payload_conversion(tmp_path):
     runtime._payloads_to_prepared_text_segments = Mock(  # type: ignore[method-assign]
         return_value=["prepared-segments"]
     )
-    runtime._pipeline = SimpleNamespace(prepare_text_segments=Mock(side_effect=AssertionError("should not call pipeline helper")))
+    runtime._pipeline = SimpleNamespace(
+        prepare_text_segments=Mock(side_effect=AssertionError("should not call pipeline helper"))
+    )
 
     result = runtime._prepare_text_cpu("你好", "zh")
 
@@ -4237,7 +4304,9 @@ def test_resolve_g2pw_segments_uses_runtime_native_frontend_path(tmp_path):
     runtime._get_text_preprocessor_symbol = Mock(  # type: ignore[method-assign]
         return_value=lambda **kwargs: SimpleNamespace(**kwargs)
     )
-    runtime._pipeline = SimpleNamespace(resolve_g2pw_segments=Mock(side_effect=AssertionError("should not call pipeline helper")))
+    runtime._pipeline = SimpleNamespace(
+        resolve_g2pw_segments=Mock(side_effect=AssertionError("should not call pipeline helper"))
+    )
     prepared_segments = [SimpleNamespace(language="zh", phones=[], word2ph=None, norm_text="你", needs_g2pw=True)]
 
     resolved_segments, profile = runtime._resolve_g2pw_segments(prepared_segments)
@@ -4267,7 +4336,9 @@ def test_build_text_features_uses_runtime_native_sync_helpers(tmp_path):
             torch.full((1024, 1), 2.0, dtype=torch.float32),
         ]
     )
-    runtime._pipeline = SimpleNamespace(build_text_features_from_segments=Mock(side_effect=AssertionError("should not call pipeline helper")))
+    runtime._pipeline = SimpleNamespace(
+        build_text_features_from_segments=Mock(side_effect=AssertionError("should not call pipeline helper"))
+    )
 
     result = runtime._build_text_features(["prepared"], "zh", 5.0, base_profile={"seed": 1.0})
 
@@ -4502,7 +4573,9 @@ def test_compute_sync_bert_feature_returns_empty_feature_for_zero_repeat_counts(
         def __call__(self, **kwargs):
             del kwargs
             hidden = torch.arange(4 * 1024, dtype=torch.float32).view(1, 4, 1024)
-            return {"hidden_states": [torch.zeros_like(hidden), hidden, torch.zeros_like(hidden), torch.zeros_like(hidden)]}
+            return {
+                "hidden_states": [torch.zeros_like(hidden), hidden, torch.zeros_like(hidden), torch.zeros_like(hidden)]
+            }
 
     runtime._pipeline = SimpleNamespace(
         prepare_bert_batch_worker=None,
@@ -4638,9 +4711,7 @@ def test_advance_ar_session_routes_non_pooled_decode_through_runtime_helpers(tmp
                 [torch.ones((1, 2, 3), dtype=torch.float32)],
             )
         ),
-        t2s_transformer=SimpleNamespace(
-            decode_next_token=Mock()
-        ),
+        t2s_transformer=SimpleNamespace(decode_next_token=Mock()),
         ar_predict_layer=Mock(return_value=torch.tensor([[0.3, 0.4]], dtype=torch.float32)),
     )
     runtime._pipeline = SimpleNamespace(t2s_model=SimpleNamespace(model=fake_model))
@@ -4782,9 +4853,7 @@ def test_decode_active_batch_falls_back_from_pooled_cache_when_decode_headroom_e
                 [torch.ones((2, 32, 3), dtype=torch.float32)],
             )
         ),
-        t2s_transformer=SimpleNamespace(
-            decode_next_token=Mock()
-        ),
+        t2s_transformer=SimpleNamespace(decode_next_token=Mock()),
         ar_predict_layer=Mock(return_value=torch.tensor([[0.1, 0.2], [0.3, 0.4]], dtype=torch.float32)),
     )
     runtime._sample_active_batch_requests = Mock(  # type: ignore[method-assign]
@@ -4821,7 +4890,10 @@ def test_decode_active_batch_keeps_dynamic_prealloc_layout_after_subset(tmp_path
     runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
     active_batch = SimpleNamespace(
         request_ids=["req-a", "req-b"],
-        states=[SimpleNamespace(request_id="req-a", early_stop_num=-1), SimpleNamespace(request_id="req-b", early_stop_num=-1)],
+        states=[
+            SimpleNamespace(request_id="req-a", early_stop_num=-1),
+            SimpleNamespace(request_id="req-b", early_stop_num=-1),
+        ],
         y_sequences=[torch.tensor([5, 6], dtype=torch.long), torch.tensor([7], dtype=torch.long)],
         prefix_lens=torch.tensor([1, 1], dtype=torch.long),
         step_indices=torch.tensor([1, 0], dtype=torch.long),
@@ -5324,10 +5396,12 @@ def test_t2s_prepare_prealloc_decode_inputs_stabilizes_x_and_hoists_metadata():
     kv_lens = torch.tensor([5], dtype=torch.long)
     attn_mask = torch.tensor([[[[False, False, False, True, True, True]]]], dtype=torch.bool)
 
-    stable_x, batch_index, max_kv_index, next_max_kv_len, sdpa_attn_mask = Text2SemanticDecoder._prepare_prealloc_decode_inputs(
-        x,
-        kv_lens,
-        attn_mask,
+    stable_x, batch_index, max_kv_index, next_max_kv_len, sdpa_attn_mask = (
+        Text2SemanticDecoder._prepare_prealloc_decode_inputs(
+            x,
+            kv_lens,
+            attn_mask,
+        )
     )
 
     assert torch.equal(stable_x, x)
@@ -5403,7 +5477,9 @@ def test_generate_semantic_tokens_uses_runtime_native_batch_scheduler(tmp_path):
     result = runtime.generate_semantic_tokens(prepared_requests)
 
     runtime._estimate_scheduler_max_steps.assert_called_once_with([item.state for item in prepared_requests])
-    runtime._run_continuous_batch_scheduler.assert_called_once_with("fake-model", [item.state for item in prepared_requests], max_steps=37)
+    runtime._run_continuous_batch_scheduler.assert_called_once_with(
+        "fake-model", [item.state for item in prepared_requests], max_steps=37
+    )
     assert torch.equal(result["req-a"], torch.tensor([1, 2], dtype=torch.long))
     assert torch.equal(result["req-b"], torch.tensor([3], dtype=torch.long))
 
@@ -5707,8 +5783,14 @@ def test_merge_active_batches_uses_runtime_native_merge_helpers(tmp_path):
         y_sequences=[torch.tensor([11], dtype=torch.long)],
         prefix_lens=torch.tensor([1], dtype=torch.long),
         step_indices=torch.tensor([0], dtype=torch.long),
-        k_cache=[torch.tensor([[[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)],
-        v_cache=[torch.tensor([[[10.0, 10.0, 10.0], [20.0, 20.0, 20.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)],
+        k_cache=[
+            torch.tensor([[[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)
+        ],
+        v_cache=[
+            torch.tensor(
+                [[[10.0, 10.0, 10.0], [20.0, 20.0, 20.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32
+            )
+        ],
         kv_lens=torch.tensor([2], dtype=torch.long),
         prefill_done=True,
         kv_cache_pooled=False,
@@ -5720,8 +5802,14 @@ def test_merge_active_batches_uses_runtime_native_merge_helpers(tmp_path):
         y_sequences=[torch.tensor([22], dtype=torch.long)],
         prefix_lens=torch.tensor([1], dtype=torch.long),
         step_indices=torch.tensor([1], dtype=torch.long),
-        k_cache=[torch.tensor([[[6.0, 6.0, 6.0], [7.0, 7.0, 7.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)],
-        v_cache=[torch.tensor([[[60.0, 60.0, 60.0], [70.0, 70.0, 70.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)],
+        k_cache=[
+            torch.tensor([[[6.0, 6.0, 6.0], [7.0, 7.0, 7.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)
+        ],
+        v_cache=[
+            torch.tensor(
+                [[[60.0, 60.0, 60.0], [70.0, 70.0, 70.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32
+            )
+        ],
         kv_lens=torch.tensor([2], dtype=torch.long),
         prefill_done=True,
         kv_cache_pooled=False,
@@ -5896,3 +5984,52 @@ def test_generate_semantic_tokens_groups_multi_segment_request_by_parent_id(tmp_
     assert [state.request_id for state in scheduler_states] == ["req-a::seg0000", "req-a::seg0001"]
     assert isinstance(result["req-a"], list)
     assert [item.tolist() for item in result["req-a"]] == [[1, 2], [3]]
+
+
+def test_prepare_models_active_offload_refcounts(monkeypatch: pytest.MonkeyPatch):
+    runtime = GPTSoVITSRuntime(project_root="/tmp/project", config_path="/tmp/config.yaml")
+    runtime._pipeline = SimpleNamespace(
+        configs=SimpleNamespace(device="cuda"),
+        bert_model=object(),
+        cnhuhbert_model=object(),
+    )
+    monkeypatch.setenv("GPTSOVITS_PREPARE_MODEL_CPU_OFFLOAD", "1")
+    moves: list[str] = []
+    monkeypatch.setattr(
+        runtime,
+        "_set_prepare_models_device",
+        lambda pipeline, device: moves.append(str(torch.device(device))),
+    )
+
+    with runtime._prepare_models_active():
+        assert runtime._prepare_model_offload_users == 1
+        with runtime._prepare_models_active():
+            assert runtime._prepare_model_offload_users == 2
+        assert runtime._prepare_model_offload_users == 1
+
+    assert runtime._prepare_model_offload_users == 0
+    assert moves == ["cuda", "cpu"]
+
+
+def test_offload_prepare_models_if_idle_respects_active_users(monkeypatch: pytest.MonkeyPatch):
+    runtime = GPTSoVITSRuntime(project_root="/tmp/project", config_path="/tmp/config.yaml")
+    pipeline = SimpleNamespace(
+        configs=SimpleNamespace(device="cuda"),
+        bert_model=object(),
+        cnhuhbert_model=object(),
+    )
+    monkeypatch.setenv("GPTSOVITS_PREPARE_MODEL_CPU_OFFLOAD", "1")
+    moves: list[str] = []
+    monkeypatch.setattr(
+        runtime,
+        "_set_prepare_models_device",
+        lambda current_pipeline, device: moves.append(str(torch.device(device))),
+    )
+
+    runtime._prepare_model_offload_users = 1
+    runtime._offload_prepare_models_if_idle(pipeline)
+    assert moves == []
+
+    runtime._prepare_model_offload_users = 0
+    runtime._offload_prepare_models_if_idle(pipeline)
+    assert moves == ["cpu"]

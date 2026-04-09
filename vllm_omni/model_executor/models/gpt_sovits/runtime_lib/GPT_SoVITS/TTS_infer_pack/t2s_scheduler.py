@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-from dataclasses import dataclass, field
 import os
-from pathlib import Path
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn.functional as F
-
-from AR.models.utils import logits_to_probs, make_pad_mask_left, multinomial_sample_one_no_sync, sample
+from AR.models.utils import logits_to_probs, make_pad_mask_left, multinomial_sample_one_no_sync
 
 
 def _sync_device(device: Any) -> None:
@@ -39,7 +39,7 @@ class SchedulerRequestSpec:
     temperature: float
     repetition_penalty: float
     early_stop_num: int
-    aux_ref_audio_paths: List[str] = field(default_factory=list)
+    aux_ref_audio_paths: list[str] = field(default_factory=list)
     ready_step: int = 0
 
 
@@ -58,8 +58,8 @@ class T2SRequestState:
     all_phones: torch.LongTensor
     all_bert_features: torch.Tensor
     prompt_semantic: torch.LongTensor
-    refer_spec: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]
-    aux_refer_specs: List[Tuple[torch.Tensor, Optional[torch.Tensor]]]
+    refer_spec: tuple[torch.Tensor, torch.Tensor | None] | None
+    aux_refer_specs: list[tuple[torch.Tensor, torch.Tensor | None]]
     raw_audio: torch.Tensor
     raw_sr: int
     top_k: int
@@ -68,7 +68,7 @@ class T2SRequestState:
     repetition_penalty: float
     early_stop_num: int
     ready_step: int
-    prepare_profile: Dict[str, float]
+    prepare_profile: dict[str, float]
 
 
 @dataclass
@@ -76,9 +76,9 @@ class T2SRunningRequest:
     state: T2SRequestState
     y_sequence: torch.LongTensor
     prefix_len: int
-    decode_attn_mask: Optional[torch.Tensor]
-    k_cache: List[torch.Tensor]
-    v_cache: List[torch.Tensor]
+    decode_attn_mask: torch.Tensor | None
+    k_cache: list[torch.Tensor]
+    v_cache: list[torch.Tensor]
     step_idx: int
 
 
@@ -92,19 +92,19 @@ class T2SFinishedItem:
 
 @dataclass
 class T2SActiveBatch:
-    request_ids: List[str]
-    states: List[T2SRequestState]
-    x: Optional[torch.Tensor]
-    x_lens: Optional[torch.LongTensor]
-    y_sequences: List[torch.LongTensor]
+    request_ids: list[str]
+    states: list[T2SRequestState]
+    x: torch.Tensor | None
+    x_lens: torch.LongTensor | None
+    y_sequences: list[torch.LongTensor]
     prefix_lens: torch.LongTensor
     xy_pos: torch.Tensor
-    key_padding_mask: Optional[torch.Tensor]
-    prefill_attn_mask: Optional[torch.Tensor]
-    decode_attn_mask: Optional[torch.Tensor]
-    k_cache: Optional[List[torch.Tensor]]
-    v_cache: Optional[List[torch.Tensor]]
-    kv_lens: Optional[torch.LongTensor]
+    key_padding_mask: torch.Tensor | None
+    prefill_attn_mask: torch.Tensor | None
+    decode_attn_mask: torch.Tensor | None
+    k_cache: list[torch.Tensor] | None
+    v_cache: list[torch.Tensor] | None
+    kv_lens: torch.LongTensor | None
     step_indices: torch.LongTensor
     prefill_done: bool
     kv_cache_pooled: bool = False
@@ -114,10 +114,10 @@ class T2SActiveBatch:
 
 @dataclass
 class PreparedTextFeatures:
-    phones: List[int]
+    phones: list[int]
     bert_features: torch.Tensor
     norm_text: str
-    profile: Dict[str, float]
+    profile: dict[str, float]
     total_ms: float
     cpu_preprocess_ms: float
 
@@ -153,7 +153,7 @@ def prepare_text_features(
     language: str,
 ) -> PreparedTextFeatures:
     device = tts.configs.device
-    profile: Dict[str, float] = {}
+    profile: dict[str, float] = {}
     branch_start = time.perf_counter()
     profile["_branch_start_ts"] = float(branch_start)
     _sync_device(device)
@@ -186,10 +186,10 @@ def build_request_state_from_parts(
     text: str,
     prompt_result: PreparedTextFeatures,
     target_result: PreparedTextFeatures,
-    ref_audio_bundle: Dict[str, Any],
+    ref_audio_bundle: dict[str, Any],
     prepare_start: float,
     prepare_sync_start: float,
-    profile_overrides: Optional[Dict[str, float]] = None,
+    profile_overrides: dict[str, float] | None = None,
 ) -> T2SRequestState:
     device = tts.configs.device
     _sync_device(device)
@@ -201,7 +201,7 @@ def build_request_state_from_parts(
         spec_audio, audio_16k = None, None
     else:
         spec_audio, audio_16k = refer_spec_value
-    aux_refer_specs: List[Tuple[torch.Tensor, Optional[torch.Tensor]]] = []
+    aux_refer_specs: list[tuple[torch.Tensor, torch.Tensor | None]] = []
     for aux_ref_audio_path in list(getattr(spec, "aux_ref_audio_paths", []) or []):
         if aux_ref_audio_path in [None, ""]:
             continue
@@ -234,15 +234,9 @@ def build_request_state_from_parts(
         "prompt_text_bert_wait_ms": float(prompt_result.profile.get("bert_wait_ms", 0.0)),
         "prompt_text_bert_admission_wait_ms": float(prompt_result.profile.get("bert_admission_wait_ms", 0.0)),
         "prompt_text_bert_queue_wait_ms": float(prompt_result.profile.get("bert_queue_wait_ms", 0.0)),
-        "prompt_text_bert_worker_queue_wait_ms": float(
-            prompt_result.profile.get("bert_worker_queue_wait_ms", 0.0)
-        ),
-        "prompt_text_bert_submit_offset_first_ms": float(
-            prompt_result.profile.get("bert_submit_offset_first_ms", 0.0)
-        ),
-        "prompt_text_bert_submit_offset_last_ms": float(
-            prompt_result.profile.get("bert_submit_offset_last_ms", 0.0)
-        ),
+        "prompt_text_bert_worker_queue_wait_ms": float(prompt_result.profile.get("bert_worker_queue_wait_ms", 0.0)),
+        "prompt_text_bert_submit_offset_first_ms": float(prompt_result.profile.get("bert_submit_offset_first_ms", 0.0)),
+        "prompt_text_bert_submit_offset_last_ms": float(prompt_result.profile.get("bert_submit_offset_last_ms", 0.0)),
         "prompt_text_bert_batch_collect_wait_ms": float(prompt_result.profile.get("bert_batch_collect_wait_ms", 0.0)),
         "prompt_text_bert_batch_dispatch_delay_ms": float(
             prompt_result.profile.get("bert_batch_dispatch_delay_ms", 0.0)
@@ -270,9 +264,7 @@ def build_request_state_from_parts(
         "prompt_text_g2pw_predict_ms": float(prompt_result.profile.get("g2pw_predict_ms", 0.0)),
         "prompt_text_g2pw_post_ms": float(prompt_result.profile.get("g2pw_post_ms", 0.0)),
         "prompt_text_g2pw_runtime_total_ms": float(prompt_result.profile.get("g2pw_runtime_total_ms", 0.0)),
-        "prompt_text_g2pw_runtime_queue_wait_ms": float(
-            prompt_result.profile.get("g2pw_runtime_queue_wait_ms", 0.0)
-        ),
+        "prompt_text_g2pw_runtime_queue_wait_ms": float(prompt_result.profile.get("g2pw_runtime_queue_wait_ms", 0.0)),
         "prompt_text_g2pw_runtime_collect_wait_ms": float(
             prompt_result.profile.get("g2pw_runtime_collect_wait_ms", 0.0)
         ),
@@ -340,9 +332,7 @@ def build_request_state_from_parts(
         "prompt_semantic_cpu_prepare_inflight_peak": float(
             bundle_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0)
         ),
-        "prompt_semantic_worker_queue_wait_ms": float(
-            bundle_profile.get("prompt_semantic_worker_queue_wait_ms", 0.0)
-        ),
+        "prompt_semantic_worker_queue_wait_ms": float(bundle_profile.get("prompt_semantic_worker_queue_wait_ms", 0.0)),
         "prompt_semantic_batch_collect_wait_ms": float(
             bundle_profile.get("prompt_semantic_batch_collect_wait_ms", 0.0)
         ),
@@ -472,8 +462,8 @@ def _run_coro_sync(coro):
     except RuntimeError:
         return asyncio.run(coro)
 
-    result: Dict[str, Any] = {}
-    error: Dict[str, BaseException] = {}
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
 
     def _runner() -> None:
         try:
@@ -531,11 +521,10 @@ def _prepare_request_state_legacy(
     prompt_text = normalize_sentence(spec.prompt_text, spec.prompt_lang)
     text = spec.text.strip("\n")
     prompt_result = None
-    profile_overrides: Dict[str, float] = {}
+    profile_overrides: dict[str, float] = {}
     prompt_future = None
     prompt_async_enabled = (
-        prompt_text not in [None, ""]
-        and os.environ.get("GPTSOVITS_PREPARE_PROMPT_TEXT_ASYNC", "0") != "0"
+        prompt_text not in [None, ""] and os.environ.get("GPTSOVITS_PREPARE_PROMPT_TEXT_ASYNC", "0") != "0"
     )
     if prompt_async_enabled:
         prompt_submit_at = time.perf_counter()
@@ -626,7 +615,7 @@ def _ensure_audio_pe(model: Any, max_position: int, dtype: torch.dtype, device: 
 
 def _pad_token_sequences(
     token_sequences: Sequence[torch.LongTensor],
-) -> Tuple[torch.LongTensor, torch.BoolTensor]:
+) -> tuple[torch.LongTensor, torch.BoolTensor]:
     if not token_sequences:
         raise ValueError("token_sequences 不能为空")
     device = token_sequences[0].device
@@ -642,7 +631,7 @@ def _pad_token_sequences(
 
 def _stack_token_sequences_if_same_length(
     token_sequences: Sequence[torch.LongTensor],
-) -> Optional[torch.LongTensor]:
+) -> torch.LongTensor | None:
     if not token_sequences:
         raise ValueError("token_sequences 不能为空")
     target_len = int(token_sequences[0].shape[0])
@@ -658,7 +647,7 @@ def _sampling_group_key(
     temperature: float,
     repetition_penalty: float,
     trim_eos: bool,
-) -> Tuple[int, float, float, float, bool]:
+) -> tuple[int, float, float, float, bool]:
     return (
         int(top_k),
         float(top_p),
@@ -669,13 +658,13 @@ def _sampling_group_key(
 
 
 def _iter_contiguous_sampling_groups(
-    sampling_keys: Sequence[Tuple[int, float, float, float, bool]],
-) -> List[Tuple[Tuple[int, float, float, float, bool], List[int]]]:
-    groups: List[Tuple[Tuple[int, float, float, float, bool], List[int]]] = []
+    sampling_keys: Sequence[tuple[int, float, float, float, bool]],
+) -> list[tuple[tuple[int, float, float, float, bool], list[int]]]:
+    groups: list[tuple[tuple[int, float, float, float, bool], list[int]]] = []
     if not sampling_keys:
         return groups
     current_key = sampling_keys[0]
-    current_indices: List[int] = [0]
+    current_indices: list[int] = [0]
     for index in range(1, len(sampling_keys)):
         key = sampling_keys[index]
         if key == current_key:
@@ -688,7 +677,7 @@ def _iter_contiguous_sampling_groups(
     return groups
 
 
-def _uniform_sampling_group_key(active_batch: T2SActiveBatch) -> Optional[Tuple[int, float, float, float, bool]]:
+def _uniform_sampling_group_key(active_batch: T2SActiveBatch) -> tuple[int, float, float, float, bool] | None:
     if not active_batch.states:
         return None
     if active_batch.step_indices.numel() <= 0:
@@ -718,8 +707,8 @@ def _uniform_sampling_group_key(active_batch: T2SActiveBatch) -> Optional[Tuple[
 def _batched_sample_uniform(
     logits: torch.Tensor,
     histories: Sequence[torch.LongTensor],
-    sampling_key: Tuple[int, float, float, float, bool],
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    sampling_key: tuple[int, float, float, float, bool],
+) -> tuple[torch.Tensor, torch.Tensor]:
     top_k, top_p, temperature, repetition_penalty, trim_eos = sampling_key
     sample_logits = logits[:, :-1] if trim_eos else logits
     padded_histories = _stack_token_sequences_if_same_length(histories)
@@ -743,10 +732,10 @@ def _batched_sample_uniform(
 def _batched_sample_by_group(
     logits: torch.Tensor,
     histories: Sequence[torch.LongTensor],
-    sampling_keys: Sequence[Tuple[int, float, float, float, bool]],
-) -> Tuple[List[torch.Tensor], List[int]]:
-    sampled_list: List[Optional[torch.Tensor]] = [None] * len(histories)
-    argmax_list: List[Optional[int]] = [None] * len(histories)
+    sampling_keys: Sequence[tuple[int, float, float, float, bool]],
+) -> tuple[list[torch.Tensor], list[int]]:
+    sampled_list: list[torch.Tensor | None] = [None] * len(histories)
+    argmax_list: list[int | None] = [None] * len(histories)
     for group_key, group_indices in _iter_contiguous_sampling_groups(sampling_keys):
         top_k, top_p, temperature, repetition_penalty, trim_eos = group_key
         index_tensor = torch.tensor(group_indices, dtype=torch.long, device=logits.device)
@@ -777,11 +766,11 @@ def _batched_sample_by_group(
 
 @torch.inference_mode()
 def build_prefill_batch(model: Any, states: Sequence[T2SRequestState]) -> T2SActiveBatch:
-    x_items: List[torch.Tensor] = []
-    y_pos_items: List[torch.Tensor] = []
-    x_lens: List[int] = []
-    prefix_lens: List[int] = []
-    y_sequences: List[torch.LongTensor] = []
+    x_items: list[torch.Tensor] = []
+    y_pos_items: list[torch.Tensor] = []
+    x_lens: list[int] = []
+    prefix_lens: list[int] = []
+    y_sequences: list[torch.LongTensor] = []
 
     for state in states:
         text_emb = model.ar_text_embedding(state.all_phones.unsqueeze(0))
@@ -804,7 +793,7 @@ def build_prefill_batch(model: Any, states: Sequence[T2SRequestState]) -> T2SAct
     device = x_batch.device
     x_lens_tensor = torch.LongTensor(x_lens).to(device)
     prefix_lens_tensor = torch.LongTensor(prefix_lens).to(device)
-    src_len = max_x_len + max_prefix_len
+    max_x_len + max_prefix_len
 
     x_padding_mask = make_pad_mask_left(x_lens_tensor, max_x_len)
     y_padding_mask = make_pad_mask_left(prefix_lens_tensor, max_prefix_len)
@@ -896,7 +885,9 @@ def _pack_active_batch_into_pool(model: Any, active_batch: T2SActiveBatch) -> bo
     max_kv_len = int(active_batch.kv_lens.max().item())
     if max_kv_len + 1 > int(pool.max_seq_len):
         try:
-            pool.record_fallback(f"pack_decode_headroom_overflow(batch={batch_size},seq={max_kv_len},next={max_kv_len + 1})")
+            pool.record_fallback(
+                f"pack_decode_headroom_overflow(batch={batch_size},seq={max_kv_len},next={max_kv_len + 1})"
+            )
         except Exception:
             pass
         active_batch.kv_cache_pooled = False
@@ -928,7 +919,7 @@ def _build_decode_mask_from_kv_lens(
     kv_lens: torch.LongTensor,
     *,
     device: torch.device,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     if kv_lens.numel() <= 0:
         return None
     target_len = int(kv_lens.max().item()) + 1
@@ -977,8 +968,8 @@ def _fallback_pooled_active_batch_to_dynamic_cache(
             pass
     target_len = int(active_batch.kv_lens.max().item())
     kv_lens_list = [int(item) for item in active_batch.kv_lens.tolist()]
-    unpacked_k_cache: List[torch.Tensor] = []
-    unpacked_v_cache: List[torch.Tensor] = []
+    unpacked_k_cache: list[torch.Tensor] = []
+    unpacked_v_cache: list[torch.Tensor] = []
     for pooled_k, pooled_v in zip(active_batch.k_cache, active_batch.v_cache):
         unpacked_k = pooled_k.new_zeros((pooled_k.shape[0], target_len, pooled_k.shape[2]))
         unpacked_v = pooled_v.new_zeros((pooled_v.shape[0], target_len, pooled_v.shape[2]))
@@ -1017,9 +1008,9 @@ def _compact_cache_to_kv_lens(
 
 
 def _compact_decode_mask_to_kv_lens(
-    decode_attn_mask: Optional[torch.Tensor],
+    decode_attn_mask: torch.Tensor | None,
     kv_lens: torch.LongTensor,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     target_len = int(kv_lens.max().item()) + 1
     if decode_attn_mask is None:
         return None
@@ -1039,9 +1030,9 @@ def _compact_decode_mask_to_kv_lens(
 
 
 def _advance_decode_mask(
-    decode_attn_mask: Optional[torch.Tensor],
+    decode_attn_mask: torch.Tensor | None,
     kv_lens: torch.LongTensor,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     if decode_attn_mask is None:
         return None
     target_len = int(kv_lens.max().item()) + 2
@@ -1064,16 +1055,16 @@ def _sample_per_request(
     active_batch: T2SActiveBatch,
     logits: torch.Tensor,
     max_steps: int,
-) -> Tuple[List[T2SFinishedItem], List[int], List[torch.LongTensor]]:
-    finished_items: List[T2SFinishedItem] = []
-    keep_indices: List[int] = []
-    updated_sequences: List[torch.LongTensor] = []
+) -> tuple[list[T2SFinishedItem], list[int], list[torch.LongTensor]]:
+    finished_items: list[T2SFinishedItem] = []
+    keep_indices: list[int] = []
+    updated_sequences: list[torch.LongTensor] = []
 
     uniform_sampling_key = _uniform_sampling_group_key(active_batch)
-    sampled_items: List[torch.Tensor]
-    argmax_tokens: List[int]
-    sampled_token_tensor: Optional[torch.Tensor] = None
-    argmax_token_tensor: Optional[torch.Tensor] = None
+    sampled_items: list[torch.Tensor]
+    argmax_tokens: list[int]
+    sampled_token_tensor: torch.Tensor | None = None
+    argmax_token_tensor: torch.Tensor | None = None
     if uniform_sampling_key is not None:
         sampled_tensor, argmax_tensor = _batched_sample_uniform(
             logits=logits,
@@ -1094,7 +1085,10 @@ def _sample_per_request(
                 list(range(len(active_batch.states))),
                 list(torch.cat([stacked_histories, sampled_token_tensor.view(-1, 1)], dim=1).unbind(0))
                 if stacked_histories is not None
-                else [torch.cat([history, sampled_token_tensor[index : index + 1]], dim=0) for index, history in enumerate(active_batch.y_sequences)],
+                else [
+                    torch.cat([history, sampled_token_tensor[index : index + 1]], dim=0)
+                    for index, history in enumerate(active_batch.y_sequences)
+                ],
             )
         sampled_items = [sampled_tensor[index : index + 1] for index in range(sampled_tensor.shape[0])]
         argmax_tokens = [int(item) for item in argmax_tensor.tolist()]
@@ -1127,8 +1121,11 @@ def _sample_per_request(
             argmax_token = argmax_tokens[batch_index]
         new_history = torch.cat([current_history, sampled.view(-1)], dim=0)
 
-        finish_reason: Optional[str] = None
-        if state.early_stop_num != -1 and (new_history.shape[0] - int(active_batch.prefix_lens[batch_index].item())) > state.early_stop_num:
+        finish_reason: str | None = None
+        if (
+            state.early_stop_num != -1
+            and (new_history.shape[0] - int(active_batch.prefix_lens[batch_index].item())) > state.early_stop_num
+        ):
             finish_reason = "early_stop"
         elif step_index + 1 >= max_steps:
             finish_reason = "max_step"
@@ -1158,7 +1155,7 @@ def decode_one_step(
     model: Any,
     active_batch: T2SActiveBatch,
     max_steps: int,
-) -> Tuple[Optional[T2SActiveBatch], List[T2SFinishedItem]]:
+) -> tuple[T2SActiveBatch | None, list[T2SFinishedItem]]:
     was_prefill = not active_batch.prefill_done
     if was_prefill:
         if active_batch.prefill_attn_mask is None or active_batch.key_padding_mask is None:
@@ -1175,9 +1172,15 @@ def decode_one_step(
                 (0, 1),
                 value=False,
             )
-            active_batch.k_cache = [_compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache]
-            active_batch.v_cache = [_compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache]
-            active_batch.decode_attn_mask = _compact_decode_mask_to_kv_lens(active_batch.decode_attn_mask, active_batch.kv_lens)
+            active_batch.k_cache = [
+                _compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
+            ]
+            active_batch.v_cache = [
+                _compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
+            ]
+            active_batch.decode_attn_mask = _compact_decode_mask_to_kv_lens(
+                active_batch.decode_attn_mask, active_batch.kv_lens
+            )
         active_batch.x = None
         active_batch.x_lens = None
         active_batch.key_padding_mask = None
@@ -1239,7 +1242,11 @@ def decode_one_step(
                 pooled_compacted = _compact_pooled_active_batch(model, active_batch, keep_indices)
                 if not pooled_compacted:
                     active_batch.kv_cache_pooled = False
-                if (not active_batch.kv_cache_pooled) and active_batch.k_cache is not None and active_batch.v_cache is not None:
+                if (
+                    (not active_batch.kv_cache_pooled)
+                    and active_batch.k_cache is not None
+                    and active_batch.v_cache is not None
+                ):
                     for cache_index in range(len(active_batch.k_cache)):
                         active_batch.k_cache[cache_index] = torch.index_select(
                             active_batch.k_cache[cache_index],
@@ -1303,7 +1310,9 @@ def decode_one_step(
     active_batch.y_sequences = updated_sequences
     active_batch.prefix_lens = torch.index_select(active_batch.prefix_lens, dim=0, index=keep_tensor)
     next_step_indices = torch.index_select(active_batch.step_indices, dim=0, index=keep_tensor)
-    next_kv_lens = None if active_batch.kv_lens is None else torch.index_select(active_batch.kv_lens, dim=0, index=keep_tensor)
+    next_kv_lens = (
+        None if active_batch.kv_lens is None else torch.index_select(active_batch.kv_lens, dim=0, index=keep_tensor)
+    )
     active_batch.step_indices = next_step_indices + 1
     if not was_prefill:
         if next_kv_lens is not None:
@@ -1321,11 +1330,19 @@ def decode_one_step(
             active_batch.kv_cache_pooled = False
     if (not active_batch.kv_cache_pooled) and active_batch.k_cache is not None and active_batch.v_cache is not None:
         for cache_index in range(len(active_batch.k_cache)):
-            active_batch.k_cache[cache_index] = torch.index_select(active_batch.k_cache[cache_index], dim=0, index=keep_tensor)
-            active_batch.v_cache[cache_index] = torch.index_select(active_batch.v_cache[cache_index], dim=0, index=keep_tensor)
+            active_batch.k_cache[cache_index] = torch.index_select(
+                active_batch.k_cache[cache_index], dim=0, index=keep_tensor
+            )
+            active_batch.v_cache[cache_index] = torch.index_select(
+                active_batch.v_cache[cache_index], dim=0, index=keep_tensor
+            )
         if active_batch.kv_lens is not None:
-            active_batch.k_cache = [_compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache]
-            active_batch.v_cache = [_compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache]
+            active_batch.k_cache = [
+                _compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.k_cache
+            ]
+            active_batch.v_cache = [
+                _compact_cache_to_kv_lens(layer, active_batch.kv_lens) for layer in active_batch.v_cache
+            ]
             active_batch.decode_attn_mask = _compact_decode_mask_to_kv_lens(
                 active_batch.decode_attn_mask,
                 active_batch.kv_lens,
@@ -1339,7 +1356,7 @@ def run_scheduler_batch(
     model: Any,
     states: Sequence[T2SRequestState],
     max_steps: int,
-) -> List[T2SFinishedItem]:
+) -> list[T2SFinishedItem]:
     return run_scheduler_continuous(model, states, max_steps=max_steps)
 
 
@@ -1393,7 +1410,7 @@ def _materialize_decode_mask_for_request(running_request: T2SRunningRequest) -> 
 
 def _materialize_decode_mask_for_active_batch(
     active_batch: T2SActiveBatch,
-    target_mask_len: Optional[int] = None,
+    target_mask_len: int | None = None,
 ) -> torch.Tensor:
     if active_batch.k_cache is None or active_batch.kv_lens is None:
         raise ValueError("active batch 缺少 KV cache 或 kv_lens")
@@ -1407,7 +1424,7 @@ def _materialize_decode_mask_for_active_batch(
             device=active_batch.k_cache[0].device,
         )
     else:
-        rows: List[torch.Tensor] = []
+        rows: list[torch.Tensor] = []
         for batch_index, kv_len in enumerate(active_batch.kv_lens.tolist()):
             row_len = kv_len + 1
             row_mask = _fit_decode_mask_length(
@@ -1426,7 +1443,7 @@ def run_prefill_active_batch(
     model: Any,
     states: Sequence[T2SRequestState],
     max_steps: int,
-) -> Tuple[Optional[T2SActiveBatch], List[T2SFinishedItem]]:
+) -> tuple[T2SActiveBatch | None, list[T2SFinishedItem]]:
     if not states:
         return None, []
     active_batch = build_prefill_batch(model, states)
@@ -1436,16 +1453,21 @@ def run_prefill_active_batch(
 @torch.inference_mode()
 def merge_active_batches(
     model: Any,
-    left_batch: Optional[T2SActiveBatch],
-    right_batch: Optional[T2SActiveBatch],
-) -> Optional[T2SActiveBatch]:
+    left_batch: T2SActiveBatch | None,
+    right_batch: T2SActiveBatch | None,
+) -> T2SActiveBatch | None:
     if left_batch is None:
         return right_batch
     if right_batch is None:
         return left_batch
     if not left_batch.prefill_done or not right_batch.prefill_done:
         raise ValueError("只有 prefill 完成后的 active batch 才能 merge")
-    if left_batch.k_cache is None or left_batch.v_cache is None or right_batch.k_cache is None or right_batch.v_cache is None:
+    if (
+        left_batch.k_cache is None
+        or left_batch.v_cache is None
+        or right_batch.k_cache is None
+        or right_batch.v_cache is None
+    ):
         raise ValueError("merge active batch 时缺少 KV cache")
     if left_batch.kv_lens is None or right_batch.kv_lens is None:
         raise ValueError("merge active batch 时缺少 kv_lens")
@@ -1453,8 +1475,8 @@ def merge_active_batches(
     merged_kv_len = int(merged_kv_lens.max().item())
     merged_mask_len = merged_kv_len + 1
 
-    merged_k_cache: List[torch.Tensor] = []
-    merged_v_cache: List[torch.Tensor] = []
+    merged_k_cache: list[torch.Tensor] = []
+    merged_v_cache: list[torch.Tensor] = []
     left_request_count = len(left_batch.request_ids)
     right_request_count = len(right_batch.request_ids)
     for layer_index in range(len(left_batch.k_cache)):
@@ -1544,12 +1566,14 @@ def run_prefill_step(
     model: Any,
     states: Sequence[T2SRequestState],
     max_steps: int,
-) -> Tuple[List[T2SRunningRequest], List[T2SFinishedItem]]:
+) -> tuple[list[T2SRunningRequest], list[T2SFinishedItem]]:
     if not states:
         return [], []
 
     active_batch = build_prefill_batch(model, states)
-    xy_dec, k_cache, v_cache = model.t2s_transformer.process_prompt(active_batch.xy_pos, active_batch.prefill_attn_mask, None)
+    xy_dec, k_cache, v_cache = model.t2s_transformer.process_prompt(
+        active_batch.xy_pos, active_batch.prefill_attn_mask, None
+    )
     decode_attn_mask = F.pad(active_batch.key_padding_mask.unsqueeze(1).unsqueeze(1), (0, 1), value=False)
     if len(states) == 1 and not decode_attn_mask.any().item():
         decode_attn_mask = None
@@ -1570,8 +1594,8 @@ def run_prefill_step(
         sampling_keys=sampling_keys,
     )
 
-    running_requests: List[T2SRunningRequest] = []
-    finished_items: List[T2SFinishedItem] = []
+    running_requests: list[T2SRunningRequest] = []
+    finished_items: list[T2SFinishedItem] = []
 
     for batch_index, state in enumerate(states):
         current_history = active_batch.y_sequences[batch_index]
@@ -1581,7 +1605,7 @@ def run_prefill_step(
         new_history = torch.cat([current_history, sampled.view(-1)], dim=0)
         prefix_len = int(active_batch.prefix_lens[batch_index].item())
 
-        finish_reason: Optional[str] = None
+        finish_reason: str | None = None
         if state.early_stop_num != -1 and (new_history.shape[0] - prefix_len) > state.early_stop_num:
             finish_reason = "early_stop"
         elif 1 >= max_steps:
@@ -1630,13 +1654,13 @@ def run_prefill_step(
 def _build_decode_batch_from_running(
     model: Any,
     running_requests: Sequence[T2SRunningRequest],
-) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor | None]:
     xy_pos = build_next_xy_pos(model, [item.y_sequence for item in running_requests])
     max_kv_len = max(item.k_cache[0].shape[1] for item in running_requests)
     num_layers = len(running_requests[0].k_cache)
 
-    batched_k_cache: List[torch.Tensor] = []
-    batched_v_cache: List[torch.Tensor] = []
+    batched_k_cache: list[torch.Tensor] = []
+    batched_v_cache: list[torch.Tensor] = []
     for layer_index in range(num_layers):
         batched_k_cache.append(
             torch.cat([_pad_cache_left(item.k_cache[layer_index], max_kv_len) for item in running_requests], dim=0)
@@ -1662,7 +1686,7 @@ def run_decode_step_for_running(
     model: Any,
     running_requests: Sequence[T2SRunningRequest],
     max_steps: int,
-) -> Tuple[List[T2SRunningRequest], List[T2SFinishedItem]]:
+) -> tuple[list[T2SRunningRequest], list[T2SFinishedItem]]:
     if not running_requests:
         return [], []
 
@@ -1693,8 +1717,8 @@ def run_decode_step_for_running(
         sampling_keys=sampling_keys,
     )
 
-    next_running: List[T2SRunningRequest] = []
-    finished_items: List[T2SFinishedItem] = []
+    next_running: list[T2SRunningRequest] = []
+    finished_items: list[T2SFinishedItem] = []
 
     for batch_index, running_request in enumerate(running_requests):
         current_idx = running_request.step_idx
@@ -1703,8 +1727,11 @@ def run_decode_step_for_running(
         argmax_token = argmax_tokens[batch_index]
         new_history = torch.cat([running_request.y_sequence, sampled.view(-1)], dim=0)
 
-        finish_reason: Optional[str] = None
-        if running_request.state.early_stop_num != -1 and (new_history.shape[0] - running_request.prefix_len) > running_request.state.early_stop_num:
+        finish_reason: str | None = None
+        if (
+            running_request.state.early_stop_num != -1
+            and (new_history.shape[0] - running_request.prefix_len) > running_request.state.early_stop_num
+        ):
             finish_reason = "early_stop"
         elif current_idx + 1 >= max_steps:
             finish_reason = "max_step"
@@ -1717,7 +1744,7 @@ def run_decode_step_for_running(
             finished_items.append(
                 T2SFinishedItem(
                     request_id=running_request.state.request_id,
-                    semantic_tokens=new_history[running_request.prefix_len:-1].clone(),
+                    semantic_tokens=new_history[running_request.prefix_len : -1].clone(),
                     finish_idx=current_idx,
                     finish_reason=finish_reason,
                 )
@@ -1725,8 +1752,12 @@ def run_decode_step_for_running(
             continue
 
         real_next_kv_len = running_request.k_cache[0].shape[1] + 1
-        request_k_cache = [layer[batch_index : batch_index + 1, -real_next_kv_len:, :].clone() for layer in next_k_cache]
-        request_v_cache = [layer[batch_index : batch_index + 1, -real_next_kv_len:, :].clone() for layer in next_v_cache]
+        request_k_cache = [
+            layer[batch_index : batch_index + 1, -real_next_kv_len:, :].clone() for layer in next_k_cache
+        ]
+        request_v_cache = [
+            layer[batch_index : batch_index + 1, -real_next_kv_len:, :].clone() for layer in next_v_cache
+        ]
         if batched_decode_attn_mask is None:
             next_decode_attn_mask = None
         else:
@@ -1758,14 +1789,14 @@ def run_scheduler_continuous(
     model: Any,
     states: Sequence[T2SRequestState],
     max_steps: int,
-) -> List[T2SFinishedItem]:
+) -> list[T2SFinishedItem]:
     pending = sorted(states, key=lambda item: (item.ready_step, item.request_id))
-    active_batch: Optional[T2SActiveBatch] = None
-    finished: List[T2SFinishedItem] = []
+    active_batch: T2SActiveBatch | None = None
+    finished: list[T2SFinishedItem] = []
     current_tick = 0
 
     while pending or active_batch is not None:
-        admitted: List[T2SRequestState] = []
+        admitted: list[T2SRequestState] = []
         while pending and pending[0].ready_step <= current_tick:
             admitted.append(pending.pop(0))
 

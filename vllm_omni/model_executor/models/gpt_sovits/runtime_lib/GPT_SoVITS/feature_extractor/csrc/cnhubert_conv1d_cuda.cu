@@ -79,7 +79,7 @@ torch::Tensor cnhubert_conv1d_forward_cuda(
     const std::array<int, 2> stride_dims = {1, static_cast<int>(stride)};
     const std::array<int, 2> dilation_dims = {1, static_cast<int>(dilation)};
     check_cudnn(
-        cudnnSetConvolutionNdDescriptor(
+        cudnnSetConvolutionAndDescriptor(
             conv_desc,
             static_cast<int>(pad_dims.size()),
             pad_dims.data(),

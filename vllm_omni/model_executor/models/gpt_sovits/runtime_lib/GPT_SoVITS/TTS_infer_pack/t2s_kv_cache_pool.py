@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any
 
 import torch
 
@@ -58,10 +59,10 @@ class T2SKVCachePool:
         self.max_seq_len = int(max_seq_len)
         self.hard_max_batch_size = max(0, int(hard_max_batch_size))
         self.hard_max_seq_len = max(0, int(hard_max_seq_len))
-        self.k_buffers: List[torch.Tensor] = []
-        self.v_buffers: List[torch.Tensor] = []
-        self.decode_mask_buffer: Optional[torch.Tensor] = None
-        self.positions: Optional[torch.Tensor] = None
+        self.k_buffers: list[torch.Tensor] = []
+        self.v_buffers: list[torch.Tensor] = []
+        self.decode_mask_buffer: torch.Tensor | None = None
+        self.positions: torch.Tensor | None = None
         self.state = T2SKVCachePoolState(
             enabled=False,
             device=str(self.device),
@@ -159,9 +160,7 @@ class T2SKVCachePool:
             )
             return False
         if self.hard_max_seq_len > 0 and requested_seq_len > self.hard_max_seq_len:
-            self.record_fallback(
-                f"resize_seq_limit_overflow(seq={requested_seq_len},limit={self.hard_max_seq_len})"
-            )
+            self.record_fallback(f"resize_seq_limit_overflow(seq={requested_seq_len},limit={self.hard_max_seq_len})")
             return False
 
         if preserve_existing:
@@ -273,11 +272,7 @@ class T2SKVCachePool:
         }
 
     def can_handle(self, batch_size: int, max_kv_len: int) -> bool:
-        return bool(
-            self.state.enabled
-            and batch_size <= self.max_batch_size
-            and max_kv_len <= self.max_seq_len
-        )
+        return bool(self.state.enabled and batch_size <= self.max_batch_size and max_kv_len <= self.max_seq_len)
 
     def set_active_rows(self, active_rows: int) -> None:
         self.state.active_rows = max(0, min(self.max_batch_size, int(active_rows)))
@@ -286,13 +281,13 @@ class T2SKVCachePool:
         self.state.fallback_count += 1
         self.state.last_fallback_reason = str(reason)
 
-    def _build_views(self, batch_size: int) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def _build_views(self, batch_size: int) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         return (
             [buffer[:batch_size, :, :] for buffer in self.k_buffers],
             [buffer[:batch_size, :, :] for buffer in self.v_buffers],
         )
 
-    def get_views(self, batch_size: int) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def get_views(self, batch_size: int) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         return self._build_views(batch_size)
 
     def pack_dynamic_cache_layers(
@@ -301,7 +296,7 @@ class T2SKVCachePool:
         k_layers: Sequence[torch.Tensor],
         v_layers: Sequence[torch.Tensor],
         kv_lens: torch.LongTensor,
-    ) -> Optional[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]] | None:
         if kv_lens.numel() <= 0:
             return self._build_views(0)
         batch_size = int(kv_lens.shape[0])
@@ -324,7 +319,7 @@ class T2SKVCachePool:
         *,
         keep_indices: Sequence[int],
         kv_lens: torch.LongTensor,
-    ) -> Optional[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]] | None:
         batch_size = int(len(keep_indices))
         if batch_size <= 0:
             return self._build_views(0)
@@ -341,7 +336,7 @@ class T2SKVCachePool:
         self.set_active_rows(batch_size)
         return self._build_views(batch_size)
 
-    def build_decode_mask(self, next_kv_lens: torch.LongTensor) -> Optional[torch.Tensor]:
+    def build_decode_mask(self, next_kv_lens: torch.LongTensor) -> torch.Tensor | None:
         if next_kv_lens.numel() <= 0:
             return None
         batch_size = int(next_kv_lens.shape[0])

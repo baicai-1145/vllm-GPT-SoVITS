@@ -8,26 +8,24 @@ d - dimension
 """
 
 from __future__ import annotations
+
 from typing import Literal
 
 import torch
-from torch import nn
 import torch.nn.functional as F
-
-from x_transformers import RMSNorm
-from x_transformers.x_transformers import RotaryEmbedding
-
 from f5_tts.model.modules import (
-    TimestepEmbedding,
-    ConvNeXtV2Block,
-    ConvPositionEmbedding,
     Attention,
     AttnProcessor,
+    ConvNeXtV2Block,
+    ConvPositionEmbedding,
     FeedForward,
-    precompute_freqs_cis,
+    TimestepEmbedding,
     get_pos_embed_indices,
+    precompute_freqs_cis,
 )
-
+from torch import nn
+from x_transformers import RMSNorm
+from x_transformers.x_transformers import RotaryEmbedding
 
 # Text embedding
 
@@ -166,7 +164,7 @@ class UNetT(nn.Module):
         x: float["b n d"],  # nosied input audio  # noqa: F722
         cond: float["b n d"],  # masked cond audio  # noqa: F722
         text: int["b nt"],  # text  # noqa: F722
-        time: float["b"] | float[""],  # time step  # noqa: F821 F722
+        time: float[b] | float[""],  # time step  # noqa: F821 F722
         drop_audio_cond,  # cfg for cond audio
         drop_text,  # cfg for text
         mask: bool["b n"] | None = None,  # noqa: F722

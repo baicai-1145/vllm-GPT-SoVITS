@@ -1,5 +1,6 @@
-import torch
 import os
+
+import torch
 from transformers import logging as tf_logging
 
 tf_logging.set_verbosity_error()
@@ -8,19 +9,19 @@ import logging
 
 logging.getLogger("numba").setLevel(logging.WARNING)
 
+import torch.nn as nn
+import utils
 from transformers import (
-    Wav2Vec2FeatureExtractor,
     HubertModel,
+    Wav2Vec2FeatureExtractor,
 )
 
-import utils
-import torch.nn as nn
+from .cnhubert_conv1d_cuda import maybe_patch_hubert_conv_layers
 from .cnhubert_conv_backend import (
     apply_backend_preset_env_defaults,
     maybe_patch_hubert_conv_backend,
     maybe_wrap_hubert_model_backend,
 )
-from .cnhubert_conv1d_cuda import maybe_patch_hubert_conv_layers
 from .cnhubert_ffn_cuda import maybe_patch_hubert_feed_forward
 
 cnhubert_base_path = None

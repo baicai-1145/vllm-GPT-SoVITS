@@ -5,7 +5,6 @@ import sys
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
-from typing import Dict
 
 import torch
 from torch import nn
@@ -60,10 +59,10 @@ class Text2SemanticLightningModule(_InferenceCompatibleLightningModule):
             self.eval_dir = output_dir / "eval"
             self.eval_dir.mkdir(parents=True, exist_ok=True)
 
-    def training_step(self, batch: Dict, batch_idx: int):
+    def training_step(self, batch: dict, batch_idx: int):
         opt = self.optimizers()
         scheduler = self.lr_schedulers()
-        forward = self.model.forward if self.config["train"].get("if_dpo", False) == True else self.model.forward_old
+        forward = self.model.forward if self.config["train"].get("if_dpo", False) else self.model.forward_old
         loss, acc = forward(
             batch["phoneme_ids"],
             batch["phoneme_ids_len"],
@@ -101,7 +100,7 @@ class Text2SemanticLightningModule(_InferenceCompatibleLightningModule):
             sync_dist=True,
         )
 
-    def validation_step(self, batch: Dict, batch_idx: int):
+    def validation_step(self, batch: dict, batch_idx: int):
         return
 
     # # get loss

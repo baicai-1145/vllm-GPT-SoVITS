@@ -8,17 +8,18 @@ To alleviate this problem, we propose an improved ERes2NetV2 by pruning redundan
 both the model parameters and its computational cost.
 """
 
-import torch
 import math
+
+import pooling_layers as pooling_layers
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pooling_layers as pooling_layers
 from fusion import AFF
 
 
 class ReLU(nn.Hardtanh):
     def __init__(self, inplace=False):
-        super(ReLU, self).__init__(0, 20, inplace)
+        super().__init__(0, 20, inplace)
 
     def __repr__(self):
         inplace_str = "inplace" if self.inplace else ""
@@ -27,7 +28,7 @@ class ReLU(nn.Hardtanh):
 
 class BasicBlockERes2NetV2(nn.Module):
     def __init__(self, in_planes, planes, stride=1, baseWidth=26, scale=2, expansion=2):
-        super(BasicBlockERes2NetV2, self).__init__()
+        super().__init__()
         width = int(math.floor(planes * (baseWidth / 64.0)))
         self.conv1 = nn.Conv2d(in_planes, width * scale, kernel_size=1, stride=stride, bias=False)
         self.bn1 = nn.BatchNorm2d(width * scale)
@@ -86,7 +87,7 @@ class BasicBlockERes2NetV2(nn.Module):
 
 class BasicBlockERes2NetV2AFF(nn.Module):
     def __init__(self, in_planes, planes, stride=1, baseWidth=26, scale=2, expansion=2):
-        super(BasicBlockERes2NetV2AFF, self).__init__()
+        super().__init__()
         width = int(math.floor(planes * (baseWidth / 64.0)))
         self.conv1 = nn.Conv2d(in_planes, width * scale, kernel_size=1, stride=stride, bias=False)
         self.bn1 = nn.BatchNorm2d(width * scale)
@@ -164,7 +165,7 @@ class ERes2NetV2(nn.Module):
         pooling_func="TSTP",
         two_emb_layer=False,
     ):
-        super(ERes2NetV2, self).__init__()
+        super().__init__()
         self.in_planes = m_channels
         self.feat_dim = feat_dim
         self.embedding_size = embedding_size
@@ -268,5 +269,5 @@ if __name__ == "__main__":
     y = model(x)
     print(y.size())
     macs, num_params = profile(model, inputs=(x,))
-    print("Params: {} M".format(num_params / 1e6))  # 17.86 M
-    print("MACs: {} G".format(macs / 1e9))  # 12.69 G
+    print(f"Params: {num_params / 1e6} M")  # 17.86 M
+    print(f"MACs: {macs / 1e9} G")  # 12.69 G

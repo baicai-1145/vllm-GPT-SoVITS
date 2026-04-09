@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -7,17 +8,13 @@ import numpy as np
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_VENDORED_RUNTIME_ROOT = (
-    _REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "gpt_sovits" / "runtime_lib"
-)
+_VENDORED_RUNTIME_ROOT = _REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "gpt_sovits" / "runtime_lib"
 for candidate in (str(_VENDORED_RUNTIME_ROOT), str(_VENDORED_RUNTIME_ROOT / "GPT_SoVITS")):
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
-
-from vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.text.g2pw.cuda_api import (
-    G2PWRuntimeWrapper,
-)
-
+G2PWRuntimeWrapper = importlib.import_module(
+    "vllm_omni.model_executor.models.gpt_sovits.runtime_lib.GPT_SoVITS.text.g2pw.cuda_api"
+).G2PWRuntimeWrapper
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

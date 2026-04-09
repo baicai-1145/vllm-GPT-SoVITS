@@ -13,11 +13,11 @@ class TAP(nn.Module):
     """
 
     def __init__(self, **kwargs):
-        super(TAP, self).__init__()
+        super().__init__()
 
     def forward(self, x):
         pooling_mean = x.mean(dim=-1)
-        # To be compatable with 2D input
+        # To be compatible with 2D input
         pooling_mean = pooling_mean.flatten(start_dim=1)
         return pooling_mean
 
@@ -28,7 +28,7 @@ class TSDP(nn.Module):
     """
 
     def __init__(self, **kwargs):
-        super(TSDP, self).__init__()
+        super().__init__()
 
     def forward(self, x):
         # The last dimension is the temporal axis
@@ -45,7 +45,7 @@ class TSTP(nn.Module):
     """
 
     def __init__(self, **kwargs):
-        super(TSTP, self).__init__()
+        super().__init__()
 
     def forward(self, x):
         # The last dimension is the temporal axis
@@ -64,7 +64,7 @@ class ASTP(nn.Module):
     """
 
     def __init__(self, in_dim, bottleneck_dim=128, global_context_att=False):
-        super(ASTP, self).__init__()
+        super().__init__()
         self.global_context_att = global_context_att
 
         # Use Conv1d with stride == 1 rather than Linear, then we don't

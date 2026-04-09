@@ -46,7 +46,9 @@ def t2s2decode(
         output = t2s_output.outputs[0]
         semantic_tokens = output.multimodal_output["semantic_tokens"].to(torch.long).reshape(-1).cpu().contiguous()
         request_id = str(getattr(t2s_output, "request_id", getattr(output, "request_id", "")) or "")
-        logger.info("GPT-SoVITS stage0 finished request %s with %d semantic tokens", request_id, int(semantic_tokens.numel()))
+        logger.info(
+            "GPT-SoVITS stage0 finished request %s with %d semantic tokens", request_id, int(semantic_tokens.numel())
+        )
         if semantic_tokens.numel() == 0:
             continue
         prompt_info = _prompt_additional_info(prompt, index)
@@ -61,7 +63,10 @@ def t2s2decode(
             segment_phones=(),
             prompt_phones=output.multimodal_output["gpt_sovits_prompt_phones"].to(torch.long).cpu().contiguous(),
             prompt_semantic=output.multimodal_output["gpt_sovits_prompt_semantic"].to(torch.long).cpu().contiguous(),
-            refer_audio_spec=output.multimodal_output["gpt_sovits_refer_audio_spec"].to(torch.float32).cpu().contiguous(),
+            refer_audio_spec=output.multimodal_output["gpt_sovits_refer_audio_spec"]
+            .to(torch.float32)
+            .cpu()
+            .contiguous(),
             refer_audio_16k=output.multimodal_output["gpt_sovits_refer_audio_16k"].to(torch.float32).cpu().contiguous(),
             raw_audio=output.multimodal_output["gpt_sovits_raw_audio"].to(torch.float32).cpu().contiguous(),
             raw_sr=int(raw_sr),

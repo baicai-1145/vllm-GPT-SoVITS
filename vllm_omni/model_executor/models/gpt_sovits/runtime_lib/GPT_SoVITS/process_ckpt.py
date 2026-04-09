@@ -1,8 +1,9 @@
+import os
+import shutil
 import traceback
 from collections import OrderedDict
 from time import time as ttime
-import shutil
-import os
+
 import torch
 from tools.i18n.i18n import I18nAuto
 
@@ -12,9 +13,9 @@ i18n = I18nAuto()
 def my_save(fea, path):  #####fix issue: torch.save doesn't support chinese path
     dir = os.path.dirname(path)
     name = os.path.basename(path)
-    tmp_path = "%s.pth" % (ttime())
+    tmp_path = f"{ttime()}.pth"
     torch.save(fea, tmp_path)
-    shutil.move(tmp_path, "%s/%s" % (dir, name))
+    shutil.move(tmp_path, f"{dir}/{name}")
 
 
 from io import BytesIO
@@ -47,14 +48,14 @@ def savee(ckpt, name, epoch, steps, hps, model_version=None, lora_rank=None):
                 continue
             opt["weight"][key] = ckpt[key].half()
         opt["config"] = hps
-        opt["info"] = "%sepoch_%siteration" % (epoch, steps)
+        opt["info"] = f"{epoch}epoch_{steps}iteration"
         if lora_rank:
             opt["lora_rank"] = lora_rank
-            my_save2(opt, "%s/%s.pth" % (hps.save_weight_dir, name), model_version)
-        elif model_version != None and "Pro" in model_version:
-            my_save2(opt, "%s/%s.pth" % (hps.save_weight_dir, name), model_version)
+            my_save2(opt, f"{hps.save_weight_dir}/{name}.pth", model_version)
+        elif model_version is not None and "Pro" in model_version:
+            my_save2(opt, f"{hps.save_weight_dir}/{name}.pth", model_version)
         else:
-            my_save(opt, "%s/%s.pth" % (hps.save_weight_dir, name))
+            my_save(opt, f"{hps.save_weight_dir}/{name}.pth")
         return "Success."
     except:
         return traceback.format_exc()
@@ -112,7 +113,7 @@ def get_sovits_version_from_path_fast(sovits_path):
     size = os.path.getsize(sovits_path)
     """
             v1weights:about 82942KB
-                half thr:82978KB
+                half the:82978KB
             v2weights:about 83014KB
             v3weights:about 750MB
     """

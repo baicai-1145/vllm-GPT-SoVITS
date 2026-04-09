@@ -1,23 +1,23 @@
-from __future__ import absolute_import, division, print_function, unicode_literals
-import sys
 import os
+import sys
 
 AP_BWE_main_dir_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AP_BWE_main")
 sys.path.append(AP_BWE_main_dir_path)
 import json
+
 import torch
 import torchaudio.functional as aF
-# from attrdict import AttrDict####will be bug in py3.10
 
-from datasets1.dataset import amp_pha_stft, amp_pha_istft
+# from attrdict import AttrDict####will be bug in py3.10
+from datasets1.dataset import amp_pha_istft, amp_pha_stft
 from models.model import APNet_BWE_Model
 
 
 class AP_BWE:
     def __init__(self, device, DictToAttrRecursive, checkpoint_file=None):
-        if checkpoint_file == None:
-            checkpoint_file = "%s/24kto48k/g_24kto48k.zip" % (AP_BWE_main_dir_path)
-            if os.path.exists(checkpoint_file) == False:
+        if checkpoint_file is None:
+            checkpoint_file = f"{AP_BWE_main_dir_path}/24kto48k/g_24kto48k.zip"
+            if not os.path.exists(checkpoint_file):
                 raise FileNotFoundError
         config_file = os.path.join(os.path.split(checkpoint_file)[0], "config.json")
         with open(config_file) as f:

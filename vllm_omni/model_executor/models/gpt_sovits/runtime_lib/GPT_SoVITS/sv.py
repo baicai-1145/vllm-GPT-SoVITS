@@ -1,5 +1,6 @@
-import sys
 import os
+import sys
+
 import torch
 
 _PACKAGE_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -7,8 +8,8 @@ _ERES2NET_DIR = os.path.join(_PACKAGE_ROOT, "eres2net")
 sv_path = os.path.join(_PACKAGE_ROOT, "pretrained_models", "sv", "pretrained_eres2netv2w24s4ep4.ckpt")
 if _ERES2NET_DIR not in sys.path:
     sys.path.insert(0, _ERES2NET_DIR)
-from ERes2NetV2 import ERes2NetV2
 import kaldi as Kaldi
+from ERes2NetV2 import ERes2NetV2
 
 
 class SV:

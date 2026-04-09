@@ -12,7 +12,7 @@ import json
 import os
 import statistics
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +21,17 @@ import torch
 
 from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSRuntime
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TEMP_ROOT = REPO_ROOT / "TEMP"
 DEFAULT_PROJECT_ROOT = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "gpt_sovits" / "runtime_lib"
 DEFAULT_CONFIG_PATH = (
-    REPO_ROOT / "tests" / "model_executor" / "models" / "gpt_sovits" / "fixtures" / "tts_infer_v2proplus_cuda_longprompt.yaml"
+    REPO_ROOT
+    / "tests"
+    / "model_executor"
+    / "models"
+    / "gpt_sovits"
+    / "fixtures"
+    / "tts_infer_v2proplus_cuda_longprompt.yaml"
 )
 DEFAULT_REF_AUDIO = REPO_ROOT / "test.wav"
 DEFAULT_REF_TEXT = "又或者说，你已经察觉到了…却还想拿「它」干什么好事？"
@@ -276,7 +281,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--ref-audio", type=Path, default=DEFAULT_REF_AUDIO)
     parser.add_argument("--text-split-method", default="cut5", help="Segmentation method passed into runtime.")
     parser.add_argument("--output-json", type=Path, default=None)
-    parser.add_argument("--save-audio", action="store_true", help="Save the last measured audio for each suite to TEMP.")
+    parser.add_argument(
+        "--save-audio", action="store_true", help="Save the last measured audio for each suite to TEMP."
+    )
     return parser
 
 

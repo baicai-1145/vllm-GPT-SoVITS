@@ -1,8 +1,9 @@
 import os
 import random
+
 import torch
-import torchaudio
 import torch.utils.data
+import torchaudio
 import torchaudio.functional as aF
 
 
@@ -37,10 +38,10 @@ def amp_pha_istft(log_amp, pha, n_fft, hop_size, win_size, center=True):
 
 
 def get_dataset_filelist(a):
-    with open(a.input_training_file, "r", encoding="utf-8") as fi:
+    with open(a.input_training_file, encoding="utf-8") as fi:
         training_indexes = [x.split("|")[0] for x in fi.read().split("\n") if len(x) > 0]
 
-    with open(a.input_validation_file, "r", encoding="utf-8") as fi:
+    with open(a.input_validation_file, encoding="utf-8") as fi:
         validation_indexes = [x.split("|")[0] for x in fi.read().split("\n") if len(x) > 0]
 
     return training_indexes, validation_indexes

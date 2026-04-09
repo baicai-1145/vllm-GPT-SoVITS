@@ -12,8 +12,8 @@ from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
 )
-from vllm_omni.model_executor.stage_input_processors.gpt_sovits import t2s2decode
 from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSStageTransport
+from vllm_omni.model_executor.stage_input_processors.gpt_sovits import t2s2decode
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -114,8 +114,6 @@ def test_t2s2decode_transport_survives_additional_information_msgspec_roundtrip(
     assert payload is not None
     encoded = msgspec.msgpack.encode(payload)
     decoded = msgspec.msgpack.decode(encoded, type=AdditionalInformationPayload)
-    transport = GPTSoVITSStageTransport.from_info(
-        deserialize_additional_information(decoded)
-    )
+    transport = GPTSoVITSStageTransport.from_info(deserialize_additional_information(decoded))
     assert torch.equal(transport.semantic_tokens, torch.tensor([7, 8, 9], dtype=torch.long))
     assert transport.has_decode_conditioning()

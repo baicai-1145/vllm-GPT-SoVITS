@@ -2,18 +2,20 @@ import os
 import re
 import threading
 import time
+from collections.abc import Sequence
 from functools import lru_cache
-from typing import Dict, List, Sequence, Tuple
 
 import cn2an
-from pypinyin import lazy_pinyin, pinyin, Style
+from pypinyin import Style, lazy_pinyin, pinyin
 from pypinyin.contrib.tone_convert import to_finals_tone3, to_initials
 
 from text.symbols import punctuation
 from text.tone_sandhi import ToneSandhi
-from text.zh_normalization.text_normlization import TextNormalizer
+from text.zh_normalization.text_normalization import TextNormalizer
 
-normalizer = lambda x: cn2an.transform(x, "an2cn")
+
+def normalizer(x):
+    return cn2an.transform(x, "an2cn")
 
 current_file_path = os.path.dirname(__file__)
 _TEXT_ROOT = os.path.abspath(current_file_path)
@@ -25,11 +27,13 @@ pinyin_to_symbol_map = {
     for line in open(os.path.join(current_file_path, "opencpop-strict.txt")).readlines()
 }
 
-import jieba_fast
 import logging
+
+import jieba_fast
 
 jieba_fast.setLogLevel(logging.CRITICAL)
 import jieba_fast.posseg as psg
+
 
 def _env_enabled(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() not in {
@@ -118,14 +122,14 @@ def replace_punctuation(text):
 
 
 def g2p(text):
-    pattern = r"(?<=[{0}])\s*".format("".join(punctuation))
+    pattern = r"(?<=[{}])\s*".format("".join(punctuation))
     sentences = [i for i in re.split(pattern, text) if i.strip() != ""]
     phones, word2ph = _g2p(sentences)
     return phones, word2ph
 
 
 @lru_cache(maxsize=8192)
-def _word_pronunciation_candidates(word: str) -> Tuple[Tuple[str, ...], ...]:
+def _word_pronunciation_candidates(word: str) -> tuple[tuple[str, ...], ...]:
     candidates = pinyin(
         word,
         style=Style.TONE3,
@@ -176,7 +180,7 @@ def _prepare_g2p_segments(segments):
     return prepared_segments, batch_inputs
 
 
-def _new_g2pw_profile() -> Dict[str, float]:
+def _new_g2pw_profile() -> dict[str, float]:
     return {
         "g2pw_prepare_ms": 0.0,
         "g2pw_predict_ms": 0.0,
@@ -193,7 +197,7 @@ def _new_g2pw_profile() -> Dict[str, float]:
     }
 
 
-def _predict_g2pw_batch(batch_inputs: Sequence[str]) -> Tuple[List[List[str]], Dict[str, float]]:
+def _predict_g2pw_batch(batch_inputs: Sequence[str]) -> tuple[list[list[str]], dict[str, float]]:
     profile = _new_g2pw_profile()
     if not (is_g2pw and batch_inputs and g2pw is not None):
         return [], profile
@@ -213,9 +217,7 @@ def _predict_g2pw_batch(batch_inputs: Sequence[str]) -> Tuple[List[List[str]], D
 
 def _g2pw_batch_weight(prepared_segments, batch_inputs: Sequence[str]) -> float:
     char_count = sum(
-        len(item["segment"])
-        for item in prepared_segments
-        if item.get("needs_g2pw", False) and item["segment"]
+        len(item["segment"]) for item in prepared_segments if item.get("needs_g2pw", False) and item["segment"]
     )
     if char_count > 0:
         return float(char_count)
@@ -225,8 +227,8 @@ def _g2pw_batch_weight(prepared_segments, batch_inputs: Sequence[str]) -> float:
 
 
 def _merge_shared_g2pw_profile(
-    profile: Dict[str, float],
-    shared_profile: Dict[str, float],
+    profile: dict[str, float],
+    shared_profile: dict[str, float],
     weight: float,
     total_weight: float,
 ) -> None:
@@ -255,8 +257,8 @@ def g2p_segments_batch(
     return_profiles: bool = False,
 ):
     prepared_batches = []
-    all_batch_inputs: List[str] = []
-    batch_weights: List[float] = []
+    all_batch_inputs: list[str] = []
+    batch_weights: list[float] = []
     for segments in segment_batches:
         prepare_start = time.perf_counter()
         prepared_segments, batch_inputs = _prepare_g2p_segments(list(segments))
@@ -632,7 +634,7 @@ def text_normalize_batch(texts):
 
 
 if __name__ == "__main__":
-    text = "啊——但是《原神》是由,米哈\游自主，研发的一款全.新开放世界.冒险游戏"
+    text = r"啊——但是《原神》是由,米哈\游自主，研发的一款全.新开放世界.冒险游戏"
     text = "呣呣呣～就是…大人的鼹鼠党吧？"
     text = "你好"
     text = text_normalize(text)

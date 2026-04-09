@@ -7,10 +7,9 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Tuple
+from typing import Any
 
 import numpy as np
-
 from TTS_infer_pack.prepare_gpu_timeline import trace_gpu_batch
 
 from .backend_common import _G2PWBaseOnnxConverter
@@ -22,12 +21,12 @@ class G2PWCudaError(RuntimeError):
 
 @dataclass
 class G2PWBatchTask:
-    model_input: Dict[str, np.ndarray]
+    model_input: dict[str, np.ndarray]
     created_at: float = field(default_factory=time.perf_counter)
     enqueued_at: float = 0.0
     done_event: threading.Event = field(default_factory=threading.Event)
     output: np.ndarray | None = None
-    profile: Dict[str, float] = field(default_factory=dict)
+    profile: dict[str, float] = field(default_factory=dict)
     error: Exception | None = None
 
 
@@ -64,11 +63,7 @@ def _resolve_cuda_root() -> Path:
         path = Path(candidate).expanduser().resolve()
         if path.exists():
             return path
-    checked = [
-        str(Path(candidate).expanduser().resolve())
-        for candidate in candidates
-        if str(candidate).strip() != ""
-    ]
+    checked = [str(Path(candidate).expanduser().resolve()) for candidate in candidates if str(candidate).strip() != ""]
     raise G2PWCudaError(
         "Cannot locate g2pw-cu root. "
         "Expected one of: "
@@ -222,7 +217,7 @@ class G2PWRuntimeWrapper:
         self.batch_max_rows = max(1, _env_int("GPTSOVITS_G2PW_CUDA_BATCH_MAX_ROWS", 96))
         self.batch_max_tokens = max(1, _env_int("GPTSOVITS_G2PW_CUDA_BATCH_MAX_TOKENS", 4096))
         self.batch_condition = threading.Condition()
-        self.pending_tasks: Deque[G2PWBatchTask] = deque()
+        self.pending_tasks: deque[G2PWBatchTask] = deque()
         self.batch_total_tasks = 0
         self.batch_total_batches = 0
         self.batch_total_rows = 0
@@ -336,7 +331,7 @@ class G2PWRuntimeWrapper:
         self._create_handle(batch_size=next_batch, seq_len=next_seq)
 
     @staticmethod
-    def _normalize_model_input(model_input: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    def _normalize_model_input(model_input: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         input_ids = np.ascontiguousarray(model_input["input_ids"], dtype=np.int64)
         token_type_ids = np.ascontiguousarray(model_input["token_type_ids"], dtype=np.int64)
         attention_masks = np.ascontiguousarray(model_input["attention_masks"], dtype=np.int64)
@@ -360,13 +355,11 @@ class G2PWRuntimeWrapper:
             sequence_ids = np.ascontiguousarray(sequence_ids_raw, dtype=np.int64)
             if sequence_ids.ndim != 1 or int(sequence_ids.shape[0]) != batch_size:
                 raise G2PWCudaError(
-                    "sequence_ids 形状无效: "
-                    f"expected=({batch_size},) actual={tuple(sequence_ids.shape)}"
+                    f"sequence_ids 形状无效: expected=({batch_size},) actual={tuple(sequence_ids.shape)}"
                 )
         if sequence_batch_size <= 0 or batch_size <= 0:
             raise G2PWCudaError(
-                "model_input 批大小无效: "
-                f"sequence_batch_size={sequence_batch_size} query_batch_size={batch_size}"
+                f"model_input 批大小无效: sequence_batch_size={sequence_batch_size} query_batch_size={batch_size}"
             )
         min_sequence_id = int(sequence_ids.min()) if batch_size > 0 else 0
         max_sequence_id = int(sequence_ids.max()) if batch_size > 0 else 0
@@ -386,7 +379,7 @@ class G2PWRuntimeWrapper:
             "sequence_ids": sequence_ids,
         }
 
-    def _run_direct(self, model_input: Dict[str, np.ndarray]) -> np.ndarray:
+    def _run_direct(self, model_input: dict[str, np.ndarray]) -> np.ndarray:
         normalized = self._normalize_model_input(model_input)
         input_ids = normalized["input_ids"]
         token_type_ids = normalized["token_type_ids"]
@@ -419,7 +412,7 @@ class G2PWRuntimeWrapper:
                 raise G2PWCudaError(f"g2pw-cu inference failed: {self._last_error()}")
         return probs
 
-    def _split_model_input_for_direct_run(self, model_input: Dict[str, np.ndarray]) -> List[Dict[str, np.ndarray]]:
+    def _split_model_input_for_direct_run(self, model_input: dict[str, np.ndarray]) -> list[dict[str, np.ndarray]]:
         normalized = self._normalize_model_input(model_input)
         query_rows = int(normalized["char_ids"].shape[0])
         sequence_rows = int(normalized["input_ids"].shape[0])
@@ -427,28 +420,22 @@ class G2PWRuntimeWrapper:
         max_rows = max(1, int(self.direct_max_rows))
         max_sequences = max(1, int(self.direct_max_sequences))
         max_tokens = max(max(1, int(self.direct_max_tokens)), seq_len)
-        if (
-            query_rows <= max_rows
-            and sequence_rows <= max_sequences
-            and (sequence_rows * seq_len) <= max_tokens
-        ):
+        if query_rows <= max_rows and sequence_rows <= max_sequences and (sequence_rows * seq_len) <= max_tokens:
             return [normalized]
 
         sequence_ids = normalized["sequence_ids"]
-        chunks: List[Dict[str, np.ndarray]] = []
+        chunks: list[dict[str, np.ndarray]] = []
         query_start = 0
         while query_start < query_rows:
             query_end = query_start
-            chunk_sequence_ids: List[int] = []
-            sequence_map: Dict[int, int] = {}
+            chunk_sequence_ids: list[int] = []
+            sequence_map: dict[int, int] = {}
             while query_end < query_rows:
                 source_sequence_id = int(sequence_ids[query_end])
                 if source_sequence_id not in sequence_map:
                     proposed_sequence_count = len(chunk_sequence_ids) + 1
                     proposed_tokens = proposed_sequence_count * seq_len
-                    if chunk_sequence_ids and (
-                        proposed_sequence_count > max_sequences or proposed_tokens > max_tokens
-                    ):
+                    if chunk_sequence_ids and (proposed_sequence_count > max_sequences or proposed_tokens > max_tokens):
                         break
                     sequence_map[source_sequence_id] = len(chunk_sequence_ids)
                     chunk_sequence_ids.append(source_sequence_id)
@@ -486,9 +473,9 @@ class G2PWRuntimeWrapper:
 
     def _run_chunked_direct_with_profile(
         self,
-        model_inputs: List[Dict[str, np.ndarray]],
-    ) -> tuple[np.ndarray, Dict[str, float]]:
-        outputs: List[np.ndarray] = []
+        model_inputs: list[dict[str, np.ndarray]],
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        outputs: list[np.ndarray] = []
         total_run_ms = 0.0
         max_chunk_rows = 0
         max_chunk_sequences = 0
@@ -500,7 +487,9 @@ class G2PWRuntimeWrapper:
             max_chunk_rows = max(max_chunk_rows, int(chunk["char_ids"].shape[0]))
             max_chunk_sequences = max(max_chunk_sequences, int(chunk["input_ids"].shape[0]))
             max_chunk_seq_len = max(max_chunk_seq_len, int(chunk["input_ids"].shape[1]))
-        merged_output = np.ascontiguousarray(np.concatenate(outputs, axis=0)) if outputs else np.zeros((0, 0), dtype=np.float32)
+        merged_output = (
+            np.ascontiguousarray(np.concatenate(outputs, axis=0)) if outputs else np.zeros((0, 0), dtype=np.float32)
+        )
         total_rows = sum(int(chunk["char_ids"].shape[0]) for chunk in model_inputs)
         return merged_output, {
             "g2pw_runtime_queue_wait_ms": 0.0,
@@ -516,7 +505,7 @@ class G2PWRuntimeWrapper:
             "g2pw_runtime_shard_index": float(self.shard_index),
         }
 
-    def _can_append_task(self, tasks: List[G2PWBatchTask], candidate: G2PWBatchTask) -> bool:
+    def _can_append_task(self, tasks: list[G2PWBatchTask], candidate: G2PWBatchTask) -> bool:
         request_count = len(tasks) + 1
         if request_count > self.batch_max_requests:
             return False
@@ -530,7 +519,7 @@ class G2PWRuntimeWrapper:
         ) + int(candidate.model_input["input_ids"].shape[0]) * int(candidate.model_input["input_ids"].shape[1])
         return total_tokens <= self.batch_max_tokens
 
-    def _merge_batch_inputs(self, tasks: List[G2PWBatchTask]) -> Tuple[Dict[str, np.ndarray], List[Tuple[int, int]]]:
+    def _merge_batch_inputs(self, tasks: list[G2PWBatchTask]) -> tuple[dict[str, np.ndarray], list[tuple[int, int]]]:
         normalized_inputs = [self._normalize_model_input(task.model_input) for task in tasks]
         total_query_rows = sum(int(item["char_ids"].shape[0]) for item in normalized_inputs)
         total_sequence_rows = sum(int(item["input_ids"].shape[0]) for item in normalized_inputs)
@@ -542,7 +531,7 @@ class G2PWRuntimeWrapper:
         char_ids = np.zeros((total_query_rows,), dtype=np.int64)
         position_ids = np.zeros((total_query_rows,), dtype=np.int64)
         sequence_ids = np.zeros((total_query_rows,), dtype=np.int64)
-        slices: List[Tuple[int, int]] = []
+        slices: list[tuple[int, int]] = []
         query_cursor = 0
         sequence_cursor = 0
         for item in normalized_inputs:
@@ -575,7 +564,7 @@ class G2PWRuntimeWrapper:
         self,
         task: G2PWBatchTask,
         output: np.ndarray | None = None,
-        profile: Dict[str, float] | None = None,
+        profile: dict[str, float] | None = None,
         error: Exception | None = None,
     ) -> None:
         task.output = output
@@ -641,7 +630,9 @@ class G2PWRuntimeWrapper:
                         "g2pw_runtime_queue_wait_ms": float(max(0.0, (run_started - task.enqueued_at) * 1000.0)),
                         "g2pw_runtime_collect_wait_ms": float(collect_wait_ms),
                         "g2pw_runtime_run_ms": float(run_ms),
-                        "g2pw_runtime_batch_rows": float(sum(int(item.model_input["char_ids"].shape[0]) for item in batch_tasks)),
+                        "g2pw_runtime_batch_rows": float(
+                            sum(int(item.model_input["char_ids"].shape[0]) for item in batch_tasks)
+                        ),
                         "g2pw_runtime_batch_requests": float(len(batch_tasks)),
                         "g2pw_runtime_task_rows": float(task_rows),
                         "g2pw_runtime_task_seq_len": float(task_seq_len),
@@ -704,7 +695,7 @@ class G2PWRuntimeWrapper:
                     )
                     self.batch_requests_peak = max(self.batch_requests_peak, len(batch_tasks))
 
-    def _submit_batched(self, model_input: Dict[str, np.ndarray]) -> tuple[np.ndarray, Dict[str, float]]:
+    def _submit_batched(self, model_input: dict[str, np.ndarray]) -> tuple[np.ndarray, dict[str, float]]:
         task = G2PWBatchTask(model_input=model_input)
         with self.batch_condition:
             if self.closed:
@@ -719,7 +710,7 @@ class G2PWRuntimeWrapper:
         assert task.output is not None
         return task.output, dict(task.profile)
 
-    def snapshot(self) -> Dict[str, float | int | bool]:
+    def snapshot(self) -> dict[str, float | int | bool]:
         with self.batch_condition:
             average_tasks_per_batch = (
                 float(self.batch_total_tasks) / float(self.batch_total_batches) if self.batch_total_batches > 0 else 0.0
@@ -728,7 +719,9 @@ class G2PWRuntimeWrapper:
                 float(self.batch_total_rows) / float(self.batch_total_batches) if self.batch_total_batches > 0 else 0.0
             )
             average_queue_wait_ms = (
-                float(self.batch_total_queue_wait_ms) / float(self.batch_total_tasks) if self.batch_total_tasks > 0 else 0.0
+                float(self.batch_total_queue_wait_ms) / float(self.batch_total_tasks)
+                if self.batch_total_tasks > 0
+                else 0.0
             )
             average_collect_wait_ms = (
                 float(self.batch_total_collect_wait_ms) / float(self.batch_total_tasks)
@@ -771,7 +764,7 @@ class G2PWRuntimeWrapper:
         with self.batch_condition:
             return int(len(self.pending_tasks))
 
-    def run_with_profile(self, model_input: Dict[str, np.ndarray]) -> tuple[np.ndarray, Dict[str, float]]:
+    def run_with_profile(self, model_input: dict[str, np.ndarray]) -> tuple[np.ndarray, dict[str, float]]:
         direct_chunks = self._split_model_input_for_direct_run(model_input)
         if len(direct_chunks) > 1:
             return self._run_chunked_direct_with_profile(direct_chunks)
@@ -790,7 +783,7 @@ class G2PWRuntimeWrapper:
             }
         return self._submit_batched(model_input)
 
-    def run(self, model_input: Dict[str, np.ndarray]) -> np.ndarray:
+    def run(self, model_input: dict[str, np.ndarray]) -> np.ndarray:
         output, _profile = self.run_with_profile(model_input)
         return output
 
@@ -812,17 +805,17 @@ class G2PWRuntimePool:
                 ),
             )
 
-    def run_with_profile(self, model_input: Dict[str, np.ndarray]) -> tuple[np.ndarray, Dict[str, float]]:
+    def run_with_profile(self, model_input: dict[str, np.ndarray]) -> tuple[np.ndarray, dict[str, float]]:
         shard = self._pick_shard()
         output, profile = shard.run_with_profile(model_input)
         profile["g2pw_runtime_pool_workers"] = float(self.worker_count)
         return output, profile
 
-    def run(self, model_input: Dict[str, np.ndarray]) -> np.ndarray:
+    def run(self, model_input: dict[str, np.ndarray]) -> np.ndarray:
         output, _profile = self.run_with_profile(model_input)
         return output
 
-    def snapshot(self) -> Dict[str, float | int | bool | List[Dict[str, float | int | bool]]]:
+    def snapshot(self) -> dict[str, float | int | bool | list[dict[str, float | int | bool]]]:
         shard_snapshots = [dict(shard.snapshot()) for shard in self.shards]
         avg_queue_wait_ms = 0.0
         total_tasks = 0.0
@@ -862,13 +855,13 @@ class G2PWCudaConverter(_G2PWBaseOnnxConverter):
         model_dir: str = "G2PWModel/",
         style: str = "bopomofo",
         model_source: str = None,
-        enable_non_tradional_chinese: bool = False,
+        enable_non_traditional_chinese: bool = False,
     ):
         super().__init__(
             model_dir=model_dir,
             style=style,
             model_source=model_source,
-            enable_non_tradional_chinese=enable_non_tradional_chinese,
+            enable_non_traditional_chinese=enable_non_traditional_chinese,
         )
         self.runtime = G2PWRuntimePool()
         self.backend = "cuda"
@@ -879,13 +872,13 @@ class G2PWCudaConverter(_G2PWBaseOnnxConverter):
         self._prewarm_lock = threading.Lock()
         self._prewarmed = False
 
-    def _predict(self, model_input: Dict[str, Any]) -> Tuple[List[str], List[float]]:
+    def _predict(self, model_input: dict[str, Any]) -> tuple[list[str], list[float]]:
         probs = self.runtime.run(model_input)
         preds = np.argmax(probs, axis=1).tolist()
         confidences = probs[np.arange(len(preds)), preds].astype(np.float32, copy=False).tolist()
         return [self.labels[pred] for pred in preds], confidences
 
-    def _predict_with_profile(self, model_input: Dict[str, Any]) -> Tuple[List[str], List[float], Dict[str, float]]:
+    def _predict_with_profile(self, model_input: dict[str, Any]) -> tuple[list[str], list[float], dict[str, float]]:
         started = time.perf_counter()
         probs, runtime_profile = self.runtime.run_with_profile(model_input)
         preds = np.argmax(probs, axis=1).tolist()
@@ -895,19 +888,22 @@ class G2PWCudaConverter(_G2PWBaseOnnxConverter):
         profile["g2pw_predict_ms"] = float(profile["g2pw_runtime_total_ms"])
         return [self.labels[pred] for pred in preds], confidences, profile
 
-    def snapshot(self) -> Dict[str, float | int | bool]:
+    def snapshot(self) -> dict[str, float | int | bool]:
         return dict(self.runtime.snapshot())
 
-    def prewarm(self, sentences: List[str] | None = None, rounds: int = 1) -> bool:
+    def prewarm(self, sentences: list[str] | None = None, rounds: int = 1) -> bool:
         with self._prewarm_lock:
             if self._prewarmed:
                 return False
-            warm_sentences = list(sentences or [
-                "重庆银行的行长在长安见到了重要的人。",
-                "音乐老师重新调整了长句里的重音和节奏。",
-                "我们准备把参考文本和目标文本一起处理。",
-                "这个系统需要在高并发下稳定完成预处理。",
-            ])
+            warm_sentences = list(
+                sentences
+                or [
+                    "重庆银行的行长在长安见到了重要的人。",
+                    "音乐老师重新调整了长句里的重音和节奏。",
+                    "我们准备把参考文本和目标文本一起处理。",
+                    "这个系统需要在高并发下稳定完成预处理。",
+                ]
+            )
             warm_sentences = [str(item).strip() for item in warm_sentences if str(item).strip()]
             if not warm_sentences:
                 warm_sentences = ["重庆银行的行长在长安见到了重要的人。"]

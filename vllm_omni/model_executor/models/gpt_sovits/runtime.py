@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import ctypes
 import hashlib
 import json
 import math
 import os
 import sys
 import threading
-import ctypes
-import types
 import time
+import types
 from collections import OrderedDict
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence, cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -27,6 +28,7 @@ except Exception:  # pragma: no cover - fallback for standalone runtime smoke te
 
     def init_logger(name: str):
         return logging.getLogger(name)
+
 
 logger = init_logger(__name__)
 
@@ -243,11 +245,15 @@ def _prepare_prompt_semantic_wav16k_profile_native(
             zero_wav_samples=zero_wav_samples,
         )
         cpu_prepare_ms = (time.perf_counter() - cpu_prepare_start) * 1000.0
-    return wav16k, cpu_prepare_ms, {
-        "wait_ms": float(limiter_stats.get("wait_ms", 0.0)),
-        "slots": float(limiter_stats.get("slots", 0.0)),
-        "peak_inflight": float(limiter_stats.get("peak_inflight", 0.0)),
-    }
+    return (
+        wav16k,
+        cpu_prepare_ms,
+        {
+            "wait_ms": float(limiter_stats.get("wait_ms", 0.0)),
+            "slots": float(limiter_stats.get("slots", 0.0)),
+            "peak_inflight": float(limiter_stats.get("peak_inflight", 0.0)),
+        },
+    )
 
 
 def _left_pad_hidden(hidden: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -353,7 +359,7 @@ class GPTSoVITSStageTransport:
         fragment_interval: float = 0.3,
         sample_steps: int = 32,
         super_sampling: bool = False,
-    ) -> "GPTSoVITSStageTransport":
+    ) -> GPTSoVITSStageTransport:
         return cls(
             request_id=str(request_id),
             semantic_tokens=torch.empty((0,), dtype=torch.long),
@@ -373,7 +379,7 @@ class GPTSoVITSStageTransport:
         )
 
     @classmethod
-    def from_state(cls, state: Any, spec: "GPTSoVITSRequestSpec") -> "GPTSoVITSStageTransport":
+    def from_state(cls, state: Any, spec: GPTSoVITSRequestSpec) -> GPTSoVITSStageTransport:
         refer_spec = getattr(state, "refer_spec", None)
         refer_audio_spec = refer_spec.spec_audio if refer_spec is not None else None
         refer_audio_16k = refer_spec.audio_16k if refer_spec is not None else None
@@ -405,7 +411,7 @@ class GPTSoVITSStageTransport:
         info: Any,
         *,
         semantic_tokens: torch.Tensor | None = None,
-    ) -> "GPTSoVITSStageTransport":
+    ) -> GPTSoVITSStageTransport:
         if isinstance(info, cls):
             base = info
         elif isinstance(info, dict):
@@ -435,10 +441,7 @@ class GPTSoVITSStageTransport:
                 )
             else:
                 request_id = str(
-                    info.get("gpt_sovits_request_id")
-                    or info.get("engine_request_id")
-                    or info.get("request_id")
-                    or ""
+                    info.get("gpt_sovits_request_id") or info.get("engine_request_id") or info.get("request_id") or ""
                 )
                 base = cls(
                     request_id=request_id,
@@ -448,11 +451,17 @@ class GPTSoVITSStageTransport:
                         dtype=torch.long,
                     ),
                     phones=_clone_transport_tensor(info.get("gpt_sovits_phones"), dtype=torch.long),
-                    segment_phones=_clone_transport_tensor_list(info.get("gpt_sovits_segment_phones"), dtype=torch.long),
+                    segment_phones=_clone_transport_tensor_list(
+                        info.get("gpt_sovits_segment_phones"), dtype=torch.long
+                    ),
                     prompt_phones=_clone_transport_tensor(info.get("gpt_sovits_prompt_phones"), dtype=torch.long),
                     prompt_semantic=_clone_transport_tensor(info.get("gpt_sovits_prompt_semantic"), dtype=torch.long),
-                    refer_audio_spec=_clone_transport_tensor(info.get("gpt_sovits_refer_audio_spec"), dtype=torch.float32),
-                    refer_audio_16k=_clone_transport_tensor(info.get("gpt_sovits_refer_audio_16k"), dtype=torch.float32),
+                    refer_audio_spec=_clone_transport_tensor(
+                        info.get("gpt_sovits_refer_audio_spec"), dtype=torch.float32
+                    ),
+                    refer_audio_16k=_clone_transport_tensor(
+                        info.get("gpt_sovits_refer_audio_16k"), dtype=torch.float32
+                    ),
                     raw_audio=_clone_transport_tensor(info.get("gpt_sovits_raw_audio"), dtype=torch.float32),
                     raw_sr=int(info.get("gpt_sovits_raw_sr", 0) or 0),
                     speed_factor=float(info.get("gpt_sovits_speed_factor", 1.0)),
@@ -466,7 +475,7 @@ class GPTSoVITSStageTransport:
             return base
         return base.with_semantic_tokens(semantic_tokens)
 
-    def with_semantic_tokens(self, semantic_tokens: Any) -> "GPTSoVITSStageTransport":
+    def with_semantic_tokens(self, semantic_tokens: Any) -> GPTSoVITSStageTransport:
         if isinstance(semantic_tokens, (list, tuple)):
             semantic_tensor = torch.empty((0,), dtype=torch.long)
             semantic_segments = _clone_transport_tensor_list(semantic_tokens, dtype=torch.long)
@@ -492,20 +501,22 @@ class GPTSoVITSStageTransport:
         )
 
     def has_decode_conditioning(self) -> bool:
-        semantic_ready = (
-            isinstance(self.semantic_tokens, torch.Tensor) and self.semantic_tokens.numel() > 0
-        ) or any(isinstance(value, torch.Tensor) and value.numel() > 0 for value in self.semantic_token_segments)
-        phone_ready = (
-            isinstance(self.phones, torch.Tensor) and self.phones.numel() > 0
-        ) or any(isinstance(value, torch.Tensor) and value.numel() > 0 for value in self.segment_phones)
+        semantic_ready = (isinstance(self.semantic_tokens, torch.Tensor) and self.semantic_tokens.numel() > 0) or any(
+            isinstance(value, torch.Tensor) and value.numel() > 0 for value in self.semantic_token_segments
+        )
+        phone_ready = (isinstance(self.phones, torch.Tensor) and self.phones.numel() > 0) or any(
+            isinstance(value, torch.Tensor) and value.numel() > 0 for value in self.segment_phones
+        )
         required = (
             self.prompt_phones,
             self.prompt_semantic,
             self.refer_audio_spec,
             self.raw_audio,
         )
-        return semantic_ready and phone_ready and all(
-            isinstance(value, torch.Tensor) and value.numel() > 0 for value in required
+        return (
+            semantic_ready
+            and phone_ready
+            and all(isinstance(value, torch.Tensor) and value.numel() > 0 for value in required)
         )
 
     def to_transport_dict(self) -> dict[str, Any]:
@@ -586,7 +597,7 @@ class GPTSoVITSPreparedCpuStage:
     ref_audio_prepare_future: Any | None = None
 
     @property
-    def cpu_stage(self) -> "GPTSoVITSPreparedCpuStage":
+    def cpu_stage(self) -> GPTSoVITSPreparedCpuStage:
         return self
 
 
@@ -817,7 +828,7 @@ class GPTSoVITSPrepareRuntimeCoordinator:
         return tuple(sorted(set(normalized)))
 
     @classmethod
-    def from_runtime_coordinator(cls, coordinator: Any) -> "GPTSoVITSPrepareRuntimeCoordinator":
+    def from_runtime_coordinator(cls, coordinator: Any) -> GPTSoVITSPrepareRuntimeCoordinator:
         if isinstance(coordinator, cls):
             return coordinator
         return cls(
@@ -869,9 +880,7 @@ class GPTSoVITSPrepareRuntimeCoordinator:
             ),
             ref_prompt_semantic_runtime_exact_prewarm_batch_sizes=tuple(
                 int(value)
-                for value in (
-                    getattr(coordinator, "ref_prompt_semantic_runtime_exact_prewarm_batch_sizes", ()) or ()
-                )
+                for value in (getattr(coordinator, "ref_prompt_semantic_runtime_exact_prewarm_batch_sizes", ()) or ())
             ),
             ref_prompt_semantic_runtime_exact_prewarm_lock=getattr(
                 coordinator,
@@ -914,9 +923,7 @@ class GPTSoVITSPrepareRuntimeCoordinator:
             ),
             ref_prompt_semantic_bucket_first_hit_bucket_indices=tuple(
                 int(value)
-                for value in (
-                    getattr(coordinator, "ref_prompt_semantic_bucket_first_hit_bucket_indices", ()) or ()
-                )
+                for value in (getattr(coordinator, "ref_prompt_semantic_bucket_first_hit_bucket_indices", ()) or ())
             ),
             ref_prompt_semantic_bucket_first_hit_lock=getattr(
                 coordinator,
@@ -964,7 +971,7 @@ class GPTSoVITSPrepareRuntimeCoordinator:
         return max(1, worker_count)
 
     @classmethod
-    def build_native(cls, tts: Any) -> "GPTSoVITSPrepareRuntimeCoordinator":
+    def build_native(cls, tts: Any) -> GPTSoVITSPrepareRuntimeCoordinator:
         gate_poll_ms = int(os.environ.get("GPTSOVITS_PREPARE_GATE_POLL_MS", "1"))
         use_async_text_feature_path = bool(
             getattr(tts, "prepare_bert_batch_worker", None) is not None
@@ -998,9 +1005,7 @@ class GPTSoVITSPrepareRuntimeCoordinator:
             int(os.environ.get("GPTSOVITS_PREPARE_REF_ASYNC_WORKERS", str(ref_audio_default_workers))),
         )
         text_cpu_gate_default = 0
-        g2pw_gate_default = (
-            int(g2pw_runtime_workers) if g2pw_runtime_workers is not None else max(0, int(g2pw_workers))
-        )
+        g2pw_gate_default = int(g2pw_runtime_workers) if g2pw_runtime_workers is not None else max(0, int(g2pw_workers))
         text_feature_gate_default = max(0, int(text_feature_workers))
         ref_audio_gate_default = max(0, int(ref_audio_workers))
         return cls(
@@ -1066,7 +1071,9 @@ class GPTSoVITSPrepareRuntimeCoordinator:
                 0,
                 int(os.environ.get("GPTSOVITS_PREPARE_REF_RUNTIME_EXACT_PREWARM_MAX_UNIQUE", "4")),
             ),
-            ref_prompt_semantic_runtime_exact_prewarm_batch_sizes=cls._resolve_ref_prompt_semantic_runtime_exact_prewarm_batch_sizes(tts),
+            ref_prompt_semantic_runtime_exact_prewarm_batch_sizes=cls._resolve_ref_prompt_semantic_runtime_exact_prewarm_batch_sizes(
+                tts
+            ),
             ref_prompt_semantic_runtime_exact_prewarm_lock=threading.Lock(),
             ref_prompt_semantic_bucket_first_hit_serialization_enabled=(
                 str(os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_SERIALIZE_FIRST_HITS", "1")).strip().lower()
@@ -1168,9 +1175,7 @@ class GPTSoVITSPrepareRuntimeCoordinator:
             self.ref_audio_asset_cache.clear()
             return
         expired_keys = [
-            key
-            for key, (_, cached_at) in self.ref_audio_asset_cache.items()
-            if (now_ts - float(cached_at)) > ttl_sec
+            key for key, (_, cached_at) in self.ref_audio_asset_cache.items() if (now_ts - float(cached_at)) > ttl_sec
         ]
         for key in expired_keys:
             self.ref_audio_asset_cache.pop(key, None)
@@ -1513,7 +1518,9 @@ class GPTSoVITSRuntime:
         project_root: str | None = None,
         config_path: str | None = None,
     ) -> None:
-        self.project_root = os.path.abspath(project_root or os.environ.get("GPT_SOVITS_PROJECT_ROOT", _DEFAULT_PROJECT_ROOT))
+        self.project_root = os.path.abspath(
+            project_root or os.environ.get("GPT_SOVITS_PROJECT_ROOT", _DEFAULT_PROJECT_ROOT)
+        )
         configured_path = config_path or os.environ.get("GPT_SOVITS_CONFIG_PATH", _DEFAULT_CONFIG_PATH)
         self.config_path = self._resolve_path(configured_path)
         self._init_lock = threading.RLock()
@@ -1592,7 +1599,9 @@ class GPTSoVITSRuntime:
     def _module_device(module: Any) -> torch.device | None:
         if module is None:
             return None
-        for tensor in list(getattr(module, "parameters", lambda: [])()) + list(getattr(module, "buffers", lambda: [])()):
+        for tensor in list(getattr(module, "parameters", lambda: [])()) + list(
+            getattr(module, "buffers", lambda: [])()
+        ):
             return tensor.device
         return None
 
@@ -1788,9 +1797,7 @@ class GPTSoVITSRuntime:
             high_pressure_batch_window_ms=int(
                 os.environ.get("GPTSOVITS_PREPARE_BERT_HIGH_PRESSURE_BATCH_WINDOW_MS", "1")
             ),
-            high_pressure_max_batch_items=int(
-                os.environ.get("GPTSOVITS_PREPARE_BERT_HIGH_PRESSURE_MAX_ITEMS", "32")
-            ),
+            high_pressure_max_batch_items=int(os.environ.get("GPTSOVITS_PREPARE_BERT_HIGH_PRESSURE_MAX_ITEMS", "32")),
             high_pressure_max_batch_tokens=int(
                 os.environ.get("GPTSOVITS_PREPARE_BERT_HIGH_PRESSURE_MAX_TOKENS", "8192")
             ),
@@ -1860,15 +1867,11 @@ class GPTSoVITSRuntime:
             high_pressure_batch_window_ms=int(
                 os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_BATCH_WINDOW_MS", "4")
             ),
-            high_pressure_max_batch_tasks=int(
-                os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_TASKS", "128")
-            ),
+            high_pressure_max_batch_tasks=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_TASKS", "128")),
             high_pressure_max_batch_groups=int(
                 os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_GROUPS", "256")
             ),
-            high_pressure_max_batch_chars=int(
-                os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_CHARS", "8192")
-            ),
+            high_pressure_max_batch_chars=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_CHARS", "8192")),
         )
         g2pw_batch_workers = max(1, int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_WORKERS", "2")))
         if g2pw_batch_workers > 1:
@@ -1913,8 +1916,12 @@ class GPTSoVITSRuntime:
         )
 
     def _install_runtime_prepare_components(self, pipeline: Any) -> None:
-        runtime_prepare_state_provider = lambda: _build_native_prepare_runtime_state(pipeline)
-        runtime_prepare_refresh = lambda: self._refresh_runtime_prepare_components(pipeline)
+        def runtime_prepare_state_provider():
+            return _build_native_prepare_runtime_state(pipeline)
+
+        def runtime_prepare_refresh():
+            return self._refresh_runtime_prepare_components(pipeline)
+
         runtime_prepare_generation = int(getattr(pipeline, "_vllm_runtime_prepare_generation", 0) or 0) + 1
         bert_batch_worker = self._build_runtime_prepare_bert_batch_worker(pipeline)
         ref_semantic_batch_worker = self._build_runtime_prepare_ref_semantic_batch_worker(pipeline)
@@ -2284,7 +2291,9 @@ class GPTSoVITSRuntime:
             prompt_hidden.dtype,
             prompt_hidden.device,
         )
-        prompt_text_pos = self._apply_position_encoding_slice(model.ar_text_position, prompt_hidden, start_index=0).squeeze(0)
+        prompt_text_pos = self._apply_position_encoding_slice(
+            model.ar_text_position, prompt_hidden, start_index=0
+        ).squeeze(0)
 
         prompt_audio_emb = model.ar_audio_embedding(prompt_semantic.unsqueeze(0))
         self._ensure_audio_position_encoding(
@@ -2293,7 +2302,9 @@ class GPTSoVITSRuntime:
             prompt_audio_emb.dtype,
             prompt_audio_emb.device,
         )
-        prompt_audio_pos = self._apply_position_encoding_slice(model.ar_audio_position, prompt_audio_emb, start_index=0).squeeze(0)
+        prompt_audio_pos = self._apply_position_encoding_slice(
+            model.ar_audio_position, prompt_audio_emb, start_index=0
+        ).squeeze(0)
         return prompt_text_pos, prompt_audio_pos
 
     @staticmethod
@@ -2344,7 +2355,8 @@ class GPTSoVITSRuntime:
             return
         current = time.perf_counter() if now is None else float(now)
         stale_keys = [
-            key for key, (cached_at, _text_pos, _audio_pos) in self._t2s_prompt_prefix_cache.items()
+            key
+            for key, (cached_at, _text_pos, _audio_pos) in self._t2s_prompt_prefix_cache.items()
             if current - float(cached_at) > ttl_sec
         ]
         for key in stale_keys:
@@ -2480,7 +2492,9 @@ class GPTSoVITSRuntime:
         x_padding_mask = _make_pad_mask_left(x_lens_tensor, max_x_len)
         y_padding_mask = _make_pad_mask_left(prefix_lens_tensor, max_prefix_len)
         key_padding_mask = torch.cat([x_padding_mask, y_padding_mask], dim=1).bool()
-        x_mask = F.pad(torch.zeros(max_x_len, max_x_len, dtype=torch.bool, device=device), (0, max_prefix_len), value=True)
+        x_mask = F.pad(
+            torch.zeros(max_x_len, max_x_len, dtype=torch.bool, device=device), (0, max_prefix_len), value=True
+        )
         y_mask = F.pad(
             torch.triu(torch.ones(max_prefix_len, max_prefix_len, dtype=torch.bool, device=device), diagonal=1),
             (max_x_len, 0),
@@ -2548,7 +2562,11 @@ class GPTSoVITSRuntime:
         position_ids = position_ids.view(-1)
         y_emb = model.ar_audio_embedding(sampled_tokens)
         self._ensure_audio_position_encoding(model, int(position_ids.max().item()), y_emb.dtype, y_emb.device)
-        pos_emb = model.ar_audio_position.pe[0].index_select(0, position_ids.to(device=y_emb.device, dtype=torch.long)).unsqueeze(1)
+        pos_emb = (
+            model.ar_audio_position.pe[0]
+            .index_select(0, position_ids.to(device=y_emb.device, dtype=torch.long))
+            .unsqueeze(1)
+        )
         return y_emb * model.ar_audio_position.x_scale + model.ar_audio_position.alpha * pos_emb.to(
             dtype=y_emb.dtype,
             device=y_emb.device,
@@ -3492,7 +3510,12 @@ class GPTSoVITSRuntime:
         stat_key: str,
         device: torch.device | None,
     ) -> Any:
-        if pending_cuda_timings is not None and device is not None and device.type == "cuda" and torch.cuda.is_available():
+        if (
+            pending_cuda_timings is not None
+            and device is not None
+            and device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
@@ -3600,14 +3623,8 @@ class GPTSoVITSRuntime:
     ) -> torch.Tensor:
         subgroup_xy = torch.index_select(active_batch.xy_pos, dim=0, index=row_index)
         subgroup_kv_lens = torch.index_select(active_batch.kv_lens, dim=0, index=row_index)
-        subgroup_k_cache = [
-            torch.index_select(layer, dim=0, index=row_index)
-            for layer in active_batch.k_cache
-        ]
-        subgroup_v_cache = [
-            torch.index_select(layer, dim=0, index=row_index)
-            for layer in active_batch.v_cache
-        ]
+        subgroup_k_cache = [torch.index_select(layer, dim=0, index=row_index) for layer in active_batch.k_cache]
+        subgroup_v_cache = [torch.index_select(layer, dim=0, index=row_index) for layer in active_batch.v_cache]
         subgroup_xy_dec, subgroup_k_cache, subgroup_v_cache = self._time_t2s_call(
             lambda: model.decode_next_token_prealloc_runtime(
                 subgroup_xy,
@@ -4032,7 +4049,9 @@ class GPTSoVITSRuntime:
             )
             for local_index, global_index in enumerate(group_indices):
                 sampled_list[global_index] = self._time_t2s_call(
-                    lambda current_index=local_index: multinomial_sample_one_no_sync(probs[current_index : current_index + 1]),
+                    lambda current_index=local_index: multinomial_sample_one_no_sync(
+                        probs[current_index : current_index + 1]
+                    ),
                     pending_cuda_timings=pending_cuda_timings,
                     stat_key="sampling_multinomial_ms",
                     device=probs.device,
@@ -4040,7 +4059,9 @@ class GPTSoVITSRuntime:
                 argmax_list[global_index] = int(argmax_tokens[local_index].item())
         if pending_cuda_timings is not None:
             self._flush_t2s_timing_records(stats, pending_cuda_timings, device=logits.device)
-        return [item for item in sampled_list if item is not None], [int(item) for item in argmax_list if item is not None]
+        return [item for item in sampled_list if item is not None], [
+            int(item) for item in argmax_list if item is not None
+        ]
 
     def _sample_active_batch_requests(
         self,
@@ -4050,7 +4071,9 @@ class GPTSoVITSRuntime:
         *,
         max_steps: int,
         stats: dict[str, Any] | None = None,
-    ) -> tuple[list[GPTSoVITSARFinishedItem], list[int], list[torch.LongTensor], torch.Tensor | None, torch.LongTensor | None]:
+    ) -> tuple[
+        list[GPTSoVITSARFinishedItem], list[int], list[torch.LongTensor], torch.Tensor | None, torch.LongTensor | None
+    ]:
         sampling_started = time.perf_counter()
         finished_items: list[GPTSoVITSARFinishedItem] = []
         keep_indices: list[int] = []
@@ -4061,9 +4084,9 @@ class GPTSoVITSRuntime:
             self._increment_t2s_stat(stats, "sampling_single_request_calls")
             state = active_batch.states[0]
             step_index = int(active_batch.step_indices[0].item())
-            current_position_ids = active_batch.prefix_lens.to(device=logits.device, dtype=torch.long) + active_batch.step_indices.to(
+            current_position_ids = active_batch.prefix_lens.to(
                 device=logits.device, dtype=torch.long
-            )
+            ) + active_batch.step_indices.to(device=logits.device, dtype=torch.long)
             sampling_key = self._sampling_group_key(
                 top_k=state.top_k,
                 top_p=state.top_p,
@@ -4171,9 +4194,7 @@ class GPTSoVITSRuntime:
             sampled_token_tensor = sampled_tensor.view(-1)
             argmax_token_tensor = argmax_tensor.view(-1)
             next_history_batch = (
-                None
-                if history_batch is None
-                else self._append_sampled_token_batch(history_batch, sampled_token_tensor)
+                None if history_batch is None else self._append_sampled_token_batch(history_batch, sampled_token_tensor)
             )
             finish_scan_started = time.perf_counter()
             uniform_step_index = int(active_batch.step_indices[0].item())
@@ -4229,9 +4250,7 @@ class GPTSoVITSRuntime:
                     next_xy_pos,
                     next_history_batch,
                 )
-            if (
-                uniform_next_step_index < max_steps
-            ):
+            if uniform_next_step_index < max_steps:
                 eos_sample_mask = sampled_token_tensor.eq(model.EOS)
                 eos_argmax_mask = (~eos_sample_mask) & argmax_token_tensor.eq(model.EOS)
                 finished_mask = eos_sample_mask | eos_argmax_mask
@@ -4250,7 +4269,9 @@ class GPTSoVITSRuntime:
                         )
                         if next_history_batch is None:
                             kept_histories = [active_batch.y_sequences[index] for index in keep_indices]
-                            updated_sequences = self._append_sampled_token_sequences(kept_histories, kept_sampled_tokens)
+                            updated_sequences = self._append_sampled_token_sequences(
+                                kept_histories, kept_sampled_tokens
+                            )
                             kept_history_batch = None
                         else:
                             kept_history_batch = torch.index_select(next_history_batch, dim=0, index=keep_index_tensor)
@@ -4269,7 +4290,9 @@ class GPTSoVITSRuntime:
                         prefix_len = int(prefix_lens[int(finished_index)])
                         current_history = active_batch.y_sequences[int(finished_index)]
                         sampled_token = sampled_token_tensor[int(finished_index) : int(finished_index) + 1]
-                        if uniform_early_stop_mask is not None and bool(uniform_early_stop_mask[int(finished_index)].item()):
+                        if uniform_early_stop_mask is not None and bool(
+                            uniform_early_stop_mask[int(finished_index)].item()
+                        ):
                             finish_reason = "early_stop"
                             semantic_tokens = torch.cat([current_history[prefix_len:], sampled_token], dim=0).clone()
                         elif bool(eos_sample_mask[int(finished_index)].item()):
@@ -4290,7 +4313,9 @@ class GPTSoVITSRuntime:
                     self._increment_t2s_stat(stats, "sampling_finish_scan_uniform_eos_path_calls")
                     self._accumulate_t2s_stat(stats, "sampling_finish_scan_uniform_eos_path_ms", elapsed_ms)
                     self._accumulate_t2s_stat(stats, "sampling_finish_scan_ms", elapsed_ms)
-                    self._accumulate_t2s_stat(stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0)
+                    self._accumulate_t2s_stat(
+                        stats, "sampling_total_ms", (time.perf_counter() - sampling_started) * 1000.0
+                    )
                     return finished_items, keep_indices, updated_sequences, next_xy_pos, kept_history_batch
             elapsed_ms = (time.perf_counter() - finish_scan_started) * 1000.0
             self._increment_t2s_stat(stats, "sampling_finish_scan_uniform_fallback_path_calls")
@@ -4324,9 +4349,7 @@ class GPTSoVITSRuntime:
         if sampled_token_tensor is None or argmax_token_tensor is None:
             raise ValueError("GPT-SoVITS sampling did not produce token tensors")
         next_history_batch = (
-            None
-            if history_batch is None
-            else self._append_sampled_token_batch(history_batch, sampled_token_tensor)
+            None if history_batch is None else self._append_sampled_token_batch(history_batch, sampled_token_tensor)
         )
         updated_histories = (
             self._append_sampled_token_sequences(active_batch.y_sequences, sampled_token_tensor)
@@ -4402,7 +4425,9 @@ class GPTSoVITSRuntime:
     ) -> tuple[Any | None, list[GPTSoVITSARFinishedItem]]:
         was_prefill = not active_batch.prefill_done
         stage_started = time.perf_counter()
-        timing_device = active_batch.xy_pos.device if isinstance(getattr(active_batch, "xy_pos", None), torch.Tensor) else None
+        timing_device = (
+            active_batch.xy_pos.device if isinstance(getattr(active_batch, "xy_pos", None), torch.Tensor) else None
+        )
         pending_cuda_timings: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]] | None = (
             [] if stats is not None else None
         )
@@ -4422,7 +4447,9 @@ class GPTSoVITSRuntime:
                     stats["pooled_decode_wall_ms"] = float(stats.get("pooled_decode_wall_ms", 0.0)) + float(elapsed_ms)
                 else:
                     stats["dynamic_decode_calls"] = int(stats.get("dynamic_decode_calls", 0)) + 1
-                    stats["dynamic_decode_wall_ms"] = float(stats.get("dynamic_decode_wall_ms", 0.0)) + float(elapsed_ms)
+                    stats["dynamic_decode_wall_ms"] = float(stats.get("dynamic_decode_wall_ms", 0.0)) + float(
+                        elapsed_ms
+                    )
             if current_active_batch is not None:
                 stats["max_batch_size_seen"] = max(
                     int(stats.get("max_batch_size_seen", 0)),
@@ -4566,12 +4593,14 @@ class GPTSoVITSRuntime:
                     )
                     if pending_cuda_timings is not None:
                         self._flush_t2s_timing_records(stats, pending_cuda_timings, device=xy_dec.device)
-                    finished_items, keep_indices, updated_sequences, next_xy_pos, next_y_sequence_batch = self._sample_active_batch_requests(
-                        model,
-                        active_batch,
-                        logits,
-                        max_steps=max_steps,
-                        stats=stats,
+                    finished_items, keep_indices, updated_sequences, next_xy_pos, next_y_sequence_batch = (
+                        self._sample_active_batch_requests(
+                            model,
+                            active_batch,
+                            logits,
+                            max_steps=max_steps,
+                            stats=stats,
+                        )
                     )
                     if len(keep_indices) == 0:
                         self._set_kv_pool_active_rows(model, 0)
@@ -4583,11 +4612,17 @@ class GPTSoVITSRuntime:
                         active_batch.step_indices = active_batch.step_indices + 1
                         active_batch.kv_lens = active_batch.kv_lens + 1
                         xy_pos_started = time.perf_counter()
-                        active_batch.xy_pos = next_xy_pos if next_xy_pos is not None else self._build_next_xy_pos(
-                            model,
-                            active_batch.y_sequences,
+                        active_batch.xy_pos = (
+                            next_xy_pos
+                            if next_xy_pos is not None
+                            else self._build_next_xy_pos(
+                                model,
+                                active_batch.y_sequences,
+                            )
                         )
-                        self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
+                        self._accumulate_t2s_stat(
+                            stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0
+                        )
                         _record_stage("pooled", active_batch)
                         return active_batch, finished_items
                     device = logits.device
@@ -4609,17 +4644,27 @@ class GPTSoVITSRuntime:
                     pooled_compacted = self._compact_pooled_active_batch(model, active_batch, keep_indices)
                     if not pooled_compacted:
                         active_batch.kv_cache_pooled = False
-                    if (not active_batch.kv_cache_pooled) and active_batch.k_cache is not None and active_batch.v_cache is not None:
+                    if (
+                        (not active_batch.kv_cache_pooled)
+                        and active_batch.k_cache is not None
+                        and active_batch.v_cache is not None
+                    ):
                         self._rebuild_nonpooled_active_batch_cache_after_subset(
                             active_batch,
                             keep_tensor=keep_tensor,
                         )
                     xy_pos_started = time.perf_counter()
-                    active_batch.xy_pos = next_xy_pos if next_xy_pos is not None else self._build_next_xy_pos(
-                        model,
-                        active_batch.y_sequences,
+                    active_batch.xy_pos = (
+                        next_xy_pos
+                        if next_xy_pos is not None
+                        else self._build_next_xy_pos(
+                            model,
+                            active_batch.y_sequences,
+                        )
                     )
-                    self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
+                    self._accumulate_t2s_stat(
+                        stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0
+                    )
                     _record_stage("pooled", active_batch)
                     return active_batch, finished_items
             if self._uses_dynamic_kv_prealloc(active_batch):
@@ -4638,7 +4683,9 @@ class GPTSoVITSRuntime:
                 )
                 if xy_dec is None:
                     batched_decode_attn_mask = self._time_t2s_call(
-                        lambda: self._build_decode_mask_from_kv_lens(next_kv_lens, device=timing_device or active_batch.xy_pos.device),
+                        lambda: self._build_decode_mask_from_kv_lens(
+                            next_kv_lens, device=timing_device or active_batch.xy_pos.device
+                        ),
                         pending_cuda_timings=pending_cuda_timings,
                         stat_key="dynamic_materialize_decode_mask_ms",
                         device=timing_device,
@@ -4706,12 +4753,14 @@ class GPTSoVITSRuntime:
         )
         if pending_cuda_timings is not None:
             self._flush_t2s_timing_records(stats, pending_cuda_timings, device=xy_dec.device)
-        finished_items, keep_indices, updated_sequences, next_xy_pos, next_y_sequence_batch = self._sample_active_batch_requests(
-            model,
-            active_batch,
-            logits,
-            max_steps=max_steps,
-            stats=stats,
+        finished_items, keep_indices, updated_sequences, next_xy_pos, next_y_sequence_batch = (
+            self._sample_active_batch_requests(
+                model,
+                active_batch,
+                logits,
+                max_steps=max_steps,
+                stats=stats,
+            )
         )
 
         if len(keep_indices) == 0:
@@ -4727,9 +4776,13 @@ class GPTSoVITSRuntime:
             if not was_prefill and active_batch.kv_lens is not None:
                 active_batch.kv_lens = active_batch.kv_lens + 1
             xy_pos_started = time.perf_counter()
-            active_batch.xy_pos = next_xy_pos if next_xy_pos is not None else self._build_next_xy_pos(
-                model,
-                active_batch.y_sequences,
+            active_batch.xy_pos = (
+                next_xy_pos
+                if next_xy_pos is not None
+                else self._build_next_xy_pos(
+                    model,
+                    active_batch.y_sequences,
+                )
             )
             self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
             _record_stage("prefill" if was_prefill else "dynamic", active_batch)
@@ -4746,7 +4799,9 @@ class GPTSoVITSRuntime:
             active_batch.early_stop_nums = torch.index_select(early_stop_nums, dim=0, index=keep_tensor)
         active_batch.prefix_lens = torch.index_select(active_batch.prefix_lens, dim=0, index=keep_tensor)
         next_step_indices = torch.index_select(active_batch.step_indices, dim=0, index=keep_tensor)
-        next_kv_lens = None if active_batch.kv_lens is None else torch.index_select(active_batch.kv_lens, dim=0, index=keep_tensor)
+        next_kv_lens = (
+            None if active_batch.kv_lens is None else torch.index_select(active_batch.kv_lens, dim=0, index=keep_tensor)
+        )
         active_batch.step_indices = next_step_indices + 1
         active_batch.kv_lens = next_kv_lens if was_prefill else (None if next_kv_lens is None else next_kv_lens + 1)
 
@@ -4765,9 +4820,13 @@ class GPTSoVITSRuntime:
             )
 
         xy_pos_started = time.perf_counter()
-        active_batch.xy_pos = next_xy_pos if next_xy_pos is not None else self._build_next_xy_pos(
-            model,
-            active_batch.y_sequences,
+        active_batch.xy_pos = (
+            next_xy_pos
+            if next_xy_pos is not None
+            else self._build_next_xy_pos(
+                model,
+                active_batch.y_sequences,
+            )
         )
         self._accumulate_t2s_stat(stats, "xy_pos_update_ms", (time.perf_counter() - xy_pos_started) * 1000.0)
         _record_stage("prefill" if was_prefill else "dynamic", active_batch)
@@ -4798,7 +4857,12 @@ class GPTSoVITSRuntime:
             return left_batch
         if not left_batch.prefill_done or not right_batch.prefill_done:
             raise ValueError("Only prefill-complete GPT-SoVITS active batches can be merged")
-        if left_batch.k_cache is None or left_batch.v_cache is None or right_batch.k_cache is None or right_batch.v_cache is None:
+        if (
+            left_batch.k_cache is None
+            or left_batch.v_cache is None
+            or right_batch.k_cache is None
+            or right_batch.v_cache is None
+        ):
             raise ValueError("GPT-SoVITS active batch merge is missing KV cache")
         if left_batch.kv_lens is None or right_batch.kv_lens is None:
             raise ValueError("GPT-SoVITS active batch merge is missing kv_lens")
@@ -4879,7 +4943,9 @@ class GPTSoVITSRuntime:
             x=None,
             x_lens=None,
             y_sequences=list(left_batch.y_sequences) + list(right_batch.y_sequences),
-            y_sequence_batch=_build_uniform_token_sequence_batch(list(left_batch.y_sequences) + list(right_batch.y_sequences)),
+            y_sequence_batch=_build_uniform_token_sequence_batch(
+                list(left_batch.y_sequences) + list(right_batch.y_sequences)
+            ),
             early_stop_nums=torch.cat(
                 [
                     left_batch.early_stop_nums
@@ -5015,8 +5081,12 @@ class GPTSoVITSRuntime:
         while pending or active_batch is not None:
             stats["scheduler_ticks"] = int(stats["scheduler_ticks"]) + 1
             admitted: list[Any] = []
-            active_request_count = 0 if active_batch is None else int(len(getattr(active_batch, "request_ids", []) or []))
-            remaining_capacity = len(pending) if int(max_active_batch) <= 0 else max(0, int(max_active_batch) - active_request_count)
+            active_request_count = (
+                0 if active_batch is None else int(len(getattr(active_batch, "request_ids", []) or []))
+            )
+            remaining_capacity = (
+                len(pending) if int(max_active_batch) <= 0 else max(0, int(max_active_batch) - active_request_count)
+            )
             while remaining_capacity > 0 and pending and pending[0].ready_step <= current_tick:
                 admitted.append(pending.pop(0))
                 remaining_capacity -= 1
@@ -5067,7 +5137,9 @@ class GPTSoVITSRuntime:
         pool_snapshot_end = None if pool is None else dict(pool.snapshot())
         stats["pool_snapshot_end"] = pool_snapshot_end
         if isinstance(pool_snapshot_start, dict) and isinstance(pool_snapshot_end, dict):
-            stats["pool_pack_hits_delta"] = int(pool_snapshot_end.get("pack_hits", 0)) - int(pool_snapshot_start.get("pack_hits", 0))
+            stats["pool_pack_hits_delta"] = int(pool_snapshot_end.get("pack_hits", 0)) - int(
+                pool_snapshot_start.get("pack_hits", 0)
+            )
             stats["pool_fallback_count_delta"] = int(pool_snapshot_end.get("fallback_count", 0)) - int(
                 pool_snapshot_start.get("fallback_count", 0)
             )
@@ -5144,8 +5216,7 @@ class GPTSoVITSRuntime:
                     return self._load_ref_audio_with_soundfile(ref_audio_path)
                 except Exception as fallback_exc:
                     raise RuntimeError(
-                        f"Failed to load GPT-SoVITS reference audio {ref_audio_path} "
-                        f"with both torchaudio and soundfile"
+                        f"Failed to load GPT-SoVITS reference audio {ref_audio_path} with both torchaudio and soundfile"
                     ) from fallback_exc
 
         pipeline._load_ref_audio_raw = types.MethodType(_load_ref_audio_raw_with_fallback, pipeline)
@@ -5340,11 +5411,7 @@ class GPTSoVITSRuntime:
         raw_target = os.environ.get("GPTSOVITS_T2S_POOLED_CUDAGRAPH_DUMP_KV_LEN")
         if raw_target is not None:
             try:
-                target_values = {
-                    int(part.strip())
-                    for part in str(raw_target).split(",")
-                    if str(part).strip()
-                }
+                target_values = {int(part.strip()) for part in str(raw_target).split(",") if str(part).strip()}
                 if int(current_kv_len) not in target_values:
                     return
             except Exception:
@@ -5401,9 +5468,12 @@ class GPTSoVITSRuntime:
     def _get_text_preprocessor_symbol(self, symbol: str) -> Any:
         self._ensure_import_path()
         with self._project_root_cwd():
-            from GPT_SoVITS.TTS_infer_pack import TextPreprocessor as _text_preprocessor_module
+            text_preprocessor_module = __import__(
+                "GPT_SoVITS.TTS_infer_pack.TextPreprocessor",
+                fromlist=[symbol],
+            )
 
-        return getattr(_text_preprocessor_module, symbol)
+        return getattr(text_preprocessor_module, symbol)
 
     def _get_text_frontend_symbol(self, module_name: str, symbol: str) -> Any:
         self._ensure_import_path()
@@ -5513,7 +5583,9 @@ class GPTSoVITSRuntime:
         cleaned_text_to_sequence = self._get_text_frontend_symbol("text", "cleaned_text_to_sequence")
         prepared_text_segment_cls = self._get_text_preprocessor_symbol("PreparedTextSegment")
         version = self._current_text_frontend_version()
-        normalized_segments = [str(getattr(prepared_segment_list[index], "norm_text", "") or "") for index in zh_indices]
+        normalized_segments = [
+            str(getattr(prepared_segment_list[index], "norm_text", "") or "") for index in zh_indices
+        ]
         resolved_segments, g2pw_profile = g2p_segments(normalized_segments, return_profile=True)
         self._merge_g2pw_profile(profile, dict(g2pw_profile or {}))
         for index, (phones, word2ph, norm_text) in zip(zh_indices, resolved_segments):
@@ -5688,11 +5760,9 @@ class GPTSoVITSRuntime:
         raw_sr: int,
     ) -> tuple[torch.Tensor | None, dict[str, float]]:
         self._ensure_pipeline()
-        if (
-            self._get_runtime_prepare_ref_semantic_batch_worker() is None
-            or str(os.environ.get("GPTSOVITS_PREPARE_REF_SUBMIT_PREPARED_WAV16K", "1")).strip().lower()
-            in {"0", "false", "no", "off"}
-        ):
+        if self._get_runtime_prepare_ref_semantic_batch_worker() is None or str(
+            os.environ.get("GPTSOVITS_PREPARE_REF_SUBMIT_PREPARED_WAV16K", "1")
+        ).strip().lower() in {"0", "false", "no", "off"}:
             return None, {
                 "prompt_semantic_cpu_prepare_wait_ms": 0.0,
                 "prompt_semantic_cpu_prepare_slots": 0.0,
@@ -5741,13 +5811,13 @@ class GPTSoVITSRuntime:
             return profile
         batch_sizes = tuple(
             int(value)
-            for value in (
-                getattr(coordinator, "ref_prompt_semantic_runtime_exact_prewarm_batch_sizes", ()) or ()
-            )
+            for value in (getattr(coordinator, "ref_prompt_semantic_runtime_exact_prewarm_batch_sizes", ()) or ())
         )
         if not batch_sizes:
-            batch_sizes = GPTSoVITSPrepareRuntimeCoordinator._resolve_ref_prompt_semantic_runtime_exact_prewarm_batch_sizes(
-                getattr(coordinator, "tts", None)
+            batch_sizes = (
+                GPTSoVITSPrepareRuntimeCoordinator._resolve_ref_prompt_semantic_runtime_exact_prewarm_batch_sizes(
+                    getattr(coordinator, "tts", None)
+                )
             )
         with prewarm_lock:
             prewarmed_samples = coordinator.ref_prompt_semantic_runtime_exact_prewarmed_samples
@@ -5840,9 +5910,7 @@ class GPTSoVITSRuntime:
             return route
         bucket_indices = tuple(
             int(value)
-            for value in (
-                getattr(coordinator, "ref_prompt_semantic_bucket_first_hit_bucket_indices", ()) or ()
-            )
+            for value in (getattr(coordinator, "ref_prompt_semantic_bucket_first_hit_bucket_indices", ()) or ())
         )
         if bucket_indices and int(bucket_index) not in set(bucket_indices):
             return route
@@ -5860,11 +5928,7 @@ class GPTSoVITSRuntime:
                 if callable(pick_first_hit_fn):
                     reserved_shard_index = int(pick_first_hit_fn())
                 else:
-                    reserved_shard_index = (
-                        int(preferred_shard_index)
-                        if preferred_shard_index is not None
-                        else 0
-                    )
+                    reserved_shard_index = int(preferred_shard_index) if preferred_shard_index is not None else 0
                 state = {
                     "reserved_shard_index": int(reserved_shard_index),
                     "dispatched_hits": 0,
@@ -6285,10 +6349,7 @@ class GPTSoVITSRuntime:
             )
         else:
             pending_results = await asyncio.gather(
-                *[
-                    worker.submit_async(norm_text, list(word2ph))
-                    for _, _, _, _, norm_text, word2ph in pending_items
-                ]
+                *[worker.submit_async(norm_text, list(word2ph)) for _, _, _, _, norm_text, word2ph in pending_items]
             )
         for (bert_list, bert_index, profile, device, _norm_text, _word2ph), (feature, worker_profile) in zip(
             pending_items,
@@ -6407,7 +6468,7 @@ class GPTSoVITSRuntime:
         return prompt_semantic, profile
 
     def _build_ref_prompt_semantic_from_raw(self, raw_audio: Any, raw_sr: int) -> GPTSoVITSRefAudioBundle:
-        pipeline = self._ensure_pipeline()
+        self._ensure_pipeline()
         load_profile = {"audio_load_ms": 0.0}
         ref_worker = self._get_runtime_prepare_ref_semantic_batch_worker()
         if ref_worker is not None:
@@ -6447,9 +6508,7 @@ class GPTSoVITSRuntime:
                     **load_profile,
                     "audio_stage_wait_ms": float(worker_profile.get("prompt_semantic_wait_ms", 0.0)),
                     "audio_stage_slots": float(worker_profile.get("prompt_semantic_stage_slots", 0.0)),
-                    "audio_stage_inflight_peak": float(
-                        worker_profile.get("prompt_semantic_stage_inflight_peak", 0.0)
-                    ),
+                    "audio_stage_inflight_peak": float(worker_profile.get("prompt_semantic_stage_inflight_peak", 0.0)),
                     "prompt_semantic_ms": float(
                         worker_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
                         + local_cpu_prepare_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
@@ -6516,9 +6575,7 @@ class GPTSoVITSRuntime:
                 "prompt_semantic_pack_ms": 0.0,
                 "prompt_semantic_h2d_ms": float(runtime_profile.get("prompt_semantic_h2d_ms", 0.0)),
                 "prompt_semantic_ssl_forward_ms": float(runtime_profile.get("prompt_semantic_ssl_forward_ms", 0.0)),
-                "prompt_semantic_hidden_length_ms": float(
-                    runtime_profile.get("prompt_semantic_hidden_length_ms", 0.0)
-                ),
+                "prompt_semantic_hidden_length_ms": float(runtime_profile.get("prompt_semantic_hidden_length_ms", 0.0)),
                 "prompt_semantic_extract_latent_ms": float(
                     runtime_profile.get("prompt_semantic_extract_latent_ms", 0.0)
                 ),
@@ -6596,7 +6653,9 @@ class GPTSoVITSRuntime:
                 "prompt_semantic_batch_dispatch_delay_ms": float(
                     prompt_semantic_profile.get("prompt_semantic_batch_dispatch_delay_ms", 0.0)
                 ),
-                "prompt_semantic_cpu_prepare_ms": float(prompt_semantic_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)),
+                "prompt_semantic_cpu_prepare_ms": float(
+                    prompt_semantic_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
+                ),
                 "prompt_semantic_preload_cpu_prepare_ms": float(preload_cpu_prepare_ms),
                 "prompt_semantic_cpu_prepare_wait_ms": float(cpu_prepare_wait_ms),
                 "prompt_semantic_cpu_prepare_slots": float(cpu_prepare_slots),
@@ -6620,7 +6679,9 @@ class GPTSoVITSRuntime:
                     prompt_semantic_profile.get("prompt_semantic_stage_inflight_peak", 0.0)
                 ),
                 "prompt_semantic_batch_size": float(prompt_semantic_profile.get("prompt_semantic_batch_size", 1.0)),
-                "prompt_semantic_batch_samples": float(prompt_semantic_profile.get("prompt_semantic_batch_samples", 0.0)),
+                "prompt_semantic_batch_samples": float(
+                    prompt_semantic_profile.get("prompt_semantic_batch_samples", 0.0)
+                ),
                 "prompt_semantic_padded_batch_samples": float(
                     prompt_semantic_profile.get("prompt_semantic_padded_batch_samples", 0.0)
                 ),
@@ -6996,9 +7057,9 @@ class GPTSoVITSRuntime:
     def _finalize_shared_prepare_results(
         self,
         coordinator: Any,
-        outputs: list[tuple[T2SRequestState, float, float] | Exception | None],
+        outputs: list[tuple[GPTSoVITST2SRequestState, float, float] | Exception | None],
         cpu_stages: list[GPTSoVITSNativePreparedCpuStage | Exception | None],
-    ) -> list[tuple[T2SRequestState, float, float] | Exception]:
+    ) -> list[tuple[GPTSoVITST2SRequestState, float, float] | Exception]:
         for index, cpu_stage in enumerate(cpu_stages):
             if not isinstance(cpu_stage, GPTSoVITSNativePreparedCpuStage):
                 continue
@@ -7011,7 +7072,7 @@ class GPTSoVITSRuntime:
         self,
         coordinator: Any,
         specs: list[GPTSoVITSRequestSpec],
-    ) -> list[tuple[T2SRequestState, float, float] | Exception]:
+    ) -> list[tuple[GPTSoVITST2SRequestState, float, float] | Exception]:
         coordinator = self._coerce_prepare_coordinator(coordinator)
         if not specs:
             return []
@@ -7036,7 +7097,7 @@ class GPTSoVITSRuntime:
             ],
             return_exceptions=True,
         )
-        outputs: list[tuple[T2SRequestState, float, float] | Exception | None] = [None] * len(specs)
+        outputs: list[tuple[GPTSoVITST2SRequestState, float, float] | Exception | None] = [None] * len(specs)
         runnable: list[tuple[int, GPTSoVITSNativePreparedCpuStage]] = []
         for index, cpu_stage in enumerate(cpu_stage_results):
             if isinstance(cpu_stage, Exception):
@@ -7077,10 +7138,7 @@ class GPTSoVITSRuntime:
             return self._finalize_shared_prepare_results(coordinator, outputs, cpu_stage_results)
 
         target_g2pw_results = await asyncio.gather(
-            *[
-                self._run_g2pw_stage(coordinator, cpu_stage.target_cpu_profiled.result)
-                for _, cpu_stage in runnable
-            ],
+            *[self._run_g2pw_stage(coordinator, cpu_stage.target_cpu_profiled.result) for _, cpu_stage in runnable],
             return_exceptions=True,
         )
         target_feature_tasks: list[asyncio.Task[Any] | Exception] = []
@@ -7102,11 +7160,7 @@ class GPTSoVITSRuntime:
         gathered_target_features = (
             list(
                 await asyncio.gather(
-                    *[
-                        item
-                        for item in target_feature_tasks
-                        if not isinstance(item, Exception)
-                    ],
+                    *[item for item in target_feature_tasks if not isinstance(item, Exception)],
                     return_exceptions=True,
                 )
             )
@@ -7327,13 +7381,21 @@ class GPTSoVITSRuntime:
         self._ensure_pipeline()
         g2pw_batch_worker = self._get_runtime_prepare_g2pw_batch_worker()
         prefer_direct_pair_batch = (
-            bool(coordinator.enable_g2pw_pair_batch)
-            and self._prepare_g2pw_single_request_direct_enabled()
+            bool(coordinator.enable_g2pw_pair_batch) and self._prepare_g2pw_single_request_direct_enabled()
         )
-        if g2pw_batch_worker is not None and (prompt_has_pending or target_has_pending) and not prefer_direct_pair_batch:
-            resolved_batches, batch_profiles, worker_profile, submit_at, started_at, finished_at = (
-                await g2pw_batch_worker.submit_async([prompt_segments or [], target_segments or []])
-            )
+        if (
+            g2pw_batch_worker is not None
+            and (prompt_has_pending or target_has_pending)
+            and not prefer_direct_pair_batch
+        ):
+            (
+                resolved_batches,
+                batch_profiles,
+                worker_profile,
+                submit_at,
+                started_at,
+                finished_at,
+            ) = await g2pw_batch_worker.submit_async([prompt_segments or [], target_segments or []])
             prompt_result, target_result = resolved_batches
             prompt_profile, target_profile = batch_profiles
             pair_finished_at = time.perf_counter()
@@ -7614,7 +7676,7 @@ class GPTSoVITSRuntime:
     ) -> tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult]:
         coordinator = self._coerce_prepare_coordinator(coordinator)
         prompt_is_empty = len(prompt_segments or []) == 0
-        pipeline = self._ensure_pipeline()
+        self._ensure_pipeline()
         if coordinator.text_feature_executor is not None:
             target_feature_task = asyncio.create_task(
                 self._prepare_run_on_executor(
@@ -7860,9 +7922,7 @@ class GPTSoVITSRuntime:
                 load_ms = float(preload_profile.get("audio_load_ms", 0.0))
                 cpu_prepare_wait_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0))
                 cpu_prepare_slots = float(preload_profile.get("prompt_semantic_cpu_prepare_slots", 0.0))
-                cpu_prepare_inflight_peak = float(
-                    preload_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0)
-                )
+                cpu_prepare_inflight_peak = float(preload_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0))
                 preload_cpu_prepare_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_ms", 0.0))
 
             route = self._build_ref_prompt_semantic_worker_routing(
@@ -7893,11 +7953,7 @@ class GPTSoVITSRuntime:
                 prompt_semantic, prompt_semantic_profile = await prompt_semantic_task
             finally:
                 self._mark_ref_prompt_semantic_worker_routing_completed(coordinator, route)
-            limiter_snapshot = (
-                ref_stage_limiter.snapshot()
-                if ref_stage_limiter is not None
-                else {}
-            )
+            limiter_snapshot = ref_stage_limiter.snapshot() if ref_stage_limiter is not None else {}
             finished_at = time.perf_counter()
             return self._build_ref_prompt_semantic_worker_profiled_result(
                 submit_at=float(submit_at),
@@ -7954,9 +8010,7 @@ class GPTSoVITSRuntime:
                 load_ms = float(preload_profile.get("audio_load_ms", 0.0))
                 cpu_prepare_wait_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0))
                 cpu_prepare_slots = float(preload_profile.get("prompt_semantic_cpu_prepare_slots", 0.0))
-                cpu_prepare_inflight_peak = float(
-                    preload_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0)
-                )
+                cpu_prepare_inflight_peak = float(preload_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0))
                 preload_cpu_prepare_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_ms", 0.0))
 
             submit_at = time.perf_counter()
@@ -8157,11 +8211,7 @@ class GPTSoVITSRuntime:
 
             if worker_tasks:
                 worker_outputs = await asyncio.gather(*worker_tasks, return_exceptions=True)
-                limiter_snapshot = (
-                    ref_stage_limiter.snapshot()
-                    if ref_stage_limiter is not None
-                    else {}
-                )
+                limiter_snapshot = ref_stage_limiter.snapshot() if ref_stage_limiter is not None else {}
                 batch_finished_at = time.perf_counter()
                 for index, worker_output in zip(worker_indices, worker_outputs):
                     self._mark_ref_prompt_semantic_worker_routing_completed(
@@ -8248,9 +8298,9 @@ class GPTSoVITSRuntime:
             )
         )
         try:
-            g2pw_pairs: list[tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult] | Exception | None] = [
-                None
-            ] * len(prepared_cpu_stages)
+            g2pw_pairs: list[
+                tuple[GPTSoVITSPrepareProfiledResult, GPTSoVITSPrepareProfiledResult] | Exception | None
+            ] = [None] * len(prepared_cpu_stages)
             group_size = max(1, int(getattr(coordinator, "g2pw_audio_batch_merge_group_size", 8)))
             for start_index in range(0, len(prepared_cpu_stages), group_size):
                 group = prepared_cpu_stages[start_index : start_index + group_size]
@@ -8325,9 +8375,7 @@ class GPTSoVITSRuntime:
     ) -> GPTSoVITSPreparedAudioPhase:
         with self._prepare_models_active():
             coordinator = self._ensure_prepare_coordinator()
-            phase_one = self._run_awaitable_sync(
-                self._prepare_gpu_audio_phase_async(coordinator, prepared_cpu_stage)
-            )
+            phase_one = self._run_awaitable_sync(self._prepare_gpu_audio_phase_async(coordinator, prepared_cpu_stage))
             return GPTSoVITSPreparedAudioPhase(
                 request_id=prepared_cpu_stage.request_id,
                 prepared_cpu_stage=prepared_cpu_stage,
@@ -8403,9 +8451,7 @@ class GPTSoVITSRuntime:
     ) -> GPTSoVITSPreparedTextPhase:
         with self._prepare_models_active():
             coordinator = self._ensure_prepare_coordinator()
-            phase_two = self._run_awaitable_sync(
-                self._prepare_gpu_text_phase_async(coordinator, prepared_audio_phase)
-            )
+            phase_two = self._run_awaitable_sync(self._prepare_gpu_text_phase_async(coordinator, prepared_audio_phase))
             return GPTSoVITSPreparedTextPhase(
                 request_id=prepared_audio_phase.request_id,
                 prepared_audio_phase=prepared_audio_phase,
@@ -8420,6 +8466,7 @@ class GPTSoVITSRuntime:
             return []
         with self._prepare_models_active():
             coordinator = self._ensure_prepare_coordinator()
+
             async def _gather_phase_twos():
                 return await asyncio.gather(
                     *[
@@ -8428,6 +8475,7 @@ class GPTSoVITSRuntime:
                     ],
                     return_exceptions=True,
                 )
+
             phase_two_results = self._run_awaitable_sync(_gather_phase_twos())
             if len(phase_two_results) != len(prepared_audio_phases):
                 raise ValueError("GPT-SoVITS batch prepare text phase count mismatch")
@@ -8485,6 +8533,7 @@ class GPTSoVITSRuntime:
         if not prepared_audio_phases:
             return []
         coordinator = self._ensure_prepare_coordinator()
+
         async def _gather_ref_specs():
             return await asyncio.gather(
                 *[
@@ -8493,6 +8542,7 @@ class GPTSoVITSRuntime:
                 ],
                 return_exceptions=True,
             )
+
         ref_spec_results = self._run_awaitable_sync(_gather_ref_specs())
         if len(ref_spec_results) != len(prepared_audio_phases):
             raise ValueError("GPT-SoVITS batch prepare ref spec phase count mismatch")
@@ -8545,7 +8595,9 @@ class GPTSoVITSRuntime:
             "g2pw_pair_executor_queue_ms": self._profile_value(target_g2pw_profiled, "g2pw_pair_executor_queue_ms"),
             "g2pw_pair_compute_ms": self._profile_value(target_g2pw_profiled, "g2pw_pair_compute_ms"),
             "g2pw_pair_stage_overhead_ms": self._profile_value(target_g2pw_profiled, "g2pw_pair_stage_overhead_ms"),
-            "g2pw_pair_audio_batch_merge_size": self._profile_value(target_g2pw_profiled, "g2pw_pair_audio_batch_merge_size"),
+            "g2pw_pair_audio_batch_merge_size": self._profile_value(
+                target_g2pw_profiled, "g2pw_pair_audio_batch_merge_size"
+            ),
             "prompt_text_g2pw_queue_ms": float(prompt_g2pw_profiled.queue_ms),
             "prompt_text_g2pw_run_ms": float(prompt_g2pw_profiled.run_ms),
             "prompt_text_g2pw_prepare_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_prepare_ms"),
@@ -8553,9 +8605,15 @@ class GPTSoVITSRuntime:
             "prompt_text_g2pw_post_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_post_ms"),
             "prompt_text_g2pw_wait_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_wait_ms"),
             "prompt_text_g2pw_admission_wait_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_admission_wait_ms"),
-            "prompt_text_g2pw_worker_queue_wait_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_worker_queue_wait_ms"),
-            "prompt_text_g2pw_batch_collect_wait_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_batch_collect_wait_ms"),
-            "prompt_text_g2pw_batch_dispatch_delay_ms": self._profile_value(prompt_g2pw_profiled, "g2pw_batch_dispatch_delay_ms"),
+            "prompt_text_g2pw_worker_queue_wait_ms": self._profile_value(
+                prompt_g2pw_profiled, "g2pw_worker_queue_wait_ms"
+            ),
+            "prompt_text_g2pw_batch_collect_wait_ms": self._profile_value(
+                prompt_g2pw_profiled, "g2pw_batch_collect_wait_ms"
+            ),
+            "prompt_text_g2pw_batch_dispatch_delay_ms": self._profile_value(
+                prompt_g2pw_profiled, "g2pw_batch_dispatch_delay_ms"
+            ),
             "prompt_text_g2pw_batch_size": self._profile_value(prompt_g2pw_profiled, "g2pw_batch_size"),
             "prompt_text_g2pw_batch_groups": self._profile_value(prompt_g2pw_profiled, "g2pw_batch_groups"),
             "prompt_text_g2pw_batch_chars": self._profile_value(prompt_g2pw_profiled, "g2pw_batch_chars"),
@@ -8568,7 +8626,9 @@ class GPTSoVITSRuntime:
             "text_g2pw_admission_wait_ms": self._profile_value(target_g2pw_profiled, "g2pw_admission_wait_ms"),
             "text_g2pw_worker_queue_wait_ms": self._profile_value(target_g2pw_profiled, "g2pw_worker_queue_wait_ms"),
             "text_g2pw_batch_collect_wait_ms": self._profile_value(target_g2pw_profiled, "g2pw_batch_collect_wait_ms"),
-            "text_g2pw_batch_dispatch_delay_ms": self._profile_value(target_g2pw_profiled, "g2pw_batch_dispatch_delay_ms"),
+            "text_g2pw_batch_dispatch_delay_ms": self._profile_value(
+                target_g2pw_profiled, "g2pw_batch_dispatch_delay_ms"
+            ),
             "text_g2pw_batch_size": self._profile_value(target_g2pw_profiled, "g2pw_batch_size"),
             "text_g2pw_batch_groups": self._profile_value(target_g2pw_profiled, "g2pw_batch_groups"),
             "text_g2pw_batch_chars": self._profile_value(target_g2pw_profiled, "g2pw_batch_chars"),
@@ -8580,16 +8640,28 @@ class GPTSoVITSRuntime:
             "prompt_text_parallel_future_run_tail_after_target_ms": 0.0,
             "prompt_text_cpu_queue_ms": float(cpu_stage.prompt_cpu_profiled.queue_ms),
             "prompt_text_cpu_run_ms": float(cpu_stage.prompt_cpu_profiled.run_ms),
-            "prompt_text_cpu_admission_wait_ms": self._profile_value(cpu_stage.prompt_cpu_profiled, "text_cpu_admission_wait_ms"),
-            "prompt_text_cpu_backpressure_wait_ms": self._profile_value(cpu_stage.prompt_cpu_profiled, "text_cpu_backpressure_wait_ms"),
-            "prompt_text_cpu_capacity_wait_ms": self._profile_value(cpu_stage.prompt_cpu_profiled, "text_cpu_capacity_wait_ms"),
+            "prompt_text_cpu_admission_wait_ms": self._profile_value(
+                cpu_stage.prompt_cpu_profiled, "text_cpu_admission_wait_ms"
+            ),
+            "prompt_text_cpu_backpressure_wait_ms": self._profile_value(
+                cpu_stage.prompt_cpu_profiled, "text_cpu_backpressure_wait_ms"
+            ),
+            "prompt_text_cpu_capacity_wait_ms": self._profile_value(
+                cpu_stage.prompt_cpu_profiled, "text_cpu_capacity_wait_ms"
+            ),
             "prompt_text_feature_queue_ms": float(prompt_feature_profiled.queue_ms),
             "prompt_text_feature_run_ms": float(prompt_feature_profiled.run_ms),
             "text_cpu_queue_ms": float(cpu_stage.target_cpu_profiled.queue_ms),
             "text_cpu_run_ms": float(cpu_stage.target_cpu_profiled.run_ms),
-            "text_cpu_admission_wait_ms": self._profile_value(cpu_stage.target_cpu_profiled, "text_cpu_admission_wait_ms"),
-            "text_cpu_backpressure_wait_ms": self._profile_value(cpu_stage.target_cpu_profiled, "text_cpu_backpressure_wait_ms"),
-            "text_cpu_capacity_wait_ms": self._profile_value(cpu_stage.target_cpu_profiled, "text_cpu_capacity_wait_ms"),
+            "text_cpu_admission_wait_ms": self._profile_value(
+                cpu_stage.target_cpu_profiled, "text_cpu_admission_wait_ms"
+            ),
+            "text_cpu_backpressure_wait_ms": self._profile_value(
+                cpu_stage.target_cpu_profiled, "text_cpu_backpressure_wait_ms"
+            ),
+            "text_cpu_capacity_wait_ms": self._profile_value(
+                cpu_stage.target_cpu_profiled, "text_cpu_capacity_wait_ms"
+            ),
             "text_feature_queue_ms": float(target_feature_profiled.queue_ms),
             "text_feature_run_ms": float(target_feature_profiled.run_ms),
             "ref_audio_task_queue_ms": float(ref_audio_profiled.queue_ms),
@@ -8703,9 +8775,15 @@ class GPTSoVITSRuntime:
             "prompt_text_bert_admission_wait_ms": float(prompt_result.profile.get("bert_admission_wait_ms", 0.0)),
             "prompt_text_bert_queue_wait_ms": float(prompt_result.profile.get("bert_queue_wait_ms", 0.0)),
             "prompt_text_bert_worker_queue_wait_ms": float(prompt_result.profile.get("bert_worker_queue_wait_ms", 0.0)),
-            "prompt_text_bert_submit_offset_first_ms": float(prompt_result.profile.get("bert_submit_offset_first_ms", 0.0)),
-            "prompt_text_bert_submit_offset_last_ms": float(prompt_result.profile.get("bert_submit_offset_last_ms", 0.0)),
-            "prompt_text_bert_batch_collect_wait_ms": float(prompt_result.profile.get("bert_batch_collect_wait_ms", 0.0)),
+            "prompt_text_bert_submit_offset_first_ms": float(
+                prompt_result.profile.get("bert_submit_offset_first_ms", 0.0)
+            ),
+            "prompt_text_bert_submit_offset_last_ms": float(
+                prompt_result.profile.get("bert_submit_offset_last_ms", 0.0)
+            ),
+            "prompt_text_bert_batch_collect_wait_ms": float(
+                prompt_result.profile.get("bert_batch_collect_wait_ms", 0.0)
+            ),
             "prompt_text_bert_batch_dispatch_delay_ms": float(
                 prompt_result.profile.get("bert_batch_dispatch_delay_ms", 0.0)
             ),
@@ -8802,9 +8880,7 @@ class GPTSoVITSRuntime:
             "prompt_semantic_cpu_prepare_wait_ms": float(
                 bundle_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0)
             ),
-            "prompt_semantic_cpu_prepare_slots": float(
-                bundle_profile.get("prompt_semantic_cpu_prepare_slots", 0.0)
-            ),
+            "prompt_semantic_cpu_prepare_slots": float(bundle_profile.get("prompt_semantic_cpu_prepare_slots", 0.0)),
             "prompt_semantic_cpu_prepare_inflight_peak": float(
                 bundle_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0)
             ),
@@ -8824,12 +8900,8 @@ class GPTSoVITSRuntime:
             "prompt_semantic_pack_ms": float(bundle_profile.get("prompt_semantic_pack_ms", 0.0)),
             "prompt_semantic_h2d_ms": float(bundle_profile.get("prompt_semantic_h2d_ms", 0.0)),
             "prompt_semantic_ssl_forward_ms": float(bundle_profile.get("prompt_semantic_ssl_forward_ms", 0.0)),
-            "prompt_semantic_hidden_length_ms": float(
-                bundle_profile.get("prompt_semantic_hidden_length_ms", 0.0)
-            ),
-            "prompt_semantic_extract_latent_ms": float(
-                bundle_profile.get("prompt_semantic_extract_latent_ms", 0.0)
-            ),
+            "prompt_semantic_hidden_length_ms": float(bundle_profile.get("prompt_semantic_hidden_length_ms", 0.0)),
+            "prompt_semantic_extract_latent_ms": float(bundle_profile.get("prompt_semantic_extract_latent_ms", 0.0)),
             "prompt_semantic_forward_ms": float(bundle_profile.get("prompt_semantic_forward_ms", 0.0)),
             "prompt_semantic_scatter_ms": float(bundle_profile.get("prompt_semantic_scatter_ms", 0.0)),
             "prompt_semantic_stage_slots": float(bundle_profile.get("prompt_semantic_stage_slots", 0.0)),
@@ -8842,9 +8914,7 @@ class GPTSoVITSRuntime:
                 bundle_profile.get("prompt_semantic_padded_batch_samples", 0.0)
             ),
             "prompt_semantic_batch_pad_ratio": float(bundle_profile.get("prompt_semantic_batch_pad_ratio", 0.0)),
-            "prompt_semantic_pool_bucket_index": float(
-                bundle_profile.get("prompt_semantic_pool_bucket_index", 0.0)
-            ),
+            "prompt_semantic_pool_bucket_index": float(bundle_profile.get("prompt_semantic_pool_bucket_index", 0.0)),
             "prompt_semantic_pool_workers": float(bundle_profile.get("prompt_semantic_pool_workers", 0.0)),
             "prompt_semantic_bucket_first_hit_serialized": float(
                 bundle_profile.get("prompt_semantic_bucket_first_hit_serialized", 0.0)
@@ -8934,9 +9004,7 @@ class GPTSoVITSRuntime:
                 prompt_phones=prompt_phones_tensor,
                 prompt_semantic=prompt_semantic,
                 refer_spec=(
-                    None
-                    if spec_audio is None
-                    else GPTSoVITSReferSpec(spec_audio=spec_audio, audio_16k=audio_16k)
+                    None if spec_audio is None else GPTSoVITSReferSpec(spec_audio=spec_audio, audio_16k=audio_16k)
                 ),
                 raw_audio=raw_audio,
                 raw_sr=raw_sr,
@@ -8959,11 +9027,7 @@ class GPTSoVITSRuntime:
             all_phones=all_phones,
             all_bert_features=all_bert_features,
             prompt_semantic=prompt_semantic,
-            refer_spec=(
-                None
-                if spec_audio is None
-                else GPTSoVITSReferSpec(spec_audio=spec_audio, audio_16k=audio_16k)
-            ),
+            refer_spec=(None if spec_audio is None else GPTSoVITSReferSpec(spec_audio=spec_audio, audio_16k=audio_16k)),
             aux_refer_specs=aux_refer_specs,
             raw_audio=raw_audio,
             raw_sr=raw_sr,
@@ -9171,7 +9235,9 @@ class GPTSoVITSRuntime:
                 token_tensor = torch.tensor([token_value], device=device, dtype=torch.long)
                 active_batch.y_sequences[0] = torch.cat([active_batch.y_sequences[0], token_tensor], dim=0)
                 if active_batch.y_sequence_batch is not None and int(active_batch.y_sequence_batch.shape[0]) == 1:
-                    active_batch.y_sequence_batch = self._append_sampled_token_batch(active_batch.y_sequence_batch, token_tensor)
+                    active_batch.y_sequence_batch = self._append_sampled_token_batch(
+                        active_batch.y_sequence_batch, token_tensor
+                    )
                 else:
                     active_batch.y_sequence_batch = _build_uniform_token_sequence_batch(active_batch.y_sequences)
                 active_batch.step_indices = active_batch.step_indices + 1
@@ -9251,7 +9317,9 @@ class GPTSoVITSRuntime:
         prefix_len = int(active_batch.prefix_lens[0].item()) if active_batch.prefix_lens.numel() > 0 else 0
         current = active_batch.y_sequences[0]
         if not isinstance(current, torch.Tensor) or current.numel() <= prefix_len:
-            return torch.zeros((0,), dtype=torch.long, device=current.device if isinstance(current, torch.Tensor) else None)
+            return torch.zeros(
+                (0,), dtype=torch.long, device=current.device if isinstance(current, torch.Tensor) else None
+            )
         return current[prefix_len:].detach().to(dtype=torch.long).contiguous()
 
     def get_ar_session_semantic_tokens(self, session: GPTSoVITSARSession) -> torch.Tensor:
@@ -9348,7 +9416,9 @@ class GPTSoVITSRuntime:
                     sample_steps=int(transport.sample_steps),
                     super_sampling=bool(transport.super_sampling),
                 )
-                for segment_index, (segment_semantic, segment_phone) in enumerate(zip(semantic_segments, segment_phones))
+                for segment_index, (segment_semantic, segment_phone) in enumerate(
+                    zip(semantic_segments, segment_phones)
+                )
             ]
             return GPTSoVITSDecodePreparedRequestGroup(
                 request_id=request_id,
@@ -9682,10 +9752,7 @@ class GPTSoVITSRuntime:
                     continue
                 window_first = first[-overlap:]
             window = torch.hann_window(overlap * 2, device=first.device, dtype=first.dtype)
-            aligned_second[:overlap] = (
-                window[:overlap] * aligned_second[:overlap]
-                + window[overlap:] * window_first
-            )
+            aligned_second[:overlap] = window[:overlap] * aligned_second[:overlap] + window[overlap:] * window_first
             merged_fragments[index + 1] = aligned_second
         return torch.cat(merged_fragments, dim=0).to(dtype)
 
@@ -9818,7 +9885,9 @@ class GPTSoVITSRuntime:
             merged_audio = merged_audio[trim_prefix:]
         trim_suffix = padding_len * upsample_rate
         if trim_suffix > 0:
-            merged_audio = merged_audio[:-trim_suffix] if trim_suffix < int(merged_audio.shape[-1]) else merged_audio[:0]
+            merged_audio = (
+                merged_audio[:-trim_suffix] if trim_suffix < int(merged_audio.shape[-1]) else merged_audio[:0]
+            )
 
         output_sr = int(prompt_context["output_sr"])
         decoded_items: list[GPTSoVITSDecodedAudio] = []
@@ -10065,7 +10134,9 @@ class GPTSoVITSRuntime:
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * float(noise_scale)
         z = vits_model.flow(z_p, y_mask, g=ge, reverse=True)
         decoder_input = (z * y_mask)[:, :, :]
-        use_compiled_decoder = str(os.environ.get("GPTSOVITS_VITS_STREAMING_USE_COMPILED_DEC", "0")).strip().lower() in {
+        use_compiled_decoder = str(
+            os.environ.get("GPTSOVITS_VITS_STREAMING_USE_COMPILED_DEC", "0")
+        ).strip().lower() in {
             "1",
             "true",
             "yes",
@@ -10206,7 +10277,9 @@ class GPTSoVITSRuntime:
             elif overlap_size > 0:
                 merged_audio = pipeline.sola_algorithm([last_audio_chunk, audio_chunk], overlap_size)
                 start_index = int(last_audio_chunk.shape[0] - overlap_size)
-                audio_fragment = merged_audio[start_index:] if is_final_chunk else merged_audio[start_index:-overlap_size]
+                audio_fragment = (
+                    merged_audio[start_index:] if is_final_chunk else merged_audio[start_index:-overlap_size]
+                )
             else:
                 audio_fragment = audio_chunk
 
@@ -10254,7 +10327,9 @@ class GPTSoVITSRuntime:
             upsample_factor *= int(stride)
         semantic_rate_scale = 2 if getattr(vits_model, "semantic_frame_rate", "") == "25hz" else 1
         speed_value = max(float(speed), 1e-6)
-        overlap_size = int(math.ceil(float(overlap_tokens) * float(upsample_factor) * (float(semantic_rate_scale) / speed_value)))
+        overlap_size = int(
+            math.ceil(float(overlap_tokens) * float(upsample_factor) * (float(semantic_rate_scale) / speed_value))
+        )
 
         audio_fragments: list[torch.Tensor] = []
         last_audio_chunk: torch.Tensor | None = None
@@ -10290,7 +10365,13 @@ class GPTSoVITSRuntime:
                 audio_chunk = audio_chunk.detach()[0, 0, :]
 
                 if overlap_len > overlap_tokens:
-                    audio_chunk = audio_chunk[-int((int(overlap_tokens) + int(new_chunk_tokens)) * float(upsample_factor) * (float(semantic_rate_scale) / speed_value)) :]
+                    audio_chunk = audio_chunk[
+                        -int(
+                            (int(overlap_tokens) + int(new_chunk_tokens))
+                            * float(upsample_factor)
+                            * (float(semantic_rate_scale) / speed_value)
+                        ) :
+                    ]
 
                 if is_first_chunk:
                     if is_final_chunk:
@@ -10304,7 +10385,9 @@ class GPTSoVITSRuntime:
                 elif overlap_size > 0:
                     merged_audio = pipeline.sola_algorithm([last_audio_chunk, audio_chunk], overlap_size)
                     start_index = int(last_audio_chunk.shape[0] - overlap_size)
-                    audio_fragment = merged_audio[start_index:] if is_final_chunk else merged_audio[start_index:-overlap_size]
+                    audio_fragment = (
+                        merged_audio[start_index:] if is_final_chunk else merged_audio[start_index:-overlap_size]
+                    )
                 else:
                     audio_fragment = audio_chunk
 
@@ -10497,9 +10580,11 @@ class GPTSoVITSRuntime:
         decoder_runtime_stats = getattr(vits_model, "get_last_decoder_runtime_stats", lambda: {})()
         borrow_output = bool(decoder_runtime_stats.get("decoder_runtime_output_borrowed"))
         audio_fragment = self._time_vits_call(
-            lambda: audio_batch[0, 0, : int(audio_lengths[0].item())].detach().clone()
-            if borrow_output
-            else audio_batch[0, 0, : int(audio_lengths[0].item())].detach(),
+            lambda: (
+                audio_batch[0, 0, : int(audio_lengths[0].item())].detach().clone()
+                if borrow_output
+                else audio_batch[0, 0, : int(audio_lengths[0].item())].detach()
+            ),
             profile=profile,
             stat_key="non_vocoder_trim_audio_ms",
             device=device,
@@ -10631,7 +10716,9 @@ class GPTSoVITSRuntime:
             runtime_stats_only["non_vocoder_max_phone_tokens"] = int(max_phone_len)
             runtime_stats_only["non_vocoder_padded_semantic_tokens"] = int(padded_semantic_len)
             runtime_stats_only["non_vocoder_padded_phone_tokens"] = int(padded_phone_len)
-            runtime_stats_only["non_vocoder_output_samples"] = int(sum(int(fragment.shape[-1]) for fragment in audio_fragments))
+            runtime_stats_only["non_vocoder_output_samples"] = int(
+                sum(int(fragment.shape[-1]) for fragment in audio_fragments)
+            )
             self._merge_last_vits_decode_profile(runtime_stats_only)
         output_sr = int(self._get_runtime_configs().sampling_rate)
         return [
@@ -10809,9 +10896,7 @@ class GPTSoVITSRuntime:
                     and current_semantic_tokens + semantic_len > max_semantic_tokens
                 )
                 would_exceed_phone = (
-                    bool(current_batch)
-                    and max_phone_tokens > 0
-                    and current_phone_tokens + phone_len > max_phone_tokens
+                    bool(current_batch) and max_phone_tokens > 0 and current_phone_tokens + phone_len > max_phone_tokens
                 )
                 if would_exceed_batch or would_exceed_semantic or would_exceed_phone:
                     batches.append(
@@ -10869,9 +10954,7 @@ class GPTSoVITSRuntime:
                     and current_semantic_tokens + semantic_len > max_semantic_tokens
                 )
                 would_exceed_phone = (
-                    bool(current_batch)
-                    and max_phone_tokens > 0
-                    and current_phone_tokens + phone_len > max_phone_tokens
+                    bool(current_batch) and max_phone_tokens > 0 and current_phone_tokens + phone_len > max_phone_tokens
                 )
                 if would_exceed_batch or would_exceed_semantic or would_exceed_phone:
                     batches.append(
@@ -11086,13 +11169,21 @@ class GPTSoVITSRuntime:
                 fragment = torch.cat([fragment, zero_wav], dim=0)
             fragment_tensors.append(fragment)
 
-        audio = torch.cat(fragment_tensors, dim=0) if fragment_tensors else torch.zeros((0,), dtype=torch.float32, device=device)
+        audio = (
+            torch.cat(fragment_tensors, dim=0)
+            if fragment_tensors
+            else torch.zeros((0,), dtype=torch.float32, device=device)
+        )
 
         if super_sampling:
             sr_model, sr_model_not_exist = self._ensure_runtime_sr_model()
             if not sr_model_not_exist and sr_model is not None:
                 audio, sr = sr_model(audio.unsqueeze(0), sr)
-                max_audio = float(torch.abs(audio).max().item()) if isinstance(audio, torch.Tensor) and audio.numel() > 0 else 0.0
+                max_audio = (
+                    float(torch.abs(audio).max().item())
+                    if isinstance(audio, torch.Tensor) and audio.numel() > 0
+                    else 0.0
+                )
                 if max_audio > 1.0:
                     audio = audio / max_audio
 
@@ -11197,7 +11288,9 @@ class GPTSoVITSRuntime:
         ref_audio_path = request.get("ref_audio_path")
         if not ref_audio_path:
             raise ValueError("GPT-SoVITS request requires 'ref_audio_path'")
-        ref_audio_path = self._resolve_path(str(ref_audio_path)) if not os.path.isabs(str(ref_audio_path)) else str(ref_audio_path)
+        ref_audio_path = (
+            self._resolve_path(str(ref_audio_path)) if not os.path.isabs(str(ref_audio_path)) else str(ref_audio_path)
+        )
         if not os.path.exists(ref_audio_path):
             raise FileNotFoundError(f"Reference audio not found: {ref_audio_path}")
 
@@ -11239,7 +11332,9 @@ class GPTSoVITSRuntime:
         prepared = self.prepare_request_spec(spec)
         semantic_tokens = self.generate_semantic_tokens([prepared]).get(str(prepared.request_id))
         if semantic_tokens is None:
-            raise RuntimeError(f"GPT-SoVITS native synthesize missing semantic tokens for request {prepared.request_id}")
+            raise RuntimeError(
+                f"GPT-SoVITS native synthesize missing semantic tokens for request {prepared.request_id}"
+            )
         return self.decode_semantic_tokens_from_transport(semantic_tokens, prepared.transport_info)
 
 
@@ -11254,9 +11349,7 @@ def get_gpt_sovits_runtime(
 ) -> GPTSoVITSRuntime:
     resolved_root = os.path.abspath(project_root or os.environ.get("GPT_SOVITS_PROJECT_ROOT", _DEFAULT_PROJECT_ROOT))
     resolved_config = os.path.abspath(
-        config_path
-        or os.environ.get("GPT_SOVITS_CONFIG_PATH")
-        or os.path.join(resolved_root, _DEFAULT_CONFIG_PATH)
+        config_path or os.environ.get("GPT_SOVITS_CONFIG_PATH") or os.path.join(resolved_root, _DEFAULT_CONFIG_PATH)
     )
     cache_key = (resolved_root, resolved_config)
     with _RUNTIME_CACHE_LOCK:

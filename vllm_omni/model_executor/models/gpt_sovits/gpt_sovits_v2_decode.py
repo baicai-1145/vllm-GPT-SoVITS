@@ -146,11 +146,18 @@ class GPTSoVITSV2Decode(nn.Module):
         if total == 0:
             return [ids]
         if runtime_additional_information and all(
-            int(GPTSoVITSStageTransport.from_info(info).semantic_token_count or info.get("gpt_sovits_semantic_token_count", 0)) > 0
+            int(
+                GPTSoVITSStageTransport.from_info(info).semantic_token_count
+                or info.get("gpt_sovits_semantic_token_count", 0)
+            )
+            > 0
             for info in runtime_additional_information
         ):
             sizes = [
-                int(GPTSoVITSStageTransport.from_info(info).semantic_token_count or info.get("gpt_sovits_semantic_token_count", 0))
+                int(
+                    GPTSoVITSStageTransport.from_info(info).semantic_token_count
+                    or info.get("gpt_sovits_semantic_token_count", 0)
+                )
                 for info in runtime_additional_information
             ]
             if sum(sizes) == total:
@@ -205,8 +212,14 @@ class GPTSoVITSV2Decode(nn.Module):
         audio_outputs: list[torch.Tensor] = []
         sample_rates: list[torch.Tensor] = []
         if not request_infos:
-            ids = input_ids.reshape(-1).to(dtype=torch.long) if input_ids is not None else torch.zeros((0,), dtype=torch.long)
-            request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"), runtime_additional_information)
+            ids = (
+                input_ids.reshape(-1).to(dtype=torch.long)
+                if input_ids is not None
+                else torch.zeros((0,), dtype=torch.long)
+            )
+            request_ids_list = self._split_request_ids(
+                ids, kwargs.get("seq_token_counts"), runtime_additional_information
+            )
             request_infos = [{} for _ in range(len(request_ids_list))]
         else:
             request_ids_list = [self._semantic_tokens_from_info(info) for info in request_infos]

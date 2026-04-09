@@ -4,13 +4,14 @@ import math
 import os
 import threading
 import time
-from typing import Any, Callable, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch._dynamo
 from torch import nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn import functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from tqdm import tqdm
 
 from AR.models.utils import (
@@ -93,8 +94,8 @@ def scaled_dot_product_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attn_mask: Optional[torch.Tensor] = None,
-    scale: Optional[torch.Tensor] = None,
+    attn_mask: torch.Tensor | None = None,
+    scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, H, L, S = query.size(0), query.size(1), query.size(-2), key.size(-2)
     if scale is None:
@@ -138,7 +139,7 @@ def _run_decode_sdpa_impl(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attn_mask: Optional[torch.Tensor],
+    attn_mask: torch.Tensor | None,
 ) -> torch.Tensor:
     backend = _get_decode_nomask_sdpa_backend_impl()
     if attn_mask is None and query.device.type == "cuda" and backend is not None:
@@ -182,12 +183,12 @@ def _prealloc_decode_cudagraph_bucket_tokens_impl() -> int:
 
 def decode_next_token_prealloc_functional(
     x: torch.Tensor,
-    k_cache: List[torch.Tensor],
-    v_cache: List[torch.Tensor],
+    k_cache: list[torch.Tensor],
+    v_cache: list[torch.Tensor],
     kv_lens: torch.Tensor,
     batch_index: torch.Tensor,
     next_max_kv_len: int,
-    sdpa_attn_mask: Optional[torch.Tensor],
+    sdpa_attn_mask: torch.Tensor | None,
     num_heads: int,
     hidden_dim: int,
     qkv_ws,
@@ -236,7 +237,9 @@ def decode_next_token_prealloc_functional(
             norm1_bs[layer_index],
             norm1_eps[layer_index],
         )
-        x = x + F.linear(F.relu(F.linear(x, ffn1_ws[layer_index], ffn1_bs[layer_index])), ffn2_ws[layer_index], ffn2_bs[layer_index])
+        x = x + F.linear(
+            F.relu(F.linear(x, ffn1_ws[layer_index], ffn1_bs[layer_index])), ffn2_ws[layer_index], ffn2_bs[layer_index]
+        )
         x = F.layer_norm(
             x,
             [hidden_dim],
@@ -299,7 +302,7 @@ class T2SBlock:
     def to_mask(
         self,
         x: torch.Tensor,
-        padding_mask: Optional[torch.Tensor],
+        padding_mask: torch.Tensor | None,
     ):
         if padding_mask is None:
             return x
@@ -313,7 +316,7 @@ class T2SBlock:
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
+        padding_mask: torch.Tensor | None = None,
         torch_sdpa: bool = True,
     ):
         q, k, v = F.linear(self.to_mask(x, padding_mask), self.qkv_w, self.qkv_b).chunk(3, dim=-1)
@@ -403,7 +406,7 @@ class T2SBlock:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         kv_lens: torch.Tensor,
-        sdpa_attn_mask: Optional[torch.Tensor],
+        sdpa_attn_mask: torch.Tensor | None,
         batch_index: torch.Tensor,
         next_max_kv_len: int,
     ):
@@ -442,7 +445,7 @@ class T2SBlock:
 
 @torch.jit.script
 class T2STransformer:
-    def __init__(self, num_blocks: int, blocks: List[T2SBlock]):
+    def __init__(self, num_blocks: int, blocks: list[T2SBlock]):
         self.num_blocks: int = num_blocks
         self.blocks = blocks
 
@@ -450,11 +453,11 @@ class T2STransformer:
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
+        padding_mask: torch.Tensor | None = None,
         torch_sdpa: bool = True,
     ):
-        k_cache: List[torch.Tensor] = []
-        v_cache: List[torch.Tensor] = []
+        k_cache: list[torch.Tensor] = []
+        v_cache: list[torch.Tensor] = []
         for i in range(self.num_blocks):
             x, k_cache_, v_cache_ = self.blocks[i].process_prompt(x, attn_mask, padding_mask, torch_sdpa)
             k_cache.append(k_cache_)
@@ -464,8 +467,8 @@ class T2STransformer:
     def decode_next_token(
         self,
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
         attn_mask: torch.Tensor = None,
         torch_sdpa: bool = True,
     ):
@@ -478,10 +481,10 @@ class T2STransformer:
     def decode_next_token_prealloc(
         self,
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
         kv_lens: torch.Tensor,
-        sdpa_attn_mask: Optional[torch.Tensor],
+        sdpa_attn_mask: torch.Tensor | None,
         batch_index: torch.Tensor,
         next_max_kv_len: int,
     ):
@@ -500,7 +503,7 @@ class T2STransformer:
 
 class Text2SemanticDecoder(nn.Module):
     def __init__(self, config, norm_first=False, top_k=3):
-        super(Text2SemanticDecoder, self).__init__()
+        super().__init__()
         self.model_dim = config["model"]["hidden_dim"]
         self.embedding_dim = config["model"]["embedding_dim"]
         self.num_head = config["model"]["head"]
@@ -677,7 +680,7 @@ class Text2SemanticDecoder(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask: Optional[torch.Tensor],
+        attn_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         del cls
         return _run_decode_sdpa_impl(query, key, value, attn_mask)
@@ -714,8 +717,8 @@ class Text2SemanticDecoder(nn.Module):
     def _prepare_prealloc_decode_inputs(
         x: torch.Tensor,
         kv_lens: torch.LongTensor,
-        attn_mask: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.LongTensor, int, int, Optional[torch.Tensor]]:
+        attn_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.LongTensor, int, int, torch.Tensor | None]:
         stable_x = x.clone(memory_format=torch.contiguous_format)
         batch_index = _get_cached_prealloc_batch_index(int(stable_x.shape[0]), stable_x.device)
         max_kv_index = int(kv_lens.max().item())
@@ -749,8 +752,8 @@ class Text2SemanticDecoder(nn.Module):
     def _prealloc_cudagraph_key(
         self,
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
         bucket_size: int,
     ) -> tuple[object, ...]:
         first_k = k_cache[0]
@@ -771,8 +774,8 @@ class Text2SemanticDecoder(nn.Module):
         *,
         key: tuple[object, ...],
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
         kv_lens: torch.LongTensor,
         bucket_size: int,
         stats: dict[str, Any],
@@ -786,15 +789,17 @@ class Text2SemanticDecoder(nn.Module):
         runtime_variants = [
             (
                 "eager",
-                lambda static_x, static_k_cache, static_v_cache, static_kv_lens, static_batch_index, static_mask: decode_next_token_prealloc_functional(
-                    static_x,
-                    static_k_cache,
-                    static_v_cache,
-                    static_kv_lens,
-                    static_batch_index,
-                    bucket_size,
-                    static_mask,
-                    *functional_args,
+                lambda static_x, static_k_cache, static_v_cache, static_kv_lens, static_batch_index, static_mask: (
+                    decode_next_token_prealloc_functional(
+                        static_x,
+                        static_k_cache,
+                        static_v_cache,
+                        static_kv_lens,
+                        static_batch_index,
+                        bucket_size,
+                        static_mask,
+                        *functional_args,
+                    )
                 ),
             )
         ]
@@ -855,7 +860,9 @@ class Text2SemanticDecoder(nn.Module):
                         "bucket_size": int(bucket_size),
                         "path": runtime_name,
                     }
-                    stats["pooled_prealloc_cudagraph_captures"] = int(stats.get("pooled_prealloc_cudagraph_captures", 0)) + 1
+                    stats["pooled_prealloc_cudagraph_captures"] = (
+                        int(stats.get("pooled_prealloc_cudagraph_captures", 0)) + 1
+                    )
                     stats["pooled_prealloc_cudagraph_capture_ms"] = float(
                         stats.get("pooled_prealloc_cudagraph_capture_ms", 0.0)
                     ) + ((time.perf_counter() - started_at) * 1000.0)
@@ -871,10 +878,10 @@ class Text2SemanticDecoder(nn.Module):
     def _maybe_decode_next_token_prealloc_cudagraph(
         self,
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
         kv_lens: torch.LongTensor,
-        attn_mask: Optional[torch.Tensor],
+        attn_mask: torch.Tensor | None,
     ):
         if not self._prealloc_decode_cudagraph_enabled():
             return None
@@ -970,7 +977,7 @@ class Text2SemanticDecoder(nn.Module):
         layer_k_cache: torch.Tensor,
         layer_v_cache: torch.Tensor,
         kv_lens: torch.LongTensor,
-        sdpa_attn_mask: Optional[torch.Tensor],
+        sdpa_attn_mask: torch.Tensor | None,
         batch_index: torch.LongTensor,
         max_kv_index: int,
         next_max_kv_len: int,
@@ -1008,7 +1015,9 @@ class Text2SemanticDecoder(nn.Module):
             layer.norm1.bias,
             layer.norm1.eps,
         )
-        x = x + F.linear(F.relu(F.linear(x, layer.linear1.weight, layer.linear1.bias)), layer.linear2.weight, layer.linear2.bias)
+        x = x + F.linear(
+            F.relu(F.linear(x, layer.linear1.weight, layer.linear1.bias)), layer.linear2.weight, layer.linear2.bias
+        )
         x = F.layer_norm(
             x,
             [self.model_dim],
@@ -1022,13 +1031,13 @@ class Text2SemanticDecoder(nn.Module):
     def _decode_next_token_prealloc_with_metadata(
         self,
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
         kv_lens: torch.LongTensor,
         batch_index: torch.LongTensor,
         max_kv_index: int,
         next_max_kv_len: int,
-        sdpa_attn_mask: Optional[torch.Tensor],
+        sdpa_attn_mask: torch.Tensor | None,
     ):
         if not k_cache or not v_cache:
             return x, k_cache, v_cache
@@ -1099,7 +1108,7 @@ class Text2SemanticDecoder(nn.Module):
         layer_k_cache: torch.Tensor,
         layer_v_cache: torch.Tensor,
         kv_lens: torch.LongTensor,
-        sdpa_attn_mask: Optional[torch.Tensor],
+        sdpa_attn_mask: torch.Tensor | None,
         batch_index: torch.LongTensor,
         max_kv_index: int,
         next_max_kv_len: int,
@@ -1140,8 +1149,12 @@ class Text2SemanticDecoder(nn.Module):
         q, k_context, v_context = self._profile_t2s_call(
             lambda: (
                 q.view(batch_size, 1, self.num_head, -1).transpose(1, 2),
-                layer_k_cache[:, :next_max_kv_len, :].view(batch_size, next_max_kv_len, self.num_head, -1).transpose(1, 2),
-                layer_v_cache[:, :next_max_kv_len, :].view(batch_size, next_max_kv_len, self.num_head, -1).transpose(1, 2),
+                layer_k_cache[:, :next_max_kv_len, :]
+                .view(batch_size, next_max_kv_len, self.num_head, -1)
+                .transpose(1, 2),
+                layer_v_cache[:, :next_max_kv_len, :]
+                .view(batch_size, next_max_kv_len, self.num_head, -1)
+                .transpose(1, 2),
             ),
             records=records,
             stat_key="pooled_prealloc_kv_context_ms",
@@ -1158,12 +1171,12 @@ class Text2SemanticDecoder(nn.Module):
             ),
             device=device,
         )
-        stats[f"pooled_prealloc_sdpa_{kv_bucket}_calls"] = int(
-            stats.get(f"pooled_prealloc_sdpa_{kv_bucket}_calls", 0)
-        ) + 1
-        stats[f"pooled_prealloc_sdpa_{shape_label}_calls"] = int(
-            stats.get(f"pooled_prealloc_sdpa_{shape_label}_calls", 0)
-        ) + 1
+        stats[f"pooled_prealloc_sdpa_{kv_bucket}_calls"] = (
+            int(stats.get(f"pooled_prealloc_sdpa_{kv_bucket}_calls", 0)) + 1
+        )
+        stats[f"pooled_prealloc_sdpa_{shape_label}_calls"] = (
+            int(stats.get(f"pooled_prealloc_sdpa_{shape_label}_calls", 0)) + 1
+        )
         attn = self._profile_t2s_call(
             lambda: attn.transpose(1, 2).reshape(batch_size, 1, -1),
             records=records,
@@ -1252,10 +1265,10 @@ class Text2SemanticDecoder(nn.Module):
     def decode_next_token_prealloc(
         self,
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
         kv_lens: torch.LongTensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor | None = None,
     ):
         prepared_x, batch_index, max_kv_index, next_max_kv_len, sdpa_attn_mask = self._prepare_prealloc_decode_inputs(
             x,
@@ -1277,10 +1290,10 @@ class Text2SemanticDecoder(nn.Module):
     def decode_next_token_prealloc_profiled(
         self,
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
         kv_lens: torch.LongTensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor | None = None,
     ):
         x, batch_index, max_kv_index, next_max_kv_len, sdpa_attn_mask = self._prepare_prealloc_decode_inputs(
             x,
@@ -1311,9 +1324,9 @@ class Text2SemanticDecoder(nn.Module):
         kv_bucket = self._prealloc_kv_bucket_label(next_max_kv_len)
         shape_label = f"b{batch_size}_max{next_max_kv_len}"
         for layer_index in range(self.num_layers):
-            stats[f"pooled_prealloc_layer_total_{kv_bucket}_calls"] = int(
-                stats.get(f"pooled_prealloc_layer_total_{kv_bucket}_calls", 0)
-            ) + 1
+            stats[f"pooled_prealloc_layer_total_{kv_bucket}_calls"] = (
+                int(stats.get(f"pooled_prealloc_layer_total_{kv_bucket}_calls", 0)) + 1
+            )
             x = self._profile_t2s_call(
                 lambda: self._decode_block_next_token_prealloc_profiled(
                     self.h.layers[layer_index],
@@ -1346,10 +1359,10 @@ class Text2SemanticDecoder(nn.Module):
     def decode_next_token_prealloc_runtime(
         self,
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
         kv_lens: torch.LongTensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor | None = None,
     ):
         if self._profile_prealloc_decode_enabled():
             return self.decode_next_token_prealloc_profiled(x, k_cache, v_cache, kv_lens, attn_mask)
@@ -1411,7 +1424,7 @@ class Text2SemanticDecoder(nn.Module):
         x: torch.Tensor,
         layer_k_cache: torch.Tensor,
         layer_v_cache: torch.Tensor,
-        attn_mask: Optional[torch.Tensor],
+        attn_mask: torch.Tensor | None,
         *,
         records: list[tuple[str, torch.cuda.Event | None, torch.cuda.Event | float]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1506,9 +1519,9 @@ class Text2SemanticDecoder(nn.Module):
     def decode_next_token_dynamic_profiled(
         self,
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
-        attn_mask: Optional[torch.Tensor] = None,
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
+        attn_mask: torch.Tensor | None = None,
     ):
         stats: dict[str, float | int] = {
             "dynamic_profiled_decode_calls": 1,
@@ -1551,9 +1564,9 @@ class Text2SemanticDecoder(nn.Module):
     def decode_next_token_dynamic_runtime(
         self,
         x: torch.Tensor,
-        k_cache: List[torch.Tensor],
-        v_cache: List[torch.Tensor],
-        attn_mask: Optional[torch.Tensor] = None,
+        k_cache: list[torch.Tensor],
+        v_cache: list[torch.Tensor],
+        attn_mask: torch.Tensor | None = None,
     ):
         if self._profile_dynamic_decode_enabled():
             return self.decode_next_token_dynamic_profiled(x, k_cache, v_cache, attn_mask)
@@ -1628,7 +1641,7 @@ class Text2SemanticDecoder(nn.Module):
             mask=xy_attn_mask,
         )
         x_len = x_lens.max()
-        logits = self.ar_predict_layer(xy_dec[:, x_len-1:])
+        logits = self.ar_predict_layer(xy_dec[:, x_len - 1 :])
 
         ###### DPO #############
         reject_xy_pos, reject_xy_attn_mask, reject_targets = self.make_input_data(
@@ -1640,7 +1653,7 @@ class Text2SemanticDecoder(nn.Module):
             mask=reject_xy_attn_mask,
         )
         x_len = x_lens.max()
-        reject_logits = self.ar_predict_layer(reject_xy_dec[:, x_len-1:])
+        reject_logits = self.ar_predict_layer(reject_xy_dec[:, x_len - 1 :])
 
         # loss
         # from feiteng: 每次 duration 越多, 梯度更新也应该更多, 所以用 sum
@@ -1710,7 +1723,7 @@ class Text2SemanticDecoder(nn.Module):
             (xy_pos, None),
             mask=xy_attn_mask,
         )
-        logits = self.ar_predict_layer(xy_dec[:, x_len-1:]).permute(0, 2, 1)
+        logits = self.ar_predict_layer(xy_dec[:, x_len - 1 :]).permute(0, 2, 1)
         # loss
         # from feiteng: 每次 duration 越多, 梯度更新也应该更多, 所以用 sum
         loss = F.cross_entropy(logits, targets, reduction="sum")
@@ -1790,10 +1803,10 @@ class Text2SemanticDecoder(nn.Module):
 
     def infer_panel_batch_infer(
         self,
-        x: List[torch.LongTensor],  #####全部文本token
+        x: list[torch.LongTensor],  #####全部文本token
         x_lens: torch.LongTensor,
         prompts: torch.LongTensor,  ####参考音频token
-        bert_feature: List[torch.LongTensor],
+        bert_feature: list[torch.LongTensor],
         top_k: int = -100,
         top_p: int = 100,
         early_stop_num: int = -1,
@@ -1945,7 +1958,7 @@ class Text2SemanticDecoder(nn.Module):
                     decode_attn_mask = attn_mask
 
             if idx < 11:  ###至少预测出10个token不然不给停止（0.4s）
-                logits = logits[:, :-1] 
+                logits = logits[:, :-1]
 
             samples = sample(
                 logits, y, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature
@@ -1960,8 +1973,8 @@ class Text2SemanticDecoder(nn.Module):
                 l1 = samples[:, 0] == self.EOS
                 l2 = tokens == self.EOS
                 l = l1.logical_or(l2)
-                removed_idx_of_batch_for_y = torch.where(l == True)[0].tolist()
-                reserved_idx_of_batch_for_y = torch.where(l == False)[0]
+                removed_idx_of_batch_for_y = torch.where(l)[0].tolist()
+                reserved_idx_of_batch_for_y = torch.where(not l)[0]
                 # batch_indexs = torch.tensor(batch_idx_map, device=y.device)[removed_idx_of_batch_for_y]
                 for i in removed_idx_of_batch_for_y:
                     batch_index = batch_idx_map[i]
@@ -2030,10 +2043,10 @@ class Text2SemanticDecoder(nn.Module):
 
     def infer_panel_naive_batched(
         self,
-        x: List[torch.LongTensor],  #####全部文本token
+        x: list[torch.LongTensor],  #####全部文本token
         x_lens: torch.LongTensor,
         prompts: torch.LongTensor,  ####参考音频token
-        bert_feature: List[torch.LongTensor],
+        bert_feature: list[torch.LongTensor],
         top_k: int = -100,
         top_p: int = 100,
         early_stop_num: int = -1,
@@ -2044,18 +2057,20 @@ class Text2SemanticDecoder(nn.Module):
         y_list = []
         idx_list = []
         for i in range(len(x)):
-            y, idx = next(self.infer_panel_naive(
-                x[i].unsqueeze(0),
-                x_lens[i],
-                prompts[i].unsqueeze(0) if prompts is not None else None,
-                bert_feature[i].unsqueeze(0),
-                top_k,
-                top_p,
-                early_stop_num,
-                temperature,
-                repetition_penalty,
-                **kwargs,
-            ))
+            y, idx = next(
+                self.infer_panel_naive(
+                    x[i].unsqueeze(0),
+                    x_lens[i],
+                    prompts[i].unsqueeze(0) if prompts is not None else None,
+                    bert_feature[i].unsqueeze(0),
+                    top_k,
+                    top_p,
+                    early_stop_num,
+                    temperature,
+                    repetition_penalty,
+                    **kwargs,
+                )
+            )
             y_list.append(y[0])
             idx_list.append(idx)
 
@@ -2088,9 +2103,8 @@ class Text2SemanticDecoder(nn.Module):
         **kwargs,
     ):
         mute_emb_sim_matrix = kwargs.get("mute_emb_sim_matrix", None)
-        chunk_split_thershold = kwargs.get("chunk_split_thershold", 0.3)
+        chunk_split_threshold = kwargs.get("chunk_split_threshold", 0.3)
         check_token_num = 2
-
 
         x = self.ar_text_embedding(x)
         x = x + self.bert_proj(bert_feature.transpose(1, 2))
@@ -2146,7 +2160,7 @@ class Text2SemanticDecoder(nn.Module):
         token_counter = 0
         curr_ptr = prefix_len
         for idx in tqdm(range(1500)):
-            token_counter+=1
+            token_counter += 1
             if xy_attn_mask is not None:
                 xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, xy_attn_mask, None)
             else:
@@ -2171,7 +2185,7 @@ class Text2SemanticDecoder(nn.Module):
 
             if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:
                 stop = True
-                y=y[:, :-1]
+                y = y[:, :-1]
                 token_counter -= 1
 
             if idx == 1499:
@@ -2183,37 +2197,35 @@ class Text2SemanticDecoder(nn.Module):
                     print("bad zero prediction")
                 # print(f"T2S Decoding EOS [{prefix_len} -> {y.shape[1]}]")
                 if streaming_mode:
-                    yield y[:, curr_ptr:] if curr_ptr<y.shape[1] else None, True
+                    yield y[:, curr_ptr:] if curr_ptr < y.shape[1] else None, True
                 break
 
-
-            if streaming_mode and (mute_emb_sim_matrix is not None) and (token_counter >= chunk_length+check_token_num):
-                score = mute_emb_sim_matrix[y[0, curr_ptr:]] - chunk_split_thershold
-                score[score<0]=-1
-                score[:-1]=score[:-1]+score[1:] ##考虑连续两个token
+            if (
+                streaming_mode
+                and (mute_emb_sim_matrix is not None)
+                and (token_counter >= chunk_length + check_token_num)
+            ):
+                score = mute_emb_sim_matrix[y[0, curr_ptr:]] - chunk_split_threshold
+                score[score < 0] = -1
+                score[:-1] = score[:-1] + score[1:]  ##考虑连续两个token
                 argmax_idx = score.argmax()
 
-                if score[argmax_idx]>=0 and argmax_idx+1>=chunk_length: 
+                if score[argmax_idx] >= 0 and argmax_idx + 1 >= chunk_length:
                     print(f"\n\ncurr_ptr:{curr_ptr}")
                     yield y[:, curr_ptr:], False
-                    token_counter -= argmax_idx+1
-                    curr_ptr += argmax_idx+1
-
+                    token_counter -= argmax_idx + 1
+                    curr_ptr += argmax_idx + 1
 
             elif streaming_mode and (mute_emb_sim_matrix is None) and (token_counter >= chunk_length):
                 yield y[:, -token_counter:], False
-                curr_ptr+=token_counter
+                curr_ptr += token_counter
                 token_counter = 0
-                
-
 
             ####################### update next step ###################################
             y_emb = self.ar_audio_embedding(y[:, -1:])
             xy_pos = y_emb * self.ar_audio_position.x_scale + self.ar_audio_position.alpha * self.ar_audio_position.pe[
                 :, y_len + idx
             ].to(dtype=y_emb.dtype, device=y_emb.device)
-
-
 
         if not streaming_mode:
             generated_token_count = max(int(y.shape[1] - prefix_len), 0)
@@ -2232,8 +2244,6 @@ class Text2SemanticDecoder(nn.Module):
                 yield y, 0
             yield y, idx
 
-
-
     def infer_panel(
         self,
         x: torch.LongTensor,  #####全部文本token
@@ -2247,6 +2257,17 @@ class Text2SemanticDecoder(nn.Module):
         repetition_penalty: float = 1.35,
         **kwargs,
     ):
-        return next(self.infer_panel_naive(
-            x, x_lens, prompts, bert_feature, top_k, top_p, early_stop_num, temperature, repetition_penalty, **kwargs
-        ))
+        return next(
+            self.infer_panel_naive(
+                x,
+                x_lens,
+                prompts,
+                bert_feature,
+                top_k,
+                top_p,
+                early_stop_num,
+                temperature,
+                repetition_penalty,
+                **kwargs,
+            )
+        )

@@ -24,7 +24,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TEMP_ROOT = REPO_ROOT / "TEMP"
 DEFAULT_TEXT_PATH = REPO_ROOT / "test_cn.txt"
@@ -190,11 +189,12 @@ def _inner_dump_backend(args: argparse.Namespace) -> int:
 
     import re
     import time
+
     from text import chinese2
 
     text = _read_text(Path(args.text_path).resolve())
     normalized = chinese2.text_normalize(text)
-    pattern = r"(?<=[{0}])\s*".format("".join(chinese2.punctuation))
+    pattern = r"(?<=[{}])\s*".format("".join(chinese2.punctuation))
     segments = [item for item in re.split(pattern, normalized) if item.strip()]
     prepared_segments, batch_inputs = chinese2._prepare_g2p_segments(list(segments))
 
@@ -249,7 +249,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--backend-a", default=DEFAULT_BACKENDS[0], choices=["g2pw", "g2pm", "pypinyin"])
     parser.add_argument("--backend-b", default=DEFAULT_BACKENDS[1], choices=["g2pw", "g2pm", "pypinyin"])
     parser.add_argument("--text-path", type=Path, default=DEFAULT_TEXT_PATH)
-    parser.add_argument("--project-root", type=Path, default=REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "gpt_sovits" / "runtime_lib")
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "gpt_sovits" / "runtime_lib",
+    )
     parser.add_argument("--repeat-until-chars", type=int, default=0)
     parser.add_argument("--output-json", type=Path, default=DEFAULT_OUTPUT_JSON)
     parser.add_argument("--max-examples", type=int, default=50)

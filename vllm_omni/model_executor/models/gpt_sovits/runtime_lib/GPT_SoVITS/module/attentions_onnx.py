@@ -1,11 +1,10 @@
 import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from module import commons
-
-from typing import Optional
 
 
 class LayerNorm(nn.Module):
@@ -180,7 +179,7 @@ class MultiHeadAttention(nn.Module):
                 self.conv_k.weight.copy_(self.conv_q.weight)
                 self.conv_k.bias.copy_(self.conv_q.bias)
 
-    def forward(self, x, c, attn_mask: Optional[torch.Tensor] = None):
+    def forward(self, x, c, attn_mask: torch.Tensor | None = None):
         q = self.conv_q(x)
         k = self.conv_k(c)
         v = self.conv_v(c)
@@ -191,7 +190,7 @@ class MultiHeadAttention(nn.Module):
         x = self.conv_o(x)
         return x
 
-    def attention(self, query, key, value, mask: Optional[torch.Tensor] = None):
+    def attention(self, query, key, value, mask: torch.Tensor | None = None):
         # reshape [b, d, t] -> [b, n_h, t, d_k]
         b, d, t_s, _ = (*key.size(), query.size(2))
         query = query.view(b, self.n_heads, self.k_channels, -1).transpose(2, 3)
@@ -239,7 +238,7 @@ class MultiHeadAttention(nn.Module):
         return ret
 
     def _get_relative_embeddings(self, relative_embeddings, length):
-        max_relative_position = 2 * self.window_size + 1
+        2 * self.window_size + 1
         # Pad first before slice to avoid using cond ops.
         pad_l = torch.zeros((1), dtype=torch.int64) + length - (self.window_size + 1)
         pad_s = torch.zeros((1), dtype=torch.int64) + (self.window_size + 1) - length
@@ -369,7 +368,7 @@ class MRTE(nn.Module):
         n_heads=4,
         ge_layer=2,
     ):
-        super(MRTE, self).__init__()
+        super().__init__()
         self.cross_attention = MultiHeadAttention(hidden_size, hidden_size, n_heads)
         self.c_pre = nn.Conv1d(content_enc_channels, hidden_size, 1)
         self.text_pre = nn.Conv1d(content_enc_channels, hidden_size, 1)

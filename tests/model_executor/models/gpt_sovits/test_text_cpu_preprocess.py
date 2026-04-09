@@ -4,7 +4,6 @@ import importlib
 import sys
 from pathlib import Path
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _VENDORED_GPT_SOVITS_RUNTIME_ROOT = (
     _REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "gpt_sovits" / "runtime_lib"

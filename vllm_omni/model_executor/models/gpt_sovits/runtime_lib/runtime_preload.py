@@ -10,15 +10,11 @@ def configure_model_runtime_environment() -> dict:
     if _RUNTIME_ENV_STATE is not None:
         return dict(_RUNTIME_ENV_STATE)
 
-    cache_root = Path(
-        os.environ.get("GPTSOVITS_RUNTIME_CACHE_ROOT", "/home/waas/gptsovits_cache")
-    ).expanduser()
+    cache_root = Path(os.environ.get("GPTSOVITS_RUNTIME_CACHE_ROOT", "/home/waas/gptsovits_cache")).expanduser()
     torchinductor_cache_dir = Path(
         os.environ.get("TORCHINDUCTOR_CACHE_DIR", str(cache_root / "torchinductor"))
     ).expanduser()
-    triton_cache_dir = Path(
-        os.environ.get("TRITON_CACHE_DIR", str(cache_root / "triton"))
-    ).expanduser()
+    triton_cache_dir = Path(os.environ.get("TRITON_CACHE_DIR", str(cache_root / "triton"))).expanduser()
 
     torchinductor_cache_dir.mkdir(parents=True, exist_ok=True)
     triton_cache_dir.mkdir(parents=True, exist_ok=True)

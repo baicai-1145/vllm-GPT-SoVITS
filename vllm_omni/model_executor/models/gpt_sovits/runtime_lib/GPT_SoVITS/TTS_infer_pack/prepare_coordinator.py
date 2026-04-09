@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from GPT_SoVITS.TTS_infer_pack.t2s_scheduler import (
     PreparedTextFeatures,
@@ -24,7 +24,7 @@ class ProfiledResult:
     submit_at: float
     started_at: float
     finished_at: float
-    profile: Dict[str, float] | None = None
+    profile: dict[str, float] | None = None
 
     @property
     def queue_ms(self) -> float:
@@ -54,7 +54,7 @@ class PreparedRefAudioAsset:
     raw_audio: Any
     raw_sr: int
     wav16k: Any
-    profile: Dict[str, float] = field(default_factory=dict)
+    profile: dict[str, float] = field(default_factory=dict)
 
 
 class AsyncStageGate:
@@ -68,7 +68,7 @@ class AsyncStageGate:
         self.total_wait_ms = 0.0
         self.wait_peak_ms = 0.0
 
-    async def acquire(self) -> Dict[str, float]:
+    async def acquire(self) -> dict[str, float]:
         wait_start = time.perf_counter()
         while True:
             with self.lock:
@@ -91,7 +91,7 @@ class AsyncStageGate:
         with self.lock:
             self.inflight = max(0, self.inflight - 1)
 
-    def snapshot(self) -> Dict[str, float]:
+    def snapshot(self) -> dict[str, float]:
         with self.lock:
             return {
                 "max_inflight": float(self.max_inflight),
@@ -114,7 +114,7 @@ class RuntimePrepareCoordinatorAdapter:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._native(), name)
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self) -> dict[str, Any]:
         coordinator = self._native()
         runtime_state = getattr(self.tts, "snapshot_prepare_runtime_components", lambda: None)()
         g2pw_state = runtime_state.get("g2pw") if isinstance(runtime_state, dict) else None
@@ -134,7 +134,7 @@ class RuntimePrepareCoordinatorAdapter:
             except Exception:
                 return 0
 
-        def _gate_snapshot(gate: Any) -> Dict[str, float]:
+        def _gate_snapshot(gate: Any) -> dict[str, float]:
             if hasattr(gate, "snapshot"):
                 try:
                     return dict(gate.snapshot())
@@ -170,7 +170,7 @@ class RuntimePrepareCoordinatorAdapter:
         }
 
     @staticmethod
-    def _phase_one_to_dict(phase_one: Any) -> Dict[str, Any]:
+    def _phase_one_to_dict(phase_one: Any) -> dict[str, Any]:
         if isinstance(phase_one, dict):
             return dict(phase_one)
         return {
@@ -183,7 +183,7 @@ class RuntimePrepareCoordinatorAdapter:
         }
 
     @staticmethod
-    def _phase_two_to_dict(phase_two: Any) -> Dict[str, Any]:
+    def _phase_two_to_dict(phase_two: Any) -> dict[str, Any]:
         if isinstance(phase_two, dict):
             return dict(phase_two)
         return {
@@ -236,7 +236,7 @@ class RuntimePrepareCoordinatorAdapter:
         self,
         cpu_stages: list[Any],
         prepared_ref_audio_futures: list[concurrent.futures.Future | None] | None = None,
-    ) -> list[Dict[str, Any] | Exception]:
+    ) -> list[dict[str, Any] | Exception]:
         if not cpu_stages:
             return []
         coordinator = self.runtime_owner._ensure_prepare_coordinator()
@@ -246,20 +246,23 @@ class RuntimePrepareCoordinatorAdapter:
                     setattr(cpu_stage, "ref_audio_prepare_future", prepared_ref_audio_future)
         if coordinator.enable_g2pw_audio_batch_merge and len(cpu_stages) > 1:
             phase_ones = await self.runtime_owner._prepare_gpu_audio_phase_batch_async(coordinator, cpu_stages)
-            return [self._phase_one_to_dict(phase_one) if not isinstance(phase_one, Exception) else phase_one for phase_one in phase_ones]
+            return [
+                self._phase_one_to_dict(phase_one) if not isinstance(phase_one, Exception) else phase_one
+                for phase_one in phase_ones
+            ]
         phase_ones = await asyncio.gather(
-            *[
-                self.runtime_owner._prepare_gpu_audio_phase_async(coordinator, cpu_stage)
-                for cpu_stage in cpu_stages
-            ],
+            *[self.runtime_owner._prepare_gpu_audio_phase_async(coordinator, cpu_stage) for cpu_stage in cpu_stages],
             return_exceptions=True,
         )
-        return [self._phase_one_to_dict(phase_one) if not isinstance(phase_one, Exception) else phase_one for phase_one in phase_ones]
+        return [
+            self._phase_one_to_dict(phase_one) if not isinstance(phase_one, Exception) else phase_one
+            for phase_one in phase_ones
+        ]
 
     async def prepare_gpu_text_phases_async(
         self,
-        items: list[tuple[Any, Dict[str, Any]]],
-    ) -> list[Dict[str, Any] | Exception]:
+        items: list[tuple[Any, dict[str, Any]]],
+    ) -> list[dict[str, Any] | Exception]:
         if not items:
             return []
         coordinator = self.runtime_owner._ensure_prepare_coordinator()
@@ -271,7 +274,11 @@ class RuntimePrepareCoordinatorAdapter:
                 self.runtime_owner._prepare_gpu_text_phase_async(
                     coordinator,
                     GPTSoVITSPreparedAudioPhase(
-                        request_id=str(getattr(cpu_stage, "request_id", getattr(getattr(cpu_stage, "spec", None), "request_id", ""))),
+                        request_id=str(
+                            getattr(
+                                cpu_stage, "request_id", getattr(getattr(cpu_stage, "spec", None), "request_id", "")
+                            )
+                        ),
                         prepared_cpu_stage=cpu_stage,
                         phase_one=self._phase_one_to_native(phase_one)[0],
                     ),
@@ -280,17 +287,20 @@ class RuntimePrepareCoordinatorAdapter:
             ],
             return_exceptions=True,
         )
-        return [self._phase_two_to_dict(phase_two) if not isinstance(phase_two, Exception) else phase_two for phase_two in phase_twos]
+        return [
+            self._phase_two_to_dict(phase_two) if not isinstance(phase_two, Exception) else phase_two
+            for phase_two in phase_twos
+        ]
 
     async def prepare_ref_spec_stages_async(
         self,
-        phase_ones: list[Dict[str, Any]],
-    ) -> list[tuple[tuple[Any, Any], Dict[str, float]] | Exception]:
+        phase_ones: list[dict[str, Any]],
+    ) -> list[tuple[tuple[Any, Any], dict[str, float]] | Exception]:
         if not phase_ones:
             return []
         coordinator = self.runtime_owner._ensure_prepare_coordinator()
 
-        async def _one(phase_one: Dict[str, Any]):
+        async def _one(phase_one: dict[str, Any]):
             ref_audio_profiled = phase_one["ref_audio_profiled"]
             raw_audio = ref_audio_profiled.result.raw_audio
             raw_sr = int(ref_audio_profiled.result.raw_sr)
@@ -307,7 +317,7 @@ class RuntimePrepareCoordinatorAdapter:
     def apply_ref_spec_result_to_state(
         self,
         state: T2SRequestState,
-        ref_spec_result: tuple[tuple[Any, Any], Dict[str, float]],
+        ref_spec_result: tuple[tuple[Any, Any], dict[str, float]],
     ) -> None:
         refer_spec, profile = ref_spec_result
         state.refer_spec = refer_spec
@@ -322,9 +332,9 @@ class RuntimePrepareCoordinatorAdapter:
     def build_gpu_prepare_result_from_phases(
         self,
         cpu_stage: Any,
-        phase_one: Dict[str, Any],
-        phase_two: Dict[str, Any],
-        extra_profile: Dict[str, float] | None = None,
+        phase_one: dict[str, Any],
+        phase_two: dict[str, Any],
+        extra_profile: dict[str, float] | None = None,
     ) -> tuple[T2SRequestState, float, float]:
         coordinator = self.runtime_owner._ensure_prepare_coordinator()
         native_phase_one, ref_spec_result = self._phase_one_to_native(phase_one)
@@ -376,7 +386,7 @@ class RuntimePrepareCoordinatorAdapter:
         if not cpu_stages:
             return []
         phase_ones = await self.prepare_gpu_audio_phases_async(cpu_stages)
-        items: list[tuple[Any, Dict[str, Any]]] = []
+        items: list[tuple[Any, dict[str, Any]]] = []
         outputs: list[tuple[T2SRequestState, float, float] | Exception | None] = [None] * len(cpu_stages)
         for index, (cpu_stage, phase_one) in enumerate(zip(cpu_stages, phase_ones)):
             if isinstance(phase_one, Exception):
@@ -434,10 +444,7 @@ class RuntimePrepareCoordinatorAdapter:
             )
         return list(
             await asyncio.gather(
-                *[
-                    self.prepare_state_profiled_async(spec, time.perf_counter())
-                    for spec in specs
-                ],
+                *[self.prepare_state_profiled_async(spec, time.perf_counter()) for spec in specs],
                 return_exceptions=True,
             )
         )
@@ -507,8 +514,8 @@ class PrepareCoordinator:
             int(os.environ.get("GPTSOVITS_PREPARE_REF_AUDIO_ASSET_CACHE_MAX_ENTRIES", "4")),
         )
         self.ref_audio_asset_lock = threading.Lock()
-        self.ref_audio_asset_inflight: Dict[str, concurrent.futures.Future] = {}
-        self.ref_audio_asset_cache: Dict[str, Tuple[PreparedRefAudioAsset, float]] = {}
+        self.ref_audio_asset_inflight: dict[str, concurrent.futures.Future] = {}
+        self.ref_audio_asset_cache: dict[str, tuple[PreparedRefAudioAsset, float]] = {}
         self.use_async_text_feature_path = bool(
             getattr(tts, "prepare_bert_batch_worker", None) is not None
             and os.environ.get("GPTSOVITS_PREPARE_TEXT_FEATURE_DIRECT", "1") != "0"
@@ -562,9 +569,7 @@ class PrepareCoordinator:
         # Keeping this gate coupled to worker_count would cap queue formation and defeat batching.
         text_cpu_gate_default = 0
         g2pw_gate_default = (
-            int(self.g2pw_runtime_workers)
-            if self.g2pw_runtime_workers is not None
-            else max(0, int(self.g2pw_workers))
+            int(self.g2pw_runtime_workers) if self.g2pw_runtime_workers is not None else max(0, int(self.g2pw_workers))
         )
         text_feature_gate_default = max(0, int(self.text_feature_workers))
         ref_audio_gate_default = max(0, int(self.ref_audio_workers))
@@ -593,7 +598,7 @@ class PrepareCoordinator:
             poll_ms=gate_poll_ms,
         )
 
-    def _mark_enter(self) -> Tuple[int, int]:
+    def _mark_enter(self) -> tuple[int, int]:
         with self.lock:
             self.inflight += 1
             current_inflight = self.inflight
@@ -605,17 +610,15 @@ class PrepareCoordinator:
         with self.lock:
             self.inflight = max(0, self.inflight - 1)
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            snapshot: Dict[str, Any] = {
+            snapshot: dict[str, Any] = {
                 "inflight": int(self.inflight),
                 "peak_inflight": int(self.peak_inflight),
                 "max_inflight": int(self.max_inflight),
                 "text_feature_workers": int(self.text_feature_workers),
                 "g2pw_workers": int(self.g2pw_workers),
-                "g2pw_runtime_workers": (
-                    None if self.g2pw_runtime_workers is None else int(self.g2pw_runtime_workers)
-                ),
+                "g2pw_runtime_workers": (None if self.g2pw_runtime_workers is None else int(self.g2pw_runtime_workers)),
                 "ref_audio_workers": int(self.ref_audio_workers),
             }
         with self.ref_audio_asset_lock:
@@ -654,12 +657,12 @@ class PrepareCoordinator:
         return self.tts.prepare_text_segments(text, language)
 
     def _resolve_g2pw_segments(self, prepared_segments):
-        profile: Dict[str, float] = {}
+        profile: dict[str, float] = {}
         resolved_segments = self.tts.resolve_g2pw_segments(prepared_segments, profile=profile)
         return resolved_segments, profile
 
     def _resolve_g2pw_segment_batches(self, prepared_segment_batches):
-        profiles: List[Dict[str, float]] = [{} for _ in prepared_segment_batches]
+        profiles: List[dict[str, float]] = [{} for _ in prepared_segment_batches]
         resolved_batches = self.tts.resolve_g2pw_segments_batch(prepared_segment_batches, profiles=profiles)
         return resolved_batches, profiles
 
@@ -694,7 +697,7 @@ class PrepareCoordinator:
     def _clone_prepared_ref_audio_asset(
         asset: PreparedRefAudioAsset,
         *,
-        extra_profile: Dict[str, float] | None = None,
+        extra_profile: dict[str, float] | None = None,
     ) -> PreparedRefAudioAsset:
         profile = dict(asset.profile or {})
         if extra_profile:
@@ -713,9 +716,7 @@ class PrepareCoordinator:
             self.ref_audio_asset_cache.clear()
             return
         expired_keys = [
-            key
-            for key, (_, cached_at) in self.ref_audio_asset_cache.items()
-            if (now_ts - float(cached_at)) > ttl_sec
+            key for key, (_, cached_at) in self.ref_audio_asset_cache.items() if (now_ts - float(cached_at)) > ttl_sec
         ]
         for key in expired_keys:
             self.ref_audio_asset_cache.pop(key, None)
@@ -830,9 +831,7 @@ class PrepareCoordinator:
                 "prompt_semantic_pack_ms": 0.0,
                 "prompt_semantic_h2d_ms": float(runtime_profile.get("prompt_semantic_h2d_ms", 0.0)),
                 "prompt_semantic_ssl_forward_ms": float(runtime_profile.get("prompt_semantic_ssl_forward_ms", 0.0)),
-                "prompt_semantic_hidden_length_ms": float(
-                    runtime_profile.get("prompt_semantic_hidden_length_ms", 0.0)
-                ),
+                "prompt_semantic_hidden_length_ms": float(runtime_profile.get("prompt_semantic_hidden_length_ms", 0.0)),
                 "prompt_semantic_extract_latent_ms": float(
                     runtime_profile.get("prompt_semantic_extract_latent_ms", 0.0)
                 ),
@@ -845,7 +844,9 @@ class PrepareCoordinator:
                 "ref_spec_wait_ms": 0.0,
                 "ref_spec_ms": 0.0,
                 "bundle_total_ms": float(
-                    cpu_prepare_ms + runtime_profile.get("prompt_semantic_forward_ms", 0.0) + stage_stats.get("wait_ms", 0.0)
+                    cpu_prepare_ms
+                    + runtime_profile.get("prompt_semantic_forward_ms", 0.0)
+                    + stage_stats.get("wait_ms", 0.0)
                 ),
             },
         }
@@ -874,12 +875,14 @@ class PrepareCoordinator:
         prepared_segments,
         language: str,
         cpu_run_ms: float,
-        base_profile: Dict[str, float] | None = None,
+        base_profile: dict[str, float] | None = None,
     ) -> PreparedTextFeatures:
-        profile: Dict[str, float] = dict(base_profile or {})
+        profile: dict[str, float] = dict(base_profile or {})
         profile["cpu_preprocess_ms"] = float(cpu_run_ms)
         branch_start = time.perf_counter()
-        phones, bert_features, norm_text = self.tts.build_text_features_from_segments(prepared_segments, profile=profile)
+        phones, bert_features, norm_text = self.tts.build_text_features_from_segments(
+            prepared_segments, profile=profile
+        )
         total_ms = float(cpu_run_ms + (time.perf_counter() - branch_start) * 1000.0)
         profile["bert_total_ms"] = max(0.0, total_ms - float(cpu_run_ms))
         return PreparedTextFeatures(
@@ -955,7 +958,7 @@ class PrepareCoordinator:
     def _build_text_cpu_profiled_result(
         submit_at: float,
         result: Any,
-        worker_profile: Dict[str, float],
+        worker_profile: dict[str, float],
     ) -> ProfiledResult:
         started_at = float(
             submit_at
@@ -1063,7 +1066,7 @@ class PrepareCoordinator:
         prepared_segments,
         language: str | None,
         cpu_run_ms: float,
-        base_profile: Dict[str, float] | None = None,
+        base_profile: dict[str, float] | None = None,
     ) -> ProfiledResult:
         if self.text_feature_executor is not None:
             await self.text_feature_gate.acquire()
@@ -1080,7 +1083,7 @@ class PrepareCoordinator:
                 self.text_feature_gate.release()
 
         await self.text_feature_gate.acquire()
-        profile: Dict[str, float] = dict(base_profile or {})
+        profile: dict[str, float] = dict(base_profile or {})
         profile["cpu_preprocess_ms"] = float(cpu_run_ms)
         submit_at = time.perf_counter()
         started_at = float(submit_at)
@@ -1142,9 +1145,9 @@ class PrepareCoordinator:
 
     @staticmethod
     def _merge_g2pw_pair_stage_profile(
-        profile: Dict[str, float] | None,
-        pair_profile: Dict[str, float],
-    ) -> Dict[str, float]:
+        profile: dict[str, float] | None,
+        pair_profile: dict[str, float],
+    ) -> dict[str, float]:
         merged = dict(profile or {})
         for key, value in pair_profile.items():
             merged[key] = float(value)
@@ -1157,9 +1160,14 @@ class PrepareCoordinator:
         target_has_pending = any(bool(getattr(segment, "needs_g2pw", False)) for segment in (target_segments or []))
         g2pw_batch_worker = getattr(self.tts, "prepare_g2pw_batch_worker", None)
         if g2pw_batch_worker is not None and (prompt_has_pending or target_has_pending):
-            resolved_batches, batch_profiles, worker_profile, submit_at, started_at, finished_at = (
-                await g2pw_batch_worker.submit_async([prompt_segments or [], target_segments or []])
-            )
+            (
+                resolved_batches,
+                batch_profiles,
+                worker_profile,
+                submit_at,
+                started_at,
+                finished_at,
+            ) = await g2pw_batch_worker.submit_async([prompt_segments or [], target_segments or []])
             prompt_result, target_result = resolved_batches
             prompt_profile, target_profile = batch_profiles
             pair_finished_at = time.perf_counter()
@@ -1425,7 +1433,7 @@ class PrepareCoordinator:
     async def _prepare_gpu_phase_one_batch(
         self,
         cpu_stages: list[PreparedCpuStage],
-    ) -> list[Dict[str, Any] | Exception]:
+    ) -> list[dict[str, Any] | Exception]:
         if not cpu_stages:
             return []
         phase_start = time.perf_counter()
@@ -1443,7 +1451,7 @@ class PrepareCoordinator:
                     g2pw_pairs[start_index + offset] = group_pair
             g2pw_pair_end = time.perf_counter()
             ref_audio_results = await asyncio.gather(*ref_audio_tasks, return_exceptions=True)
-            outputs: list[Dict[str, Any] | Exception] = []
+            outputs: list[dict[str, Any] | Exception] = []
             for cpu_stage, g2pw_pair, ref_audio_profiled in zip(cpu_stages, g2pw_pairs, ref_audio_results):
                 if isinstance(g2pw_pair, Exception):
                     outputs.append(g2pw_pair)
@@ -1471,7 +1479,7 @@ class PrepareCoordinator:
                 task.cancel()
 
     @staticmethod
-    def _estimate_text_feature_run_ms(profile: Dict[str, float]) -> float:
+    def _estimate_text_feature_run_ms(profile: dict[str, float]) -> float:
         return float(
             profile.get("bert_wait_ms", 0.0)
             + profile.get("bert_tokenize_ms", 0.0)
@@ -1485,8 +1493,8 @@ class PrepareCoordinator:
         target_segments,
         prompt_cpu_run_ms: float,
         target_cpu_run_ms: float,
-        prompt_base_profile: Dict[str, float] | None = None,
-        target_base_profile: Dict[str, float] | None = None,
+        prompt_base_profile: dict[str, float] | None = None,
+        target_base_profile: dict[str, float] | None = None,
     ) -> tuple[ProfiledResult, ProfiledResult]:
         prompt_is_empty = len(prompt_segments or []) == 0
         if self.text_feature_executor is not None:
@@ -1523,7 +1531,7 @@ class PrepareCoordinator:
             return prompt_profiled, target_profiled
 
         await self.text_feature_gate.acquire()
-        target_profile: Dict[str, float] = dict(target_base_profile or {})
+        target_profile: dict[str, float] = dict(target_base_profile or {})
         target_profile["cpu_preprocess_ms"] = float(target_cpu_run_ms)
         submit_at = time.perf_counter()
         started_at = float(submit_at)
@@ -1573,7 +1581,7 @@ class PrepareCoordinator:
                     target_result.profile["bert_total_ms"] = self._estimate_text_feature_run_ms(target_profile)
                 return prompt_profiled, target_profiled
 
-            prompt_profile: Dict[str, float] = dict(prompt_base_profile or {})
+            prompt_profile: dict[str, float] = dict(prompt_base_profile or {})
             prompt_profile["cpu_preprocess_ms"] = float(prompt_cpu_run_ms)
             prompt_result_raw, target_result_raw = await self.tts.build_text_feature_pair_from_segments_async(
                 prompt_segments,
@@ -1650,7 +1658,9 @@ class PrepareCoordinator:
             if preload_profiled is None:
                 await self.ref_load_gate.acquire()
                 try:
-                    load_profiled = await self._run_on_executor(self.ref_audio_executor, self._load_ref_audio_raw, ref_audio_path)
+                    load_profiled = await self._run_on_executor(
+                        self.ref_audio_executor, self._load_ref_audio_raw, ref_audio_path
+                    )
                 finally:
                     self.ref_load_gate.release()
                 raw_audio, raw_sr = load_profiled.result
@@ -1672,9 +1682,7 @@ class PrepareCoordinator:
                 load_ms = float(preload_profile.get("audio_load_ms", 0.0))
                 cpu_prepare_wait_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0))
                 cpu_prepare_slots = float(preload_profile.get("prompt_semantic_cpu_prepare_slots", 0.0))
-                cpu_prepare_inflight_peak = float(
-                    preload_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0)
-                )
+                cpu_prepare_inflight_peak = float(preload_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0))
                 preload_cpu_prepare_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_ms", 0.0))
             prompt_semantic_task = asyncio.create_task(
                 self.tts.prepare_ref_semantic_batch_worker.submit_async(raw_audio, raw_sr, wav16k=wav16k)
@@ -1746,7 +1754,9 @@ class PrepareCoordinator:
                     ),
                     "prompt_semantic_forward_ms": float(prompt_semantic_profile.get("prompt_semantic_forward_ms", 0.0)),
                     "prompt_semantic_scatter_ms": float(prompt_semantic_profile.get("prompt_semantic_scatter_ms", 0.0)),
-                    "prompt_semantic_stage_slots": float(prompt_semantic_profile.get("prompt_semantic_stage_slots", 0.0)),
+                    "prompt_semantic_stage_slots": float(
+                        prompt_semantic_profile.get("prompt_semantic_stage_slots", 0.0)
+                    ),
                     "prompt_semantic_stage_inflight_peak": float(
                         prompt_semantic_profile.get("prompt_semantic_stage_inflight_peak", 0.0)
                     ),
@@ -1790,12 +1800,7 @@ class PrepareCoordinator:
                     "prompt_semantic_shard_index": float(
                         prompt_semantic_profile.get("prompt_semantic_shard_index", 0.0)
                     ),
-                    "bundle_total_ms": float(
-                        load_queue_ms
-                        + load_ms
-                        + preload_cpu_prepare_ms
-                        + prompt_semantic_ms
-                    ),
+                    "bundle_total_ms": float(load_queue_ms + load_ms + preload_cpu_prepare_ms + prompt_semantic_ms),
                 },
             }
             return ProfiledResult(
@@ -1820,7 +1825,9 @@ class PrepareCoordinator:
                 preload_profiled = await asyncio.wrap_future(prepared_asset_future)
 
             if preload_profiled is None:
-                load_profiled = await self._run_on_executor(self.ref_audio_executor, self._load_ref_audio_raw, ref_audio_path)
+                load_profiled = await self._run_on_executor(
+                    self.ref_audio_executor, self._load_ref_audio_raw, ref_audio_path
+                )
                 raw_audio, raw_sr = load_profiled.result
                 wav16k = None
                 load_queue_ms = float(load_profiled.queue_ms)
@@ -1840,9 +1847,7 @@ class PrepareCoordinator:
                 load_ms = float(preload_profile.get("audio_load_ms", 0.0))
                 cpu_prepare_wait_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0))
                 cpu_prepare_slots = float(preload_profile.get("prompt_semantic_cpu_prepare_slots", 0.0))
-                cpu_prepare_inflight_peak = float(
-                    preload_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0)
-                )
+                cpu_prepare_inflight_peak = float(preload_profile.get("prompt_semantic_cpu_prepare_inflight_peak", 0.0))
                 preload_cpu_prepare_ms = float(preload_profile.get("prompt_semantic_cpu_prepare_ms", 0.0))
             submit_at = time.perf_counter()
             started_at = time.perf_counter()
@@ -1904,14 +1909,18 @@ class PrepareCoordinator:
             result["profile"]["audio_load_queue_ms"] = float(load_queue_ms)
             result["profile"]["audio_load_ms"] = float(load_ms)
             finished_at = time.perf_counter()
-            return ProfiledResult(result=result, submit_at=float(submit_at), started_at=float(started_at), finished_at=float(finished_at))
+            return ProfiledResult(
+                result=result, submit_at=float(submit_at), started_at=float(started_at), finished_at=float(finished_at)
+            )
         finally:
             self.ref_audio_gate.release()
 
     async def _run_ref_spec_stage(self, raw_audio, raw_sr: int) -> ProfiledResult:
         await self.ref_spec_gate.acquire()
         try:
-            return await self._run_on_executor(self.ref_audio_executor, self._extract_ref_spec_from_raw, raw_audio, raw_sr)
+            return await self._run_on_executor(
+                self.ref_audio_executor, self._extract_ref_spec_from_raw, raw_audio, raw_sr
+            )
         finally:
             self.ref_spec_gate.release()
 
@@ -1995,7 +2004,7 @@ class PrepareCoordinator:
     @staticmethod
     def _merge_ref_spec_profiled_result(
         profiled: ProfiledResult,
-    ) -> tuple[tuple[Any, Any], Dict[str, float]]:
+    ) -> tuple[tuple[Any, Any], dict[str, float]]:
         refer_spec, profile = profiled.result
         merged_profile = dict(profile)
         merged_profile["ref_spec_wait_ms"] = float(profiled.queue_ms)
@@ -2008,9 +2017,9 @@ class PrepareCoordinator:
         prompt_profiled: ProfiledResult,
         target_profiled: ProfiledResult,
         shared_profiled: ProfiledResult,
-        shared_ref_spec_result: tuple[tuple[Any, Any], Dict[str, float]] | None,
+        shared_ref_spec_result: tuple[tuple[Any, Any], dict[str, float]] | None,
         phase_kind: str,
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         phase_wall_ms = max(
             float(prompt_profiled.run_ms),
             float(target_profiled.run_ms),
@@ -2111,10 +2120,10 @@ class PrepareCoordinator:
             target_feature_tasks.append(
                 asyncio.create_task(
                     self._run_text_feature_stage(
-                    target_g2pw_profiled.result,
-                    cpu_stage.spec.text_lang,
-                    cpu_stage.target_cpu_profiled.run_ms,
-                    base_profile=dict(target_g2pw_profiled.profile or {}),
+                        target_g2pw_profiled.result,
+                        cpu_stage.spec.text_lang,
+                        cpu_stage.target_cpu_profiled.run_ms,
+                        base_profile=dict(target_g2pw_profiled.profile or {}),
                     )
                 )
             )
@@ -2124,16 +2133,16 @@ class PrepareCoordinator:
                 target_feature_results.append(task)
                 continue
             target_feature_results.append(task)
-        target_feature_results = list(
-            await asyncio.gather(
-                *[
-                    item
-                    for item in target_feature_results
-                    if not isinstance(item, Exception)
-                ],
-                return_exceptions=True,
+        target_feature_results = (
+            list(
+                await asyncio.gather(
+                    *[item for item in target_feature_results if not isinstance(item, Exception)],
+                    return_exceptions=True,
+                )
             )
-        ) if any(not isinstance(item, Exception) for item in target_feature_results) else []
+            if any(not isinstance(item, Exception) for item in target_feature_results)
+            else []
+        )
         merged_target_feature_results: List[ProfiledResult | Exception] = []
         gather_index = 0
         for item in target_feature_tasks:
@@ -2237,7 +2246,7 @@ class PrepareCoordinator:
         self,
         cpu_stage: PreparedCpuStage,
         prepared_ref_audio_future: concurrent.futures.Future | None = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         phase_start = time.perf_counter()
         g2pw_pair_task = asyncio.create_task(
             self._run_g2pw_pair_stage(
@@ -2267,8 +2276,8 @@ class PrepareCoordinator:
     async def _prepare_gpu_phase_two(
         self,
         cpu_stage: PreparedCpuStage,
-        phase_one: Dict[str, Any],
-    ) -> Dict[str, Any]:
+        phase_one: dict[str, Any],
+    ) -> dict[str, Any]:
         phase_start = time.perf_counter()
         prompt_g2pw_profiled = phase_one["prompt_g2pw_profiled"]
         target_g2pw_profiled = phase_one["target_g2pw_profiled"]
@@ -2290,9 +2299,9 @@ class PrepareCoordinator:
     def _build_gpu_prepare_result(
         self,
         cpu_stage: PreparedCpuStage,
-        phase_one: Dict[str, Any],
-        phase_two: Dict[str, Any],
-        extra_profile: Dict[str, float] | None = None,
+        phase_one: dict[str, Any],
+        phase_two: dict[str, Any],
+        extra_profile: dict[str, float] | None = None,
     ) -> tuple[T2SRequestState, float, float]:
         prompt_g2pw_profiled = phase_one["prompt_g2pw_profiled"]
         target_g2pw_profiled = phase_one["target_g2pw_profiled"]
@@ -2353,7 +2362,9 @@ class PrepareCoordinator:
             "text_g2pw_predict_ms": float((target_g2pw_profiled.profile or {}).get("g2pw_predict_ms", 0.0)),
             "text_g2pw_post_ms": float((target_g2pw_profiled.profile or {}).get("g2pw_post_ms", 0.0)),
             "text_g2pw_wait_ms": float((target_g2pw_profiled.profile or {}).get("g2pw_wait_ms", 0.0)),
-            "text_g2pw_admission_wait_ms": float((target_g2pw_profiled.profile or {}).get("g2pw_admission_wait_ms", 0.0)),
+            "text_g2pw_admission_wait_ms": float(
+                (target_g2pw_profiled.profile or {}).get("g2pw_admission_wait_ms", 0.0)
+            ),
             "text_g2pw_worker_queue_wait_ms": float(
                 (target_g2pw_profiled.profile or {}).get("g2pw_worker_queue_wait_ms", 0.0)
             ),
@@ -2444,14 +2455,16 @@ class PrepareCoordinator:
             profile_overrides=profile_overrides,
         )
         prepare_exec_finished_at = time.perf_counter()
-        state.prepare_profile["executor_run_wall_ms"] = max(0.0, (prepare_exec_finished_at - cpu_stage.prepare_start) * 1000.0)
+        state.prepare_profile["executor_run_wall_ms"] = max(
+            0.0, (prepare_exec_finished_at - cpu_stage.prepare_start) * 1000.0
+        )
         return state, cpu_stage.prepare_start, prepare_exec_finished_at
 
     async def prepare_ref_spec_stages_async(
         self,
-        phase_ones: list[Dict[str, Any]],
-    ) -> list[tuple[tuple[Any, Any], Dict[str, float]] | Exception]:
-        async def _one(phase_one: Dict[str, Any]):
+        phase_ones: list[dict[str, Any]],
+    ) -> list[tuple[tuple[Any, Any], dict[str, float]] | Exception]:
+        async def _one(phase_one: dict[str, Any]):
             ref_audio_profiled = phase_one["ref_audio_profiled"]
             raw_audio = ref_audio_profiled.result["raw_audio"]
             raw_sr = int(ref_audio_profiled.result["raw_sr"])
@@ -2469,7 +2482,7 @@ class PrepareCoordinator:
     def apply_ref_spec_result_to_state(
         self,
         state: T2SRequestState,
-        ref_spec_result: tuple[tuple[Any, Any], Dict[str, float]],
+        ref_spec_result: tuple[tuple[Any, Any], dict[str, float]],
     ) -> None:
         refer_spec, profile = ref_spec_result
         state.refer_spec = refer_spec
@@ -2503,7 +2516,7 @@ class PrepareCoordinator:
         phase_one_wall_ms = max(0.0, (phase_one_finished_at - phase_one_started_at) * 1000.0)
 
         outputs: list[tuple[T2SRequestState, float, float] | Exception | None] = [None] * len(cpu_stages)
-        pending_phase_two: list[tuple[int, PreparedCpuStage, Dict[str, Any]]] = []
+        pending_phase_two: list[tuple[int, PreparedCpuStage, dict[str, Any]]] = []
         for index, (cpu_stage, phase_one) in enumerate(zip(cpu_stages, phase_one_results)):
             if isinstance(phase_one, Exception):
                 outputs[index] = phase_one
@@ -2547,7 +2560,7 @@ class PrepareCoordinator:
         self,
         cpu_stages: list[PreparedCpuStage],
         prepared_ref_audio_futures: list[concurrent.futures.Future | None] | None = None,
-    ) -> list[Dict[str, Any] | Exception]:
+    ) -> list[dict[str, Any] | Exception]:
         if not cpu_stages:
             return []
         if self.enable_g2pw_audio_batch_merge and len(cpu_stages) > 1:
@@ -2566,8 +2579,8 @@ class PrepareCoordinator:
 
     async def prepare_gpu_text_phases_async(
         self,
-        items: list[tuple[PreparedCpuStage, Dict[str, Any]]],
-    ) -> list[Dict[str, Any] | Exception]:
+        items: list[tuple[PreparedCpuStage, dict[str, Any]]],
+    ) -> list[dict[str, Any] | Exception]:
         if not items:
             return []
         return list(
@@ -2580,9 +2593,9 @@ class PrepareCoordinator:
     def build_gpu_prepare_result_from_phases(
         self,
         cpu_stage: PreparedCpuStage,
-        phase_one: Dict[str, Any],
-        phase_two: Dict[str, Any],
-        extra_profile: Dict[str, float] | None = None,
+        phase_one: dict[str, Any],
+        phase_two: dict[str, Any],
+        extra_profile: dict[str, float] | None = None,
     ) -> tuple[T2SRequestState, float, float]:
         try:
             return self._build_gpu_prepare_result(cpu_stage, phase_one, phase_two, extra_profile=extra_profile)

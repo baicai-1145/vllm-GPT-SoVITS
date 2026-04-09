@@ -1,11 +1,12 @@
+import torch
 from torch.nn.functional import *
 from torch.nn.functional import (
-    _mha_shape_check,
     _canonical_mask,
-    _none_or_dtype,
     _in_projection_packed,
+    _mha_shape_check,
+    _none_or_dtype,
 )
-import torch
+
 # Tensor = torch.Tensor
 # from typing import Callable, List, Optional, Tuple, Union
 
@@ -250,7 +251,7 @@ def multi_head_attention_forward_patched(
             b_k,
             b_v,
         )
-    if cache != None:
+    if cache is not None:
         if cache["first_infer"] == 1:
             cache["k"][cache["stage"]] = k
             # print(0,cache["k"].shape)

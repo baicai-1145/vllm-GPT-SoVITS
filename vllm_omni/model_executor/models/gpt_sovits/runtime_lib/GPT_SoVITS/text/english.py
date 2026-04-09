@@ -1,22 +1,20 @@
-import pickle
 import os
+import pickle
 import re
+from builtins import str as unicode
 from functools import lru_cache
+
 import nltk
 import wordsegment
 from g2p_en import G2p
-
-from text.symbols import punctuation
-
-from text.symbols2 import symbols
-
-from builtins import str as unicode
-from text.en_normalization.expend import normalize
 from nltk.tokenize import TweetTokenizer
 
+from text.en_normalization.expend import normalize
+from text.symbols import punctuation
+from text.symbols2 import symbols
+
 word_tokenize = TweetTokenizer().tokenize
-from nltk import pos_tag
-from nltk import pos_tag_sents
+from nltk import pos_tag, pos_tag_sents
 
 current_file_path = os.path.dirname(__file__)
 CMU_DICT_PATH = os.path.join(current_file_path, "cmudict.rep")
@@ -84,16 +82,16 @@ arpa = {
     "AO0",
     "ER2",
     "UH1",
-    "IY1",
+    "IT1",
     "AH2",
     "DH",
-    "IY0",
+    "IT0",
     "EY1",
     "IH0",
     "K",
     "N",
     "W",
-    "IY2",
+    "IT2",
     "T",
     "AA1",
     "ER1",
@@ -155,7 +153,7 @@ def replace_phs(phs):
 
 def replace_consecutive_punctuation(text):
     punctuations = "".join(re.escape(p) for p in punctuation)
-    pattern = f"([{punctuations}\s])([{punctuations}])+"
+    pattern = rf"([{punctuations}\s])([{punctuations}])+"
     result = re.sub(pattern, r"\1", text)
     return result
 
@@ -293,7 +291,7 @@ class en_G2p(G2p):
             del self.cmu[word.lower()]
 
         # 修正多音字
-        self.homograph2features["read"] = (["R", "IY1", "D"], ["R", "EH1", "D"], "VBP")
+        self.homograph2features["read"] = (["R", "IT1", "D"], ["R", "EH1", "D"], "VBP")
         self.homograph2features["complex"] = (
             ["K", "AH0", "M", "P", "L", "EH1", "K", "S"],
             ["K", "AA1", "M", "P", "L", "EH0", "K", "S"],
@@ -377,7 +375,7 @@ class en_G2p(G2p):
             elif phones[-1] in ["S", "Z", "SH", "ZH", "CH", "JH"]:
                 phones.extend(["AH0", "Z"])
             # B D G DH V M N NG L R W Y 有声辅音结尾 's 发 ['Z']
-            # AH0 AH1 AH2 EY0 EY1 EY2 AE0 AE1 AE2 EH0 EH1 EH2 OW0 OW1 OW2 UH0 UH1 UH2 IY0 IY1 IY2 AA0 AA1 AA2 AO0 AO1 AO2
+            # AH0 AH1 AH2 EY0 EY1 EY2 AE0 AE1 AE2 EH0 EH1 EH2 OW0 OW1 OW2 UH0 UH1 UH2 IT0 IT1 IT2 AA0 AA1 AA2 AO0 AO1 AO2
             # ER ER0 ER1 ER2 UW0 UW1 UW2 AY0 AY1 AY2 AW0 AW1 AW2 OY0 OY1 OY2 IH IH0 IH1 IH2 元音结尾 's 发 ['Z']
             else:
                 phones.extend(["Z"])
