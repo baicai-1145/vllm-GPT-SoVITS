@@ -24,95 +24,27 @@ from typing import Any
 import torch
 
 from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSRuntime
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-TEMP_ROOT = REPO_ROOT / "TEMP"
-DEFAULT_PROJECT_ROOT = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "gpt_sovits" / "runtime_lib"
-DEFAULT_CONFIG_PATH = (
-    REPO_ROOT
-    / "tests"
-    / "model_executor"
-    / "models"
-    / "gpt_sovits"
-    / "fixtures"
-    / "tts_infer_v2proplus_cuda_longprompt.yaml"
+from vllm_omni.model_executor.models.gpt_sovits.script_utils import (
+    DEFAULT_BENCH_CONFIG_PATH,
+    DEFAULT_PROJECT_ROOT,
+    DEFAULT_REF_AUDIO,
+    DEFAULT_REF_TEXT,
+    DEFAULT_TEXT_FILES,
+    TEMP_ROOT,
+    build_default_request,
+    configure_runtime_cache_root,
+    elapsed_ms,
+    read_text,
+    resolve_existing,
+    stage_timer,
+    summarize_audio_file,
+    to_serializable,
 )
-DEFAULT_REF_AUDIO = REPO_ROOT / "test.wav"
-DEFAULT_REF_TEXT = "又或者说，你已经察觉到了…却还想拿「它」干什么好事？"
-DEFAULT_TEXT_FILES = {
-    "cn": [REPO_ROOT / "test_cn.txt", Path("/root/GPT-SoVITS/test_cn.txt")],
-    "en": [REPO_ROOT / "test_en.txt", Path("/root/GPT-SoVITS/test_en.txt")],
-    "4lang": [REPO_ROOT / "test_4lang.txt", Path("/root/GPT-SoVITS/test_4lang.txt")],
-}
-
-
-def _sync_cuda() -> None:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
-def _stage_timer() -> float:
-    _sync_cuda()
-    return time.perf_counter()
-
-
-def _elapsed_ms(start: float) -> float:
-    _sync_cuda()
-    return (time.perf_counter() - start) * 1000.0
-
-
-def _resolve_existing(paths: list[Path]) -> Path:
-    for path in paths:
-        if path.exists():
-            return path
-    joined = ", ".join(str(path) for path in paths)
-    raise FileNotFoundError(f"None of the candidate paths exist: {joined}")
-
-
-def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8").strip()
-
-
-def _to_serializable(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _to_serializable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_serializable(item) for item in value]
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, torch.Tensor):
-        return {
-            "shape": list(value.shape),
-            "dtype": str(value.dtype),
-            "device": str(value.device),
-        }
-    return value
 
 
 def _set_env_if_not_none(key: str, value: str | None) -> None:
     if value is not None:
         os.environ[key] = value
-
-
-def _default_request(text: str, ref_audio_path: Path, *, text_split_method: str) -> dict[str, Any]:
-    return {
-        "text": text,
-        "text_lang": "auto",
-        "ref_audio_path": str(ref_audio_path),
-        "prompt_text": DEFAULT_REF_TEXT,
-        "prompt_lang": "auto",
-        "text_split_method": text_split_method,
-        "speed_factor": 1.0,
-        "sample_steps": 32,
-        "super_sampling": False,
-        "parallel_infer": True,
-        "fragment_interval": 0.3,
-        "seed": 1234,
-        "batch_size": 4,
-        "batch_threshold": 0.75,
-        "split_bucket": True,
-        "repetition_penalty": 1.35,
-    }
 
 
 @dataclass
@@ -131,7 +63,7 @@ class IterationMetrics:
             "postprocess_ms": self.postprocess_ms,
             "output_samples": self.output_samples,
             "sample_rate": self.sample_rate,
-            "vits_profile": _to_serializable(self.vits_profile),
+            "vits_profile": to_serializable(self.vits_profile),
         }
 
 
@@ -152,14 +84,14 @@ def run_iteration(
     iteration: int,
     prepared_request: Any,
 ) -> IterationMetrics:
-    start = _stage_timer()
+    start = stage_timer()
     decoded = runtime.decode_prepared_request(prepared_request)
-    vits_ms = _elapsed_ms(start)
+    vits_ms = elapsed_ms(start)
     vits_profile = runtime.get_last_vits_decode_profile()
 
-    start = _stage_timer()
+    start = stage_timer()
     result = runtime.finalize_decoded_audio(decoded)
-    postprocess_ms = _elapsed_ms(start)
+    postprocess_ms = elapsed_ms(start)
 
     return IterationMetrics(
         iteration=iteration,
@@ -180,19 +112,7 @@ def export_prepared_request_audio_streaming(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     decoded = runtime.decode_prepared_request(prepared_request)
     sample_rate = runtime.finalize_decoded_audio_to_file(decoded, output_path)
-    import soundfile as sf
-
-    info = sf.info(output_path)
-    return {
-        "path": str(output_path),
-        "sample_rate": int(sample_rate),
-        "file_sample_rate": int(info.samplerate),
-        "frames": int(info.frames),
-        "duration_sec": float(info.frames / info.samplerate) if int(info.samplerate) > 0 else 0.0,
-        "format": str(info.format),
-        "subtype": str(info.subtype),
-        "mode": "bounded_memory_extra_pass",
-    }
+    return summarize_audio_file(output_path, sample_rate=sample_rate, mode="bounded_memory_extra_pass")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -201,7 +121,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT_ROOT)
-    parser.add_argument("--config-path", type=Path, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--config-path", type=Path, default=DEFAULT_BENCH_CONFIG_PATH)
     parser.add_argument("--ref-audio", type=Path, default=DEFAULT_REF_AUDIO)
     parser.add_argument("--text-split-method", default="cut5")
     parser.add_argument(
@@ -247,26 +167,19 @@ def main() -> int:
     _set_env_if_not_none("GPTSOVITS_SEGMENT_DECODE_SEMANTIC_BUCKETS", args.segment_decode_semantic_buckets)
     _set_env_if_not_none("GPTSOVITS_SEGMENT_DECODE_PHONE_BUCKETS", args.segment_decode_phone_buckets)
     if args.runtime_cache_root is not None:
-        runtime_cache_root = args.runtime_cache_root.resolve()
-        torchinductor_cache_dir = runtime_cache_root / "torchinductor"
-        triton_cache_dir = runtime_cache_root / "triton"
-        torchinductor_cache_dir.mkdir(parents=True, exist_ok=True)
-        triton_cache_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["GPTSOVITS_RUNTIME_CACHE_ROOT"] = str(runtime_cache_root)
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(torchinductor_cache_dir)
-        os.environ["TRITON_CACHE_DIR"] = str(triton_cache_dir)
+        configure_runtime_cache_root(args.runtime_cache_root)
 
     ref_audio = args.ref_audio.resolve()
     if not ref_audio.exists():
         raise FileNotFoundError(f"Reference audio not found: {ref_audio}")
-    text_path = _resolve_existing(DEFAULT_TEXT_FILES[args.suite])
-    text = _read_text(text_path)
+    text_path = resolve_existing(DEFAULT_TEXT_FILES[args.suite])
+    text = read_text(text_path)
 
     runtime = GPTSoVITSRuntime(
         project_root=str(args.project_root.resolve()),
         config_path=str(args.config_path.resolve()),
     )
-    request = _default_request(text, ref_audio, text_split_method=args.text_split_method)
+    request = build_default_request(text, ref_audio, text_split_method=args.text_split_method)
 
     setup_ms = 0.0
     cache_loaded = False
@@ -352,8 +265,8 @@ def main() -> int:
 
     output_json = args.output_json or (TEMP_ROOT / f"gpt_sovits_vits_only_{args.suite}_{int(time.time())}.json")
     output_json.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(json.dumps(_to_serializable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(_to_serializable(payload), ensure_ascii=False, indent=2))
+    output_json.write_text(json.dumps(to_serializable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(to_serializable(payload), ensure_ascii=False, indent=2))
     print(f"\nWrote VITS-only benchmark report to: {output_json}")
     return 0
 
