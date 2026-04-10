@@ -1,4 +1,5 @@
 import math
+import time
 
 import numpy as np
 import torch
@@ -30,6 +31,26 @@ def _conv2d_spec_from_conv1d(
         "padding": (0, conv.padding[0]),
         "dilation": (1, conv.dilation[0]),
     }
+
+
+def _sync_profile_device(device: torch.device | str) -> None:
+    try:
+        device_str = str(device)
+        if device_str.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        elif device_str == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+            torch.mps.synchronize()
+    except Exception:
+        pass
+
+
+def _profile_cuda_call(fn, stats: dict[str, float], key: str, device: torch.device | str):
+    _sync_profile_device(device)
+    started = time.perf_counter()
+    result = fn()
+    _sync_profile_device(device)
+    stats[key] = float(stats.get(key, 0.0)) + float((time.perf_counter() - started) * 1000.0)
+    return result
 
 
 class LayerNorm(nn.Module):
@@ -350,6 +371,93 @@ class ResBlock1(torch.nn.Module):
             x = x * mask
         return x
 
+    def forward_channels_last_profiled(self, x, stats, prefix: str, device, x_mask=None):
+        started = time.perf_counter()
+        if x.dim() != 4:
+            raise ValueError(f"ResBlock1.forward_channels_last expects 4D input, got shape={tuple(x.shape)}")
+        key = (str(x.device), str(x.dtype))
+        if key not in self._channels_last_runtime:
+            self.prepare_channels_last_runtime(dtype=x.dtype)
+        convs1, convs2 = self._channels_last_runtime[key]
+        mask = x_mask
+        if mask is not None and mask.dim() == 3:
+            mask = mask.unsqueeze(2)
+        if mask is not None and not mask.is_contiguous(memory_format=torch.channels_last):
+            mask = mask.contiguous(memory_format=torch.channels_last)
+        for layer_index, (c1, c2) in enumerate(zip(convs1, convs2)):
+            layer_prefix = f"{prefix}_layer_{layer_index}"
+            layer_started = time.perf_counter()
+            xt = _profile_cuda_call(
+                lambda current=x: F.leaky_relu(current, LRELU_SLOPE),
+                stats,
+                f"{layer_prefix}_relu1_ms",
+                device,
+            )
+            if mask is not None:
+                xt = _profile_cuda_call(
+                    lambda current=xt, current_mask=mask: current * current_mask,
+                    stats,
+                    f"{layer_prefix}_mask1_ms",
+                    device,
+                )
+            xt = _profile_cuda_call(
+                lambda current=xt, spec=c1: F.conv2d(
+                    current,
+                    spec["weight"],
+                    spec["bias"],
+                    stride=spec["stride"],
+                    padding=spec["padding"],
+                    dilation=spec["dilation"],
+                ),
+                stats,
+                f"{layer_prefix}_conv1_ms",
+                device,
+            )
+            xt = _profile_cuda_call(
+                lambda current=xt: F.leaky_relu(current, LRELU_SLOPE),
+                stats,
+                f"{layer_prefix}_relu2_ms",
+                device,
+            )
+            if mask is not None:
+                xt = _profile_cuda_call(
+                    lambda current=xt, current_mask=mask: current * current_mask,
+                    stats,
+                    f"{layer_prefix}_mask2_ms",
+                    device,
+                )
+            xt = _profile_cuda_call(
+                lambda current=xt, spec=c2: F.conv2d(
+                    current,
+                    spec["weight"],
+                    spec["bias"],
+                    stride=spec["stride"],
+                    padding=spec["padding"],
+                    dilation=spec["dilation"],
+                ),
+                stats,
+                f"{layer_prefix}_conv2_ms",
+                device,
+            )
+            x = _profile_cuda_call(
+                lambda current=xt, residual=x: current + residual,
+                stats,
+                f"{layer_prefix}_residual_add_ms",
+                device,
+            )
+            stats[f"{layer_prefix}_total_ms"] = float((time.perf_counter() - layer_started) * 1000.0)
+        if mask is not None:
+            x = _profile_cuda_call(
+                lambda current=x, current_mask=mask: current * current_mask,
+                stats,
+                f"{prefix}_final_mask_ms",
+                device,
+            )
+        total_ms = float((time.perf_counter() - started) * 1000.0)
+        stats[f"{prefix}_ms"] = total_ms
+        stats[f"{prefix}_total_ms"] = total_ms
+        return x
+
     def forward(self, x, x_mask=None):
         for c1, c2 in zip(self.convs1, self.convs2):
             xt = F.leaky_relu(x, LRELU_SLOPE)
@@ -441,6 +549,67 @@ class ResBlock2(torch.nn.Module):
             x = xt + x
         if mask is not None:
             x = x * mask
+        return x
+
+    def forward_channels_last_profiled(self, x, stats, prefix: str, device, x_mask=None):
+        started = time.perf_counter()
+        if x.dim() != 4:
+            raise ValueError(f"ResBlock2.forward_channels_last expects 4D input, got shape={tuple(x.shape)}")
+        key = (str(x.device), str(x.dtype))
+        if key not in self._channels_last_runtime:
+            self.prepare_channels_last_runtime(dtype=x.dtype)
+        convs = self._channels_last_runtime[key]
+        mask = x_mask
+        if mask is not None and mask.dim() == 3:
+            mask = mask.unsqueeze(2)
+        if mask is not None and not mask.is_contiguous(memory_format=torch.channels_last):
+            mask = mask.contiguous(memory_format=torch.channels_last)
+        for layer_index, conv in enumerate(convs):
+            layer_prefix = f"{prefix}_layer_{layer_index}"
+            layer_started = time.perf_counter()
+            xt = _profile_cuda_call(
+                lambda current=x: F.leaky_relu(current, LRELU_SLOPE),
+                stats,
+                f"{layer_prefix}_relu_ms",
+                device,
+            )
+            if mask is not None:
+                xt = _profile_cuda_call(
+                    lambda current=xt, current_mask=mask: current * current_mask,
+                    stats,
+                    f"{layer_prefix}_mask_ms",
+                    device,
+                )
+            xt = _profile_cuda_call(
+                lambda current=xt, spec=conv: F.conv2d(
+                    current,
+                    spec["weight"],
+                    spec["bias"],
+                    stride=spec["stride"],
+                    padding=spec["padding"],
+                    dilation=spec["dilation"],
+                ),
+                stats,
+                f"{layer_prefix}_conv_ms",
+                device,
+            )
+            x = _profile_cuda_call(
+                lambda current=xt, residual=x: current + residual,
+                stats,
+                f"{layer_prefix}_residual_add_ms",
+                device,
+            )
+            stats[f"{layer_prefix}_total_ms"] = float((time.perf_counter() - layer_started) * 1000.0)
+        if mask is not None:
+            x = _profile_cuda_call(
+                lambda current=x, current_mask=mask: current * current_mask,
+                stats,
+                f"{prefix}_final_mask_ms",
+                device,
+            )
+        total_ms = float((time.perf_counter() - started) * 1000.0)
+        stats[f"{prefix}_ms"] = total_ms
+        stats[f"{prefix}_total_ms"] = total_ms
         return x
 
     def forward(self, x, x_mask=None):

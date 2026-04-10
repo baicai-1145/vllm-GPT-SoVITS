@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import soundfile as sf
 import torch
 
 from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSRuntime
@@ -173,7 +172,6 @@ def run_iteration(
     suite: str,
     iteration: int,
     request: dict[str, Any],
-    save_audio_path: Path | None,
 ) -> IterationMetrics:
     total_start = _stage_timer()
 
@@ -205,10 +203,6 @@ def run_iteration(
 
     end_to_end_ms = _elapsed_ms(total_start)
 
-    if save_audio_path is not None:
-        save_audio_path.parent.mkdir(parents=True, exist_ok=True)
-        sf.write(save_audio_path, result.audio, result.sample_rate)
-
     return IterationMetrics(
         suite=suite,
         iteration=iteration,
@@ -226,6 +220,29 @@ def run_iteration(
         t2s_profile=t2s_profile,
         vits_profile=vits_profile,
     )
+
+
+def export_audio_streaming(
+    runtime: GPTSoVITSRuntime,
+    *,
+    request: dict[str, Any],
+    output_path: Path,
+) -> dict[str, Any]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_rate = runtime.synthesize_to_file(request, output_path)
+    import soundfile as sf
+
+    info = sf.info(output_path)
+    return {
+        "path": str(output_path),
+        "sample_rate": int(sample_rate),
+        "file_sample_rate": int(info.samplerate),
+        "frames": int(info.frames),
+        "duration_sec": float(info.frames / info.samplerate) if int(info.samplerate) > 0 else 0.0,
+        "format": str(info.format),
+        "subtype": str(info.subtype),
+        "mode": "bounded_memory_extra_pass",
+    }
 
 
 def summarize_iterations(items: list[IterationMetrics]) -> dict[str, Any]:
@@ -282,7 +299,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--text-split-method", default="cut5", help="Segmentation method passed into runtime.")
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument(
-        "--save-audio", action="store_true", help="Save the last measured audio for each suite to TEMP."
+        "--save-audio",
+        action="store_true",
+        help="Export one extra bounded-memory audio file per suite after measured iterations.",
+    )
+    parser.add_argument(
+        "--runtime-cache-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional runtime cache root for TorchInductor/Triton. Useful when the default cache path has quota issues."
+        ),
     )
     return parser
 
@@ -290,6 +317,16 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_argparser()
     args = parser.parse_args()
+
+    if args.runtime_cache_root is not None:
+        runtime_cache_root = args.runtime_cache_root.resolve()
+        torchinductor_cache_dir = runtime_cache_root / "torchinductor"
+        triton_cache_dir = runtime_cache_root / "triton"
+        torchinductor_cache_dir.mkdir(parents=True, exist_ok=True)
+        triton_cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["GPTSOVITS_RUNTIME_CACHE_ROOT"] = str(runtime_cache_root)
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(torchinductor_cache_dir)
+        os.environ["TRITON_CACHE_DIR"] = str(triton_cache_dir)
 
     suites = ["cn", "en", "4lang"] if args.suite == "all" else [args.suite]
     ref_audio = args.ref_audio.resolve()
@@ -313,6 +350,7 @@ def main() -> int:
             "iters": int(args.iters),
             "device": device_name,
             "cuda_available": bool(torch.cuda.is_available()),
+            "runtime_cache_root": None if args.runtime_cache_root is None else str(args.runtime_cache_root.resolve()),
             "torch_version": torch.__version__,
             "python": os.sys.version,
         },
@@ -332,27 +370,28 @@ def main() -> int:
                 suite=suite,
                 iteration=-(warmup_index + 1),
                 request=request,
-                save_audio_path=None,
             )
 
         measured: list[IterationMetrics] = []
         for iteration in range(args.iters):
-            audio_path = None
-            if args.save_audio and iteration == args.iters - 1:
-                audio_path = TEMP_ROOT / f"gpt_sovits_{suite}_bench.wav"
             measured.append(
                 run_iteration(
                     runtime,
                     suite=suite,
                     iteration=iteration,
                     request=request,
-                    save_audio_path=audio_path,
                 )
             )
 
         suite_summary = summarize_iterations(measured)
         suite_summary["text_path"] = str(text_path)
         suite_summary["text_chars"] = len(text)
+        if args.save_audio:
+            suite_summary["saved_audio"] = export_audio_streaming(
+                runtime,
+                request=request,
+                output_path=TEMP_ROOT / f"gpt_sovits_{suite}_bench.wav",
+            )
         result_payload["suites"][suite] = suite_summary
 
     output_json = args.output_json

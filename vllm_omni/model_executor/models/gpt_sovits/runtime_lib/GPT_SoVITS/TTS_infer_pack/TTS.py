@@ -66,6 +66,20 @@ def _compile_vits_dec_enabled() -> bool:
     return os.environ.get("GPTSOVITS_COMPILE_VITS_DEC", "1").strip().lower() not in {"0", "false", "no", "off", ""}
 
 
+def _compile_vits_enc_p_enabled() -> bool:
+    return os.environ.get("GPTSOVITS_COMPILE_VITS_ENC_P", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _compile_vits_enc_p_static_buckets_enabled() -> bool:
+    return os.environ.get("GPTSOVITS_COMPILE_VITS_ENC_P_STATIC_BUCKETS", "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
 def _compile_t2s_prealloc_enabled() -> bool:
     return os.environ.get("GPTSOVITS_COMPILE_T2S_PREALLOC", "1").strip().lower() not in {
         "0",
@@ -1121,6 +1135,55 @@ class TTS:
             self.vits_model._compiled_dec = None
             print(f"Compile VITS decoder skipped: {exc}")
 
+    def _maybe_compile_vits_enc_p(self) -> None:
+        if self.configs.use_vocoder or not _compile_vits_enc_p_enabled():
+            return
+        if _compile_vits_enc_p_static_buckets_enabled():
+            print("Skip eager VITS enc_p compile: static bucket compile enabled")
+            return
+        if not hasattr(torch, "compile") or getattr(self.vits_model, "_compiled_enc_p", None) is not None:
+            return
+        compile_mode = (
+            os.environ.get("GPTSOVITS_COMPILE_VITS_ENC_P_MODE", "max-autotune-no-cudagraphs").strip()
+            or "max-autotune-no-cudagraphs"
+        )
+        dynamic = os.environ.get("GPTSOVITS_COMPILE_VITS_ENC_P_DYNAMIC", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        skip_dynamic_graphs = os.environ.get(
+            "GPTSOVITS_COMPILE_VITS_ENC_P_SKIP_DYNAMIC_CUDAGRAPH", "1"
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if skip_dynamic_graphs:
+            try:
+                import torch._inductor.config as inductor_config
+
+                inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+            except Exception:
+                pass
+        try:
+            started_at = time.perf_counter()
+            self.vits_model._compiled_enc_p = torch.compile(
+                self.vits_model.enc_p,
+                mode=compile_mode,
+                dynamic=dynamic,
+            )
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            print(
+                f"Compiled VITS enc_p: mode={compile_mode} dynamic={dynamic} "
+                f"skip_dynamic_cudagraph={skip_dynamic_graphs} wrap_ms={elapsed_ms:.2f}"
+            )
+        except Exception as exc:
+            self.vits_model._compiled_enc_p = None
+            print(f"Compile VITS enc_p skipped: {exc}")
+
     def _maybe_compile_t2s_prealloc_decoder(self) -> None:
         if not _compile_t2s_prealloc_enabled():
             return
@@ -1290,6 +1353,7 @@ class TTS:
 
         vits_model = vits_model.eval()
         self.vits_model = self._cast_module_to_runtime_precision(vits_model)
+        self._maybe_compile_vits_enc_p()
         self._maybe_compile_vits_decoder()
 
         self.configs.save_configs()

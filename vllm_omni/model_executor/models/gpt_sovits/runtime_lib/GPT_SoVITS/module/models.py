@@ -59,6 +59,95 @@ def _vits_static_bucket_compile_mode() -> str:
     return os.environ.get("GPTSOVITS_COMPILE_VITS_DEC_STATIC_BUCKET_MODE", "default").strip() or "default"
 
 
+def _vits_decoder_stage_static_compile_enabled() -> bool:
+    return os.environ.get("GPTSOVITS_COMPILE_VITS_DEC_STAGE_STATIC_BUCKETS", "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
+def _vits_decoder_stage_static_min_hits() -> int:
+    raw_value = os.environ.get("GPTSOVITS_COMPILE_VITS_DEC_STAGE_STATIC_BUCKET_MIN_HITS", "2").strip()
+    try:
+        return max(1, int(raw_value))
+    except Exception:
+        return 2
+
+
+def _vits_decoder_stage_static_max_entries() -> int:
+    raw_value = os.environ.get("GPTSOVITS_COMPILE_VITS_DEC_STAGE_STATIC_BUCKET_MAX_ENTRIES", "8").strip()
+    try:
+        return max(1, int(raw_value))
+    except Exception:
+        return 8
+
+
+def _vits_decoder_stage_static_compile_mode() -> str:
+    return (
+        os.environ.get("GPTSOVITS_COMPILE_VITS_DEC_STAGE_STATIC_BUCKET_MODE", "max-autotune-no-cudagraphs").strip()
+        or "max-autotune-no-cudagraphs"
+    )
+
+
+def _vits_decoder_stage_static_stages() -> set[int]:
+    raw_value = os.environ.get("GPTSOVITS_COMPILE_VITS_DEC_STAGE_STATIC_BUCKET_STAGES", "").strip()
+    if not raw_value:
+        return set()
+    values: set[int] = set()
+    for item in raw_value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.add(int(item))
+        except Exception:
+            continue
+    return values
+
+
+def _vits_enc_p_static_bucket_compile_enabled() -> bool:
+    return os.environ.get("GPTSOVITS_COMPILE_VITS_ENC_P_STATIC_BUCKETS", "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
+def _vits_enc_p_static_bucket_min_hits() -> int:
+    raw_value = os.environ.get("GPTSOVITS_COMPILE_VITS_ENC_P_STATIC_BUCKET_MIN_HITS", "2").strip()
+    try:
+        return max(1, int(raw_value))
+    except Exception:
+        return 2
+
+
+def _vits_enc_p_static_bucket_max_entries() -> int:
+    raw_value = os.environ.get("GPTSOVITS_COMPILE_VITS_ENC_P_STATIC_BUCKET_MAX_ENTRIES", "4").strip()
+    try:
+        return max(1, int(raw_value))
+    except Exception:
+        return 4
+
+
+def _vits_enc_p_static_bucket_compile_mode() -> str:
+    return (
+        os.environ.get("GPTSOVITS_COMPILE_VITS_ENC_P_STATIC_BUCKET_MODE", "max-autotune-no-cudagraphs").strip()
+        or "max-autotune-no-cudagraphs"
+    )
+
+
+def _vits_enc_p_static_bucket_shape_whitelist() -> set[str]:
+    raw_value = os.environ.get("GPTSOVITS_COMPILE_VITS_ENC_P_STATIC_BUCKET_SHAPES", "").strip()
+    if not raw_value:
+        return set()
+    return {item.strip() for item in raw_value.split(",") if item.strip()}
+
+
 def _vits_decoder_cudagraph_enabled() -> bool:
     return os.environ.get("GPTSOVITS_VITS_DECODER_CUDAGRAPH", "0").strip().lower() not in {
         "0",
@@ -102,6 +191,16 @@ def _vits_decoder_tf32_enabled() -> bool:
     }
 
 
+def _vits_decoder_cudnn_benchmark_enabled() -> bool:
+    return os.environ.get("GPTSOVITS_VITS_DECODER_CUDNN_BENCHMARK", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
 def _vits_decoder_channels_last_resblock_enabled() -> bool:
     return os.environ.get("GPTSOVITS_VITS_DECODER_CHANNELS_LAST_RESBLOCK", "1").strip().lower() not in {
         "0",
@@ -110,6 +209,21 @@ def _vits_decoder_channels_last_resblock_enabled() -> bool:
         "off",
         "",
     }
+
+
+def _torch_is_compiling() -> bool:
+    try:
+        compiler_mod = getattr(torch, "compiler", None)
+        if compiler_mod is not None and hasattr(compiler_mod, "is_compiling"):
+            return bool(compiler_mod.is_compiling())
+    except Exception:
+        pass
+    try:
+        import torch._dynamo as dynamo  # noqa: PLC0415
+
+        return bool(dynamo.is_compiling())
+    except Exception:
+        return False
 
 
 @contextlib.contextmanager
@@ -126,6 +240,19 @@ def _vits_decoder_tf32_context(x: torch.Tensor):
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev_matmul
         torch.backends.cudnn.allow_tf32 = prev_cudnn
+
+
+@contextlib.contextmanager
+def _vits_decoder_cudnn_benchmark_context(x: torch.Tensor):
+    if not _vits_decoder_cudnn_benchmark_enabled() or x.device.type != "cuda":
+        yield
+        return
+    prev_benchmark = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = True
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = prev_benchmark
 
 
 class StochasticDurationPredictor(nn.Module):
@@ -551,6 +678,22 @@ class WNEncoder(nn.Module):
         return out
 
 
+class _GeneratorStageChannelsLastRuntime(nn.Module):
+    def __init__(self, generator: "Generator", stage_index: int):
+        super().__init__()
+        self.generator = generator
+        self.stage_index = int(stage_index)
+
+    def forward(self, stage_x: torch.Tensor) -> torch.Tensor:
+        xs = None
+        stage_base = self.stage_index * self.generator.num_kernels
+        for j in range(self.generator.num_kernels):
+            block = self.generator.resblocks[stage_base + j]
+            block_out = block.forward_channels_last(stage_x)
+            xs = block_out if xs is None else xs + block_out
+        return xs / self.generator.num_kernels
+
+
 class Generator(torch.nn.Module):
     def __init__(
         self,
@@ -592,6 +735,12 @@ class Generator(torch.nn.Module):
 
         self.conv_post = Conv1d(ch, 1, 7, 1, padding=3, bias=is_bias)
         self.ups.apply(init_weights)
+        self._last_stage_runtime_stats = {}
+        self._compiled_stage_static_buckets = {}
+        self._compiled_stage_static_bucket_seen = {}
+        self._compiled_stage_static_bucket_failures = set()
+        self._compiled_stage_static_bucket_failure_reasons = {}
+        self._compiled_stage_static_bucket_lock = threading.Lock()
 
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
@@ -692,15 +841,157 @@ class Generator(torch.nn.Module):
             and x.dtype in {torch.float16, torch.bfloat16}
         )
 
-    def _run_stage_resblocks_channels_last(self, x, stage_index: int):
-        stage_x = x.unsqueeze(2).contiguous(memory_format=torch.channels_last)
+    def get_last_stage_runtime_stats(self):
+        return dict(self._last_stage_runtime_stats)
+
+    def _set_last_stage_runtime_stats(self, stats):
+        self._last_stage_runtime_stats = dict(stats)
+
+    def _reset_stage_runtime_stats(self):
+        self._last_stage_runtime_stats = {}
+
+    @staticmethod
+    def _stage_static_bucket_key(stage_index: int, stage_x: torch.Tensor) -> tuple[object, ...]:
+        return (
+            int(stage_index),
+            tuple(int(dim) for dim in stage_x.shape),
+            str(stage_x.dtype),
+            str(stage_x.device),
+        )
+
+    @staticmethod
+    def _stage_runtime_shape_id(stage_index: int, stage_x: torch.Tensor) -> str:
+        return f"s{int(stage_index)}_x" + "x".join(str(int(dim)) for dim in stage_x.shape)
+
+    @staticmethod
+    def _stage_static_compile_stage_enabled(stage_index: int) -> bool:
+        allowed_stages = _vits_decoder_stage_static_stages()
+        return not allowed_stages or int(stage_index) in allowed_stages
+
+    def _run_stage_resblocks_channels_last_eager(self, stage_x: torch.Tensor, stage_index: int) -> torch.Tensor:
         xs = None
         stage_base = stage_index * self.num_kernels
         for j in range(self.num_kernels):
             block = self.resblocks[stage_base + j]
             block_out = block.forward_channels_last(stage_x)
             xs = block_out if xs is None else xs + block_out
-        return (xs / self.num_kernels).squeeze(2)
+        return xs / self.num_kernels
+
+    def _run_stage_resblocks_channels_last_static_runtime(
+        self,
+        stage_x: torch.Tensor,
+        stage_index: int,
+    ) -> torch.Tensor:
+        stage_stats = dict(self._last_stage_runtime_stats)
+        stage_stats["decoder_stage_static_runtime_calls"] = int(stage_stats.get("decoder_stage_static_runtime_calls", 0)) + 1
+        stage_key = self._stage_static_bucket_key(stage_index, stage_x)
+        shape_id = self._stage_runtime_shape_id(stage_index, stage_x)
+        if (
+            not _vits_decoder_stage_static_compile_enabled()
+            or not hasattr(torch, "compile")
+            or _torch_is_compiling()
+            or not self._stage_static_compile_stage_enabled(stage_index)
+        ):
+            stage_stats["decoder_stage_static_runtime_eager_calls"] = int(
+                stage_stats.get("decoder_stage_static_runtime_eager_calls", 0)
+            ) + 1
+            started_at = time.perf_counter()
+            output = self._run_stage_resblocks_channels_last_eager(stage_x, stage_index)
+            _sync_profile_device(stage_x.device)
+            elapsed_ms = float((time.perf_counter() - started_at) * 1000.0)
+            stage_stats["decoder_stage_static_runtime_eager_ms"] = float(
+                stage_stats.get("decoder_stage_static_runtime_eager_ms", 0.0)
+            ) + elapsed_ms
+            stage_stats[f"decoder_stage_static_stage_{int(stage_index)}_eager_ms"] = float(
+                stage_stats.get(f"decoder_stage_static_stage_{int(stage_index)}_eager_ms", 0.0)
+            ) + elapsed_ms
+            self._set_last_stage_runtime_stats(stage_stats)
+            return output
+
+        static_runtime = self._compiled_stage_static_buckets.get(stage_key)
+        if static_runtime is None and stage_key not in self._compiled_stage_static_bucket_failures:
+            seen_hits = int(self._compiled_stage_static_bucket_seen.get(stage_key, 0)) + 1
+            self._compiled_stage_static_bucket_seen[stage_key] = seen_hits
+            stage_stats[f"decoder_stage_static_stage_{int(stage_index)}_seen_hits"] = seen_hits
+            if (
+                seen_hits >= _vits_decoder_stage_static_min_hits()
+                and len(self._compiled_stage_static_buckets) < _vits_decoder_stage_static_max_entries()
+            ):
+                with self._compiled_stage_static_bucket_lock:
+                    if (
+                        stage_key not in self._compiled_stage_static_buckets
+                        and stage_key not in self._compiled_stage_static_bucket_failures
+                    ):
+                        try:
+                            started_at = time.perf_counter()
+                            static_runtime = torch.compile(
+                                _GeneratorStageChannelsLastRuntime(self, stage_index).eval(),
+                                mode=_vits_decoder_stage_static_compile_mode(),
+                                dynamic=False,
+                            )
+                            with torch.no_grad():
+                                _ = static_runtime(stage_x)
+                            _sync_profile_device(stage_x.device)
+                            stage_stats["decoder_stage_static_runtime_compile_ms"] = float(
+                                stage_stats.get("decoder_stage_static_runtime_compile_ms", 0.0)
+                            ) + float((time.perf_counter() - started_at) * 1000.0)
+                            stage_stats["decoder_stage_static_runtime_compiles"] = int(
+                                stage_stats.get("decoder_stage_static_runtime_compiles", 0)
+                            ) + 1
+                            stage_stats[f"decoder_stage_static_stage_{int(stage_index)}_compile_ms"] = float(
+                                stage_stats.get(f"decoder_stage_static_stage_{int(stage_index)}_compile_ms", 0.0)
+                            ) + float((time.perf_counter() - started_at) * 1000.0)
+                            self._compiled_stage_static_buckets[stage_key] = static_runtime
+                        except Exception as exc:
+                            self._compiled_stage_static_bucket_failures.add(stage_key)
+                            self._compiled_stage_static_bucket_failure_reasons[stage_key] = f"{type(exc).__name__}: {exc}"
+                            stage_stats[f"decoder_stage_static_stage_{int(stage_index)}_failure"] = 1
+                            stage_stats["decoder_stage_static_runtime_failure_reason"] = (
+                                self._compiled_stage_static_bucket_failure_reasons[stage_key]
+                            )
+                    static_runtime = self._compiled_stage_static_buckets.get(stage_key)
+        if static_runtime is not None:
+            stage_stats["decoder_stage_static_runtime_compiled_calls"] = int(
+                stage_stats.get("decoder_stage_static_runtime_compiled_calls", 0)
+            ) + 1
+            stage_stats[f"decoder_stage_static_stage_{int(stage_index)}_compiled_calls"] = int(
+                stage_stats.get(f"decoder_stage_static_stage_{int(stage_index)}_compiled_calls", 0)
+            ) + 1
+            stage_stats["decoder_stage_static_runtime_last_shape_id"] = shape_id
+            started_at = time.perf_counter()
+            output = static_runtime(stage_x)
+            _sync_profile_device(stage_x.device)
+            elapsed_ms = float((time.perf_counter() - started_at) * 1000.0)
+            stage_stats["decoder_stage_static_runtime_compiled_ms"] = float(
+                stage_stats.get("decoder_stage_static_runtime_compiled_ms", 0.0)
+            ) + elapsed_ms
+            stage_stats[f"decoder_stage_static_stage_{int(stage_index)}_compiled_ms"] = float(
+                stage_stats.get(f"decoder_stage_static_stage_{int(stage_index)}_compiled_ms", 0.0)
+            ) + elapsed_ms
+            self._set_last_stage_runtime_stats(stage_stats)
+            return output
+        stage_stats["decoder_stage_static_runtime_eager_calls"] = int(
+            stage_stats.get("decoder_stage_static_runtime_eager_calls", 0)
+        ) + 1
+        stage_stats[f"decoder_stage_static_stage_{int(stage_index)}_eager_calls"] = int(
+            stage_stats.get(f"decoder_stage_static_stage_{int(stage_index)}_eager_calls", 0)
+        ) + 1
+        started_at = time.perf_counter()
+        output = self._run_stage_resblocks_channels_last_eager(stage_x, stage_index)
+        _sync_profile_device(stage_x.device)
+        elapsed_ms = float((time.perf_counter() - started_at) * 1000.0)
+        stage_stats["decoder_stage_static_runtime_eager_ms"] = float(
+            stage_stats.get("decoder_stage_static_runtime_eager_ms", 0.0)
+        ) + elapsed_ms
+        stage_stats[f"decoder_stage_static_stage_{int(stage_index)}_eager_ms"] = float(
+            stage_stats.get(f"decoder_stage_static_stage_{int(stage_index)}_eager_ms", 0.0)
+        ) + elapsed_ms
+        self._set_last_stage_runtime_stats(stage_stats)
+        return output
+
+    def _run_stage_resblocks_channels_last(self, x, stage_index: int):
+        stage_x = x.unsqueeze(2).contiguous(memory_format=torch.channels_last)
+        return self._run_stage_resblocks_channels_last_static_runtime(stage_x, stage_index).squeeze(2)
 
     def _run_stage_resblocks_channels_last_profiled(self, x, stats, stage_index: int, device):
         stage_prefix = f"decoder_stage_{stage_index}"
@@ -714,12 +1005,16 @@ class Generator(torch.nn.Module):
         stage_base = stage_index * self.num_kernels
         for j in range(self.num_kernels):
             block = self.resblocks[stage_base + j]
-            block_out = self._profile_call(
-                lambda block=block, current=stage_x: block.forward_channels_last(current),
-                stats,
-                f"{stage_prefix}_resblock_{j}_ms",
-                device,
-            )
+            block_prefix = f"{stage_prefix}_resblock_{j}"
+            if hasattr(block, "forward_channels_last_profiled"):
+                block_out = block.forward_channels_last_profiled(stage_x, stats, block_prefix, device)
+            else:
+                block_out = self._profile_call(
+                    lambda block=block, current=stage_x: block.forward_channels_last(current),
+                    stats,
+                    f"{block_prefix}_ms",
+                    device,
+                )
             if xs is None:
                 xs = block_out
             else:
@@ -737,6 +1032,7 @@ class Generator(torch.nn.Module):
         )
 
     def forward(self, x, g=None):
+        self._reset_stage_runtime_stats()
         x = self.conv_pre(x)
         if g is not None:
             x = x + self.cond(g)
@@ -761,6 +1057,7 @@ class Generator(torch.nn.Module):
         return x
 
     def forward_profiled(self, x, g=None):
+        self._reset_stage_runtime_stats()
         stats = {
             "decoder_profiled_calls": 1,
             "decoder_num_upsamples": int(self.num_upsamples),
@@ -1261,6 +1558,12 @@ class SynthesizerTrn(nn.Module):
             self.sv_emb = nn.Linear(20480, gin_channels)
             self.ge_to512 = nn.Linear(gin_channels, 512)
             self.prelu = nn.PReLU(num_parameters=gin_channels)
+        self._last_enc_p_runtime_stats = {}
+        self._compiled_enc_p_static_buckets = {}
+        self._compiled_enc_p_static_bucket_seen = {}
+        self._compiled_enc_p_static_bucket_failures = set()
+        self._compiled_enc_p_static_bucket_failure_reasons = {}
+        self._compiled_enc_p_static_bucket_lock = threading.Lock()
         self._last_decoder_profile = {}
         self._last_decoder_runtime_stats = {}
         self._compiled_dec_static_buckets = {}
@@ -1279,11 +1582,193 @@ class SynthesizerTrn(nn.Module):
     def _set_last_decoder_profile(self, stats):
         self._last_decoder_profile = dict(stats)
 
+    def get_last_enc_p_runtime_stats(self):
+        return dict(self._last_enc_p_runtime_stats)
+
+    def _set_last_enc_p_runtime_stats(self, stats):
+        self._last_enc_p_runtime_stats = dict(stats)
+
     def get_last_decoder_runtime_stats(self):
         return dict(self._last_decoder_runtime_stats)
 
     def _set_last_decoder_runtime_stats(self, stats):
         self._last_decoder_runtime_stats = dict(stats)
+
+    @staticmethod
+    def _enc_p_static_bucket_key(
+        quantized: torch.Tensor,
+        text: torch.Tensor,
+        ge: torch.Tensor,
+        speed: float,
+    ) -> tuple[object, ...]:
+        return (
+            tuple(int(dim) for dim in quantized.shape),
+            str(quantized.dtype),
+            str(quantized.device),
+            tuple(int(dim) for dim in text.shape),
+            str(text.dtype),
+            str(text.device),
+            tuple(int(dim) for dim in ge.shape),
+            str(ge.dtype),
+            str(ge.device),
+            float(speed),
+        )
+
+    @staticmethod
+    def _enc_p_runtime_shape_id(
+        quantized: torch.Tensor,
+        text: torch.Tensor,
+        ge: torch.Tensor,
+        speed: float,
+    ) -> str:
+        quantized_part = "q" + "x".join(str(int(dim)) for dim in quantized.shape)
+        text_part = "t" + "x".join(str(int(dim)) for dim in text.shape)
+        ge_part = "g" + "x".join(str(int(dim)) for dim in ge.shape)
+        return f"{quantized_part}_{text_part}_{ge_part}_speed{float(speed):.3f}"
+
+    @staticmethod
+    def enc_p_static_bucket_compile_enabled() -> bool:
+        return _vits_enc_p_static_bucket_compile_enabled()
+
+    def _maybe_compile_enc_p_static_bucket(
+        self,
+        key: tuple[object, ...],
+        shape_id: str,
+        quantized: torch.Tensor,
+        y_lengths: torch.Tensor,
+        text: torch.Tensor,
+        text_lengths: torch.Tensor,
+        ge: torch.Tensor,
+        speed: float,
+        runtime_stats: dict[str, object],
+    ) -> None:
+        if not _vits_enc_p_static_bucket_compile_enabled() or not hasattr(torch, "compile"):
+            return
+        shape_whitelist = _vits_enc_p_static_bucket_shape_whitelist()
+        if shape_whitelist and shape_id not in shape_whitelist:
+            runtime_stats["enc_p_runtime_static_bucket_shape_blocked"] = 1
+            return
+        if key in self._compiled_enc_p_static_buckets or key in self._compiled_enc_p_static_bucket_failures:
+            return
+        seen_hits = int(self._compiled_enc_p_static_bucket_seen.get(key, 0)) + 1
+        self._compiled_enc_p_static_bucket_seen[key] = seen_hits
+        runtime_stats["enc_p_runtime_static_bucket_seen_hits"] = seen_hits
+        if seen_hits < _vits_enc_p_static_bucket_min_hits():
+            return
+        if len(self._compiled_enc_p_static_buckets) >= _vits_enc_p_static_bucket_max_entries():
+            runtime_stats["enc_p_runtime_static_bucket_evicted_by_cap"] = 1
+            return
+        with self._compiled_enc_p_static_bucket_lock:
+            if key in self._compiled_enc_p_static_buckets or key in self._compiled_enc_p_static_bucket_failures:
+                return
+            try:
+                started_at = time.perf_counter()
+                static_runtime = torch.compile(
+                    self.enc_p,
+                    mode=_vits_enc_p_static_bucket_compile_mode(),
+                    dynamic=False,
+                )
+                with torch.no_grad():
+                    _ = static_runtime(quantized, y_lengths, text, text_lengths, ge, speed)
+                _sync_profile_device(quantized.device)
+                runtime_stats["enc_p_runtime_static_bucket_compile_ms"] = float(
+                    (time.perf_counter() - started_at) * 1000.0
+                )
+                runtime_stats["enc_p_runtime_static_bucket_compiles"] = 1
+                self._compiled_enc_p_static_buckets[key] = static_runtime
+            except Exception as exc:
+                self._compiled_enc_p_static_bucket_failures.add(key)
+                self._compiled_enc_p_static_bucket_failure_reasons[key] = f"{type(exc).__name__}: {exc}"
+                runtime_stats["enc_p_runtime_static_bucket_failure_reason"] = (
+                    self._compiled_enc_p_static_bucket_failure_reasons[key]
+                )
+
+    def run_enc_p_runtime(
+        self,
+        quantized: torch.Tensor,
+        y_lengths: torch.Tensor,
+        text: torch.Tensor,
+        text_lengths: torch.Tensor,
+        ge: torch.Tensor,
+        speed: float,
+    ):
+        runtime_enc_p = getattr(self, "_compiled_enc_p", None)
+        static_bucket_key = self._enc_p_static_bucket_key(quantized, text, ge, speed)
+        shape_id = self._enc_p_runtime_shape_id(quantized, text, ge, speed)
+        runtime_stats = {
+            "enc_p_runtime_calls": 1,
+            "enc_p_runtime_compiled_available": bool(
+                runtime_enc_p is not None or self._compiled_enc_p_static_buckets
+            ),
+            "enc_p_runtime_quantized_shape": [int(dim) for dim in quantized.shape],
+            "enc_p_runtime_quantized_dtype": str(quantized.dtype),
+            "enc_p_runtime_quantized_device": str(quantized.device),
+            "enc_p_runtime_text_shape": [int(dim) for dim in text.shape],
+            "enc_p_runtime_text_dtype": str(text.dtype),
+            "enc_p_runtime_text_device": str(text.device),
+            "enc_p_runtime_ge_shape": [int(dim) for dim in ge.shape],
+            "enc_p_runtime_ge_dtype": str(ge.dtype),
+            "enc_p_runtime_ge_device": str(ge.device),
+            "enc_p_runtime_speed": float(speed),
+            "enc_p_runtime_static_bucket_key": repr(static_bucket_key),
+            "enc_p_runtime_shape_id": shape_id,
+            "enc_p_runtime_path_hist": {},
+            "enc_p_runtime_shape_hist": {shape_id: 1},
+            "enc_p_runtime_static_bucket_hits": 0,
+            "enc_p_runtime_static_bucket_misses": 0,
+        }
+        if _vits_enc_p_static_bucket_compile_enabled():
+            static_runtime = self._compiled_enc_p_static_buckets.get(static_bucket_key)
+            if static_runtime is not None:
+                runtime_stats["enc_p_runtime_compiled_available"] = True
+                runtime_stats["enc_p_runtime_compiled_calls"] = 1
+                runtime_stats["enc_p_runtime_eager_calls"] = 0
+                runtime_stats["enc_p_runtime_static_bucket_hits"] = 1
+                runtime_stats["enc_p_runtime_static_bucket_misses"] = 0
+                runtime_stats["enc_p_runtime_path_hist"] = {"compiled_static_bucket": 1}
+                runtime_stats["enc_p_runtime_path"] = "compiled_static_bucket"
+                self._set_last_enc_p_runtime_stats(runtime_stats)
+                return static_runtime(quantized, y_lengths, text, text_lengths, ge, speed)
+            runtime_stats["enc_p_runtime_static_bucket_misses"] = 1
+            self._maybe_compile_enc_p_static_bucket(
+                static_bucket_key,
+                shape_id,
+                quantized,
+                y_lengths,
+                text,
+                text_lengths,
+                ge,
+                speed,
+                runtime_stats,
+            )
+            static_runtime = self._compiled_enc_p_static_buckets.get(static_bucket_key)
+            if static_runtime is not None:
+                runtime_stats["enc_p_runtime_compiled_available"] = True
+                runtime_stats["enc_p_runtime_compiled_calls"] = 1
+                runtime_stats["enc_p_runtime_eager_calls"] = 0
+                runtime_stats["enc_p_runtime_static_bucket_hits"] = 1
+                runtime_stats["enc_p_runtime_path_hist"] = {"compiled_static_bucket": 1}
+                runtime_stats["enc_p_runtime_path"] = "compiled_static_bucket"
+                self._set_last_enc_p_runtime_stats(runtime_stats)
+                return static_runtime(quantized, y_lengths, text, text_lengths, ge, speed)
+            if static_bucket_key in self._compiled_enc_p_static_bucket_failure_reasons:
+                runtime_stats["enc_p_runtime_static_bucket_failure_reason"] = (
+                    self._compiled_enc_p_static_bucket_failure_reasons[static_bucket_key]
+                )
+        if runtime_enc_p is not None:
+            runtime_stats["enc_p_runtime_compiled_available"] = True
+            runtime_stats["enc_p_runtime_compiled_calls"] = 1
+            runtime_stats["enc_p_runtime_eager_calls"] = 0
+            runtime_stats["enc_p_runtime_path_hist"] = {"compiled": 1}
+            runtime_stats["enc_p_runtime_path"] = "compiled"
+            self._set_last_enc_p_runtime_stats(runtime_stats)
+            return runtime_enc_p(quantized, y_lengths, text, text_lengths, ge, speed)
+        runtime_stats["enc_p_runtime_compiled_calls"] = 0
+        runtime_stats["enc_p_runtime_eager_calls"] = 1
+        runtime_stats["enc_p_runtime_path_hist"] = {"eager": 1}
+        runtime_stats["enc_p_runtime_path"] = "eager"
+        self._set_last_enc_p_runtime_stats(runtime_stats)
+        return self.enc_p(quantized, y_lengths, text, text_lengths, ge, speed)
 
     @staticmethod
     def _decoder_static_bucket_key(x: torch.Tensor, g: torch.Tensor | None) -> tuple[object, ...]:
@@ -1398,7 +1883,8 @@ class SynthesizerTrn(nn.Module):
             "decoder_runtime_cudagraph_miss_shape_hist": {},
         }
         if getattr(self.dec, "_profile_decoder_enabled", None) is not None and self.dec._profile_decoder_enabled():
-            audio, stats = self.dec.forward_profiled(x, g=g)
+            with _vits_decoder_tf32_context(x), _vits_decoder_cudnn_benchmark_context(x):
+                audio, stats = self.dec.forward_profiled(x, g=g)
             runtime_stats["decoder_runtime_profiled_calls"] = 1
             runtime_stats["decoder_runtime_compiled_calls"] = 0
             runtime_stats["decoder_runtime_eager_calls"] = 0
@@ -1436,15 +1922,16 @@ class SynthesizerTrn(nn.Module):
             runtime_stats["decoder_runtime_cudagraph_shape_hist"] = {shape_id: 1}
             runtime_stats["decoder_runtime_path"] = "compiled_cudagraph"
             self._set_last_decoder_profile({})
-            if borrow_output:
-                runtime_stats["decoder_runtime_output_borrowed"] = 1
-                self._set_last_decoder_runtime_stats(runtime_stats)
-                return cuda_graph_entry["out"]
-            started_at = time.perf_counter()
-            output = cuda_graph_entry["out"].clone()
-            runtime_stats["decoder_runtime_cudagraph_output_clone_ms"] = float(
-                (time.perf_counter() - started_at) * 1000.0
-            )
+            with _vits_decoder_tf32_context(x), _vits_decoder_cudnn_benchmark_context(x):
+                if borrow_output:
+                    runtime_stats["decoder_runtime_output_borrowed"] = 1
+                    self._set_last_decoder_runtime_stats(runtime_stats)
+                    return cuda_graph_entry["out"]
+                started_at = time.perf_counter()
+                output = cuda_graph_entry["out"].clone()
+                runtime_stats["decoder_runtime_cudagraph_output_clone_ms"] = float(
+                    (time.perf_counter() - started_at) * 1000.0
+                )
             self._set_last_decoder_runtime_stats(runtime_stats)
             return output
         if runtime_dec is not None and _vits_static_bucket_compile_enabled():
@@ -1459,7 +1946,7 @@ class SynthesizerTrn(nn.Module):
                 runtime_stats["decoder_runtime_path"] = "compiled_static_bucket"
                 self._set_last_decoder_profile({})
                 self._set_last_decoder_runtime_stats(runtime_stats)
-                with _vits_decoder_tf32_context(x):
+                with _vits_decoder_tf32_context(x), _vits_decoder_cudnn_benchmark_context(x):
                     return static_runtime(x, g=g)
             runtime_stats["decoder_runtime_static_bucket_hits"] = 0
             runtime_stats["decoder_runtime_static_bucket_misses"] = 1
@@ -1504,7 +1991,7 @@ class SynthesizerTrn(nn.Module):
             runtime_stats["decoder_runtime_path"] = "compiled"
             self._set_last_decoder_profile({})
             self._set_last_decoder_runtime_stats(runtime_stats)
-            with _vits_decoder_tf32_context(x):
+            with _vits_decoder_tf32_context(x), _vits_decoder_cudnn_benchmark_context(x):
                 return runtime_dec(x, g=g)
         runtime_stats["decoder_runtime_profiled_calls"] = 0
         runtime_stats["decoder_runtime_compiled_calls"] = 0
@@ -1514,9 +2001,12 @@ class SynthesizerTrn(nn.Module):
         runtime_stats["decoder_runtime_path_hist"] = {"eager": 1}
         runtime_stats["decoder_runtime_path"] = "eager"
         self._set_last_decoder_profile({})
+        with _vits_decoder_tf32_context(x), _vits_decoder_cudnn_benchmark_context(x):
+            output = self.dec(x, g=g)
+        stage_runtime_stats = getattr(self.dec, "get_last_stage_runtime_stats", lambda: {})()
+        runtime_stats.update(stage_runtime_stats)
         self._set_last_decoder_runtime_stats(runtime_stats)
-        with _vits_decoder_tf32_context(x):
-            return self.dec(x, g=g)
+        return output
 
     def forward(self, ssl, y, y_lengths, text, text_lengths, sv_emb=None):
         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)

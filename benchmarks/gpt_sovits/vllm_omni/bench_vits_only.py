@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import soundfile as sf
 import torch
 
 from vllm_omni.model_executor.models.gpt_sovits.runtime import GPTSoVITSRuntime
@@ -152,7 +151,6 @@ def run_iteration(
     *,
     iteration: int,
     prepared_request: Any,
-    save_audio_path: Path | None,
 ) -> IterationMetrics:
     start = _stage_timer()
     decoded = runtime.decode_prepared_request(prepared_request)
@@ -162,10 +160,6 @@ def run_iteration(
     start = _stage_timer()
     result = runtime.finalize_decoded_audio(decoded)
     postprocess_ms = _elapsed_ms(start)
-
-    if save_audio_path is not None:
-        save_audio_path.parent.mkdir(parents=True, exist_ok=True)
-        sf.write(save_audio_path, result.audio, result.sample_rate)
 
     return IterationMetrics(
         iteration=iteration,
@@ -177,6 +171,30 @@ def run_iteration(
     )
 
 
+def export_prepared_request_audio_streaming(
+    runtime: GPTSoVITSRuntime,
+    *,
+    prepared_request: Any,
+    output_path: Path,
+) -> dict[str, Any]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    decoded = runtime.decode_prepared_request(prepared_request)
+    sample_rate = runtime.finalize_decoded_audio_to_file(decoded, output_path)
+    import soundfile as sf
+
+    info = sf.info(output_path)
+    return {
+        "path": str(output_path),
+        "sample_rate": int(sample_rate),
+        "file_sample_rate": int(info.samplerate),
+        "frames": int(info.frames),
+        "duration_sec": float(info.frames / info.samplerate) if int(info.samplerate) > 0 else 0.0,
+        "format": str(info.format),
+        "subtype": str(info.subtype),
+        "mode": "bounded_memory_extra_pass",
+    }
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Benchmark GPT-SoVITS VITS-only hot path.")
     parser.add_argument("--suite", choices=["cn", "en", "4lang"], default="cn")
@@ -186,7 +204,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--config-path", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--ref-audio", type=Path, default=DEFAULT_REF_AUDIO)
     parser.add_argument("--text-split-method", default="cut5")
-    parser.add_argument("--save-audio", action="store_true")
+    parser.add_argument(
+        "--save-audio",
+        action="store_true",
+        help="Export one extra bounded-memory audio file after measured iterations.",
+    )
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument(
         "--prepared-cache",
@@ -271,18 +293,13 @@ def main() -> int:
             runtime,
             iteration=-(warmup_index + 1),
             prepared_request=decode_prepared,
-            save_audio_path=None,
         )
     for iteration in range(args.iters):
-        audio_path = None
-        if args.save_audio and iteration == args.iters - 1:
-            audio_path = TEMP_ROOT / f"gpt_sovits_vits_only_{args.suite}.wav"
         measured.append(
             run_iteration(
                 runtime,
                 iteration=iteration,
                 prepared_request=decode_prepared,
-                save_audio_path=audio_path,
             )
         )
 
@@ -310,6 +327,15 @@ def main() -> int:
             "segment_decode_max_phone_tokens": os.environ.get("GPTSOVITS_SEGMENT_DECODE_MAX_PHONE_TOKENS"),
             "segment_decode_semantic_buckets": os.environ.get("GPTSOVITS_SEGMENT_DECODE_SEMANTIC_BUCKETS"),
             "segment_decode_phone_buckets": os.environ.get("GPTSOVITS_SEGMENT_DECODE_PHONE_BUCKETS"),
+            "saved_audio": (
+                export_prepared_request_audio_streaming(
+                    runtime,
+                    prepared_request=decode_prepared,
+                    output_path=TEMP_ROOT / f"gpt_sovits_vits_only_{args.suite}.wav",
+                )
+                if args.save_audio
+                else None
+            ),
         },
         "iterations": summarized,
         "aggregate": {

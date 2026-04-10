@@ -10029,19 +10029,36 @@ class GPTSoVITSRuntime:
             if bool(getattr(vits_model, "is_v2pro", False))
             else ge
         )
+        compiled_enc_p = getattr(vits_model, "_compiled_enc_p", None)
+        enc_p_runtime = getattr(vits_model, "run_enc_p_runtime", None)
         x, m_p, logs_p, y_mask, _, _ = self._time_vits_call(
-            lambda: vits_model.enc_p(
-                quantized,
-                y_lengths,
-                text,
-                text_lengths,
-                encoder_ge,
-                speed,
+            lambda: (
+                enc_p_runtime(quantized, y_lengths, text, text_lengths, encoder_ge, speed)
+                if callable(enc_p_runtime)
+                else (
+                    compiled_enc_p(quantized, y_lengths, text, text_lengths, encoder_ge, speed)
+                    if compiled_enc_p is not None
+                    else vits_model.enc_p(
+                        quantized,
+                        y_lengths,
+                        text,
+                        text_lengths,
+                        encoder_ge,
+                        speed,
+                    )
+                )
             ),
             profile=profile,
             stat_key="non_vocoder_enc_p_ms",
             device=quantized.device,
         )
+        enc_p_runtime_stats = getattr(vits_model, "get_last_enc_p_runtime_stats", lambda: {})()
+        self._merge_numeric_t2s_stats(profile if profile is not None else stats_sink, enc_p_runtime_stats)
+        if profile is not None:
+            profile["non_vocoder_enc_p_compiled"] = int(
+                int(enc_p_runtime_stats.get("enc_p_runtime_compiled_calls", 0)) > 0
+                or compiled_enc_p is not None
+            )
         del x
         z_p = self._time_vits_call(
             lambda: m_p + torch.randn_like(m_p) * torch.exp(logs_p) * float(noise_scale),
@@ -11194,6 +11211,97 @@ class GPTSoVITSRuntime:
         audio_np = (audio_np.reshape(-1) * 32768).astype(np.int16)
         return int(sr), audio_np
 
+    def _write_empty_audio_file(
+        self,
+        output_path: str | os.PathLike[str],
+        *,
+        sample_rate: int,
+        format: str | None = None,
+        subtype: str = "PCM_16",
+    ) -> int:
+        import soundfile as sf
+
+        resolved_path = os.fspath(output_path)
+        output_dir = os.path.dirname(os.path.abspath(resolved_path))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with sf.SoundFile(
+            resolved_path,
+            mode="w",
+            samplerate=int(sample_rate),
+            channels=1,
+            format=format,
+            subtype=subtype,
+        ):
+            pass
+        return int(sample_rate)
+
+    def finalize_decoded_audio_to_file(
+        self,
+        decoded: Any,
+        output_path: str | os.PathLike[str],
+        *,
+        format: str | None = None,
+        subtype: str = "PCM_16",
+    ) -> int:
+        import soundfile as sf
+
+        pipeline = self._ensure_pipeline()
+        if isinstance(decoded, GPTSoVITSDecodedAudioGroup):
+            fragment_items = decoded.segment_items
+            speed_factor = float(decoded.speed_factor)
+            fragment_interval = float(decoded.fragment_interval)
+            super_sampling = bool(decoded.super_sampling)
+        else:
+            fragment_items = [decoded]
+            speed_factor = float(decoded.speed_factor)
+            fragment_interval = float(getattr(decoded, "fragment_interval", 0.0))
+            super_sampling = bool(decoded.super_sampling)
+
+        default_sample_rate = int(getattr(pipeline.configs, "sampling_rate", 32000))
+        if not fragment_items:
+            return self._write_empty_audio_file(
+                output_path,
+                sample_rate=default_sample_rate,
+                format=format,
+                subtype=subtype,
+            )
+        if super_sampling and len(fragment_items) > 1:
+            raise NotImplementedError(
+                "finalize_decoded_audio_to_file does not support grouped super_sampling outputs"
+            )
+
+        resolved_path = os.fspath(output_path)
+        output_dir = os.path.dirname(os.path.abspath(resolved_path))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        sample_rate = int(fragment_items[0].output_sr)
+        with self._run_lock:
+            with sf.SoundFile(
+                resolved_path,
+                mode="w",
+                samplerate=sample_rate,
+                channels=1,
+                format=format,
+                subtype=subtype,
+            ) as sink:
+                for item in fragment_items:
+                    fragment_sample_rate, fragment_audio = self._audio_postprocess_native(
+                        pipeline,
+                        audio_fragments=[item.audio_fragment],
+                        sr=int(item.output_sr),
+                        speed_factor=speed_factor,
+                        fragment_interval=fragment_interval,
+                        super_sampling=super_sampling,
+                    )
+                    if int(fragment_sample_rate) != sample_rate:
+                        raise RuntimeError(
+                            "GPT-SoVITS decoded fragments produced inconsistent sample rates "
+                            f"({fragment_sample_rate} != {sample_rate})"
+                        )
+                    sink.write(np.asarray(fragment_audio).reshape(-1))
+        return sample_rate
+
     def finalize_decoded_audio(
         self,
         decoded: Any,
@@ -11224,7 +11332,7 @@ class GPTSoVITSRuntime:
                 audio_fragments=[decoded.audio_fragment],
                 sr=int(decoded.output_sr),
                 speed_factor=float(decoded.speed_factor),
-                fragment_interval=float(decoded.fragment_interval),
+                fragment_interval=float(getattr(decoded, "fragment_interval", 0.0)),
                 super_sampling=bool(decoded.super_sampling),
             )
         return GPTSoVITSResult(sample_rate=int(sample_rate), audio=self._normalize_audio(np.asarray(audio)))
@@ -11336,6 +11444,47 @@ class GPTSoVITSRuntime:
                 f"GPT-SoVITS native synthesize missing semantic tokens for request {prepared.request_id}"
             )
         return self.decode_semantic_tokens_from_transport(semantic_tokens, prepared.transport_info)
+
+    def synthesize_to_file(
+        self,
+        request: dict[str, Any],
+        output_path: str | os.PathLike[str],
+        *,
+        format: str | None = None,
+        subtype: str = "PCM_16",
+    ) -> int:
+        spec = self.build_request_spec(request)
+        prepared = self.prepare_request_spec(spec)
+        semantic_tokens = self.generate_semantic_tokens([prepared]).get(str(prepared.request_id))
+        if semantic_tokens is None:
+            raise RuntimeError(
+                f"GPT-SoVITS native synthesize missing semantic tokens for request {prepared.request_id}"
+            )
+        decode_prepared = self.prepare_decode_request(semantic_tokens, prepared.transport_info)
+        if isinstance(decode_prepared, GPTSoVITSDecodePreparedRequestGroup):
+            if not decode_prepared.segment_requests:
+                pipeline = self._ensure_pipeline()
+                return self._write_empty_audio_file(
+                    output_path,
+                    sample_rate=int(getattr(pipeline.configs, "sampling_rate", 32000)),
+                    format=format,
+                    subtype=subtype,
+                )
+        elif decode_prepared.semantic_tokens.numel() == 0:
+            pipeline = self._ensure_pipeline()
+            return self._write_empty_audio_file(
+                output_path,
+                sample_rate=int(getattr(pipeline.configs, "sampling_rate", 32000)),
+                format=format,
+                subtype=subtype,
+            )
+        decoded = self.decode_prepared_request(decode_prepared)
+        return self.finalize_decoded_audio_to_file(
+            decoded,
+            output_path,
+            format=format,
+            subtype=subtype,
+        )
 
 
 _RUNTIME_CACHE: dict[tuple[str, str], GPTSoVITSRuntime] = {}

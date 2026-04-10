@@ -1407,6 +1407,32 @@ def test_synthesize_routes_through_runtime_native_prepare_generate_decode_pipeli
     assert result is expected
 
 
+def test_synthesize_to_file_routes_through_runtime_native_prepare_generate_decode_pipeline(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    spec = SimpleNamespace(request_id="req-native")
+    prepared = SimpleNamespace(request_id="req-native", transport_info={"transport": "ok"})
+    decode_prepared = SimpleNamespace(semantic_tokens=torch.tensor([1, 2, 3], dtype=torch.long))
+    semantic_tokens = torch.tensor([1, 2, 3], dtype=torch.long)
+    decoded = SimpleNamespace(audio_fragment=np.array([0.1], dtype=np.float32))
+    output_path = tmp_path / "synthesized.wav"
+    runtime.build_request_spec = Mock(return_value=spec)  # type: ignore[method-assign]
+    runtime.prepare_request_spec = Mock(return_value=prepared)  # type: ignore[method-assign]
+    runtime.generate_semantic_tokens = Mock(return_value={"req-native": semantic_tokens})  # type: ignore[method-assign]
+    runtime.prepare_decode_request = Mock(return_value=decode_prepared)  # type: ignore[method-assign]
+    runtime.decode_prepared_request = Mock(return_value=decoded)  # type: ignore[method-assign]
+    runtime.finalize_decoded_audio_to_file = Mock(return_value=32000)  # type: ignore[method-assign]
+
+    sample_rate = runtime.synthesize_to_file({"text": "hello"}, output_path)
+
+    assert sample_rate == 32000
+    runtime.build_request_spec.assert_called_once_with({"text": "hello"})
+    runtime.prepare_request_spec.assert_called_once_with(spec)
+    runtime.generate_semantic_tokens.assert_called_once_with([prepared])
+    runtime.prepare_decode_request.assert_called_once_with(semantic_tokens, {"transport": "ok"})
+    runtime.decode_prepared_request.assert_called_once_with(decode_prepared)
+    runtime.finalize_decoded_audio_to_file.assert_called_once_with(decoded, output_path, format=None, subtype="PCM_16")
+
+
 def test_extract_ref_spec_from_raw_uses_runtime_native_components(tmp_path):
     runtime = GPTSoVITSRuntime(
         project_root="/root/vllm-omni/vllm_omni/model_executor/models/gpt_sovits/runtime_lib",
@@ -2285,6 +2311,62 @@ def test_finalize_decoded_audio_normalizes_output(tmp_path):
     runtime._audio_postprocess_native.assert_called_once()
     assert result.sample_rate == 32000
     np.testing.assert_allclose(result.audio, np.array([32767 / 32768.0, -1.0], dtype=np.float32))
+
+
+def test_finalize_decoded_audio_to_file_streams_group_fragments(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._pipeline = SimpleNamespace(configs=SimpleNamespace(device="cpu", sampling_rate=32000))
+    runtime._audio_postprocess_native = Mock(  # type: ignore[method-assign]
+        side_effect=[
+            (32000, np.array([1, 2], dtype=np.int16)),
+            (32000, np.array([3, 4, 5], dtype=np.int16)),
+        ]
+    )
+    output_path = tmp_path / "streamed.wav"
+
+    sample_rate = runtime.finalize_decoded_audio_to_file(
+        GPTSoVITSDecodedAudioGroup(
+            request_id="req",
+            segment_items=[
+                GPTSoVITSDecodedAudio("req::seg0000", np.array([0.1], dtype=np.float32), 32000, 1.0, 0.3, False),
+                GPTSoVITSDecodedAudio("req::seg0001", np.array([0.2], dtype=np.float32), 32000, 1.0, 0.3, False),
+            ],
+            speed_factor=1.0,
+            fragment_interval=0.3,
+            super_sampling=False,
+        ),
+        output_path,
+    )
+
+    assert sample_rate == 32000
+    assert runtime._audio_postprocess_native.call_count == 2
+    first_call = runtime._audio_postprocess_native.call_args_list[0]
+    second_call = runtime._audio_postprocess_native.call_args_list[1]
+    np.testing.assert_allclose(first_call.kwargs["audio_fragments"][0], np.array([0.1], dtype=np.float32))
+    np.testing.assert_allclose(second_call.kwargs["audio_fragments"][0], np.array([0.2], dtype=np.float32))
+    audio, read_sr = sf.read(output_path, dtype="int16")
+    assert read_sr == 32000
+    assert audio.tolist() == [1, 2, 3, 4, 5]
+
+
+def test_finalize_decoded_audio_to_file_rejects_group_super_sampling(tmp_path):
+    runtime = GPTSoVITSRuntime(project_root=str(tmp_path), config_path=str(tmp_path / "dummy.yaml"))
+    runtime._pipeline = SimpleNamespace(configs=SimpleNamespace(device="cpu", sampling_rate=32000))
+
+    with pytest.raises(NotImplementedError, match="grouped super_sampling"):
+        runtime.finalize_decoded_audio_to_file(
+            GPTSoVITSDecodedAudioGroup(
+                request_id="req",
+                segment_items=[
+                    GPTSoVITSDecodedAudio("req::seg0000", np.array([0.1], dtype=np.float32), 32000, 1.0, 0.3, True),
+                    GPTSoVITSDecodedAudio("req::seg0001", np.array([0.2], dtype=np.float32), 32000, 1.0, 0.3, True),
+                ],
+                speed_factor=1.0,
+                fragment_interval=0.3,
+                super_sampling=True,
+            ),
+            tmp_path / "unsupported.wav",
+        )
 
 
 def test_audio_postprocess_native_super_sampling_uses_runtime_sr_loader(tmp_path):
